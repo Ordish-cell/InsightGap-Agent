@@ -1,0 +1,114 @@
+# open_deep_research Web 开发启动命令
+
+项目路径：
+
+```powershell
+D:\pythonproject\open_deep_research
+```
+
+---
+
+## 1. 启动后端 FastAPI
+
+打开第一个 PowerShell / PyCharm Terminal：
+
+```powershell
+cd D:\pythonproject\open_deep_research
+
+$env:PYTHONPATH="src"
+uv run uvicorn web_app.main:app --reload
+```
+
+后端地址：
+
+```text
+http://127.0.0.1:8000
+```
+
+后端 API 文档：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+健康检查接口：
+
+```text
+http://127.0.0.1:8000/api/health
+```
+
+关闭后端：
+
+```text
+Ctrl + C
+```
+
+如果提示 `Terminate batch job (Y/N)?`，输入：
+
+```text
+Y
+```
+
+---
+
+## 2. 启动前端 Vue
+
+打开第二个 PowerShell / PyCharm Terminal：
+
+```powershell
+cd D:\pythonproject\open_deep_research\frontend
+
+npm run dev
+```
+
+前端地址：
+
+```text
+http://localhost:5173
+```
+
+关闭前端：
+
+```text
+Ctrl + C
+```
+
+如果提示 `Terminate batch job (Y/N)?`，输入：
+
+```text
+Y
+```
+
+---
+
+## 3. 每次开发启动顺序
+
+```text
+1. 先启动后端 FastAPI
+2. 再启动前端 Vue
+3. 浏览器打开 http://localhost:5173
+```
+
+---
+
+## 4. 常用检查命令
+
+检查 Python 是否使用项目虚拟环境：
+
+```powershell
+cd D:\pythonproject\open_deep_research
+uv run python -c "import sys; print(sys.executable)"
+```
+
+正常应该输出类似：
+
+```text
+D:\pythonproject\open_deep_research\.venv\Scripts\python.exe
+```
+
+检查前端 Node / npm：
+
+```powershell
+node -v
+npm -v
+```
