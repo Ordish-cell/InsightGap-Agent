@@ -1,0 +1,3 @@
+# Agent OS RAG
+
+Qdrant stores user scoped evidence chunks. RAG answers must cite evidence and avoid hallucination.

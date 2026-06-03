@@ -1,0 +1,7 @@
+L0_READ_ONLY = "L0_READ_ONLY"
+L1_DRAFT = "L1_DRAFT"
+L2_LOCAL_WRITE = "L2_LOCAL_WRITE"
+L3_EXTERNAL_WRITE = "L3_EXTERNAL_WRITE"
+L4_HIGH_RISK = "L4_HIGH_RISK"
+
+BLOCKED_TOOL_PATTERNS = ("email/send", "comment/post", "form/submit", "payment", "delete")

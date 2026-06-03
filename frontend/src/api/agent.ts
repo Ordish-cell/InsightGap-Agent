@@ -1,0 +1,36 @@
+import { apiBaseUrl, apiRequest } from './client'
+import type { AgentRun, AgentStep } from './types'
+
+export const createRun = (payload: Record<string, unknown>) => apiRequest<AgentRun>('/agent/runs', { method: 'POST', body: payload })
+export const createLegacyRun = (payload: Record<string, unknown>) => apiRequest<AgentRun>('/agent/run', { method: 'POST', body: payload })
+export const getSteps = (runId: number | string) => apiRequest<{ run_id: number; steps: AgentStep[] }>(`/agent/runs/${runId}/steps`)
+
+export function createRunStream(runId: number | string, handlers: { onMessage?: (event: MessageEvent) => void; onError?: () => void }) {
+  const token = localStorage.getItem('authToken')
+  const controller = new AbortController()
+  fetch(`${apiBaseUrl()}/agent/runs/${runId}/stream`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    signal: controller.signal,
+  })
+    .then(async (response) => {
+      if (!response.ok || !response.body) throw new Error(`Stream failed: ${response.status}`)
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const chunks = buffer.split('\n\n')
+        buffer = chunks.pop() || ''
+        chunks.forEach((chunk) => {
+          const data = chunk.split('\n').find((line) => line.startsWith('data: '))?.slice(6) || chunk
+          handlers.onMessage?.({ data } as MessageEvent)
+        })
+      }
+    })
+    .catch(() => {
+      if (!controller.signal.aborted) handlers.onError?.()
+    })
+  return { close: () => controller.abort() }
+}
