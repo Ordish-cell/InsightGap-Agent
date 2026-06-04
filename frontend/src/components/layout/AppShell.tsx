@@ -1,18 +1,17 @@
-import { Outlet } from 'react-router-dom'
+import { Outlet, useLocation } from 'react-router-dom'
 
 import { Sidebar } from './Sidebar'
-import { Topbar } from './Topbar'
 
 export function AppShell() {
+  const location = useLocation()
+  const isHome = location.pathname === '/'
+
   return (
     <div className="app-shell">
       <Sidebar />
-      <div className="app-main">
-        <Topbar />
-        <main className="content">
-          <Outlet />
-        </main>
-      </div>
+      <main className={isHome ? 'app-main home-main' : 'app-main'}>
+        {isHome ? <Outlet /> : <div className="content"><Outlet /></div>}
+      </main>
     </div>
   )
 }

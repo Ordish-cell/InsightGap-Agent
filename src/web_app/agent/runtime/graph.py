@@ -24,12 +24,14 @@ class AgentRuntime:
             self.nodes.permission_guard,
             self.nodes.router,
             self.nodes.context_builder,
+            self.nodes.skill_matcher,
             self.nodes.research,
             self.nodes.rag,
             self.nodes.artifact,
             self.nodes.skill_librarian,
             self.nodes.tool,
             self.nodes.memory_writer,
+            self.nodes.skill_draft_detector,
             self.nodes.evaluator,
         ]
 
@@ -43,24 +45,28 @@ class AgentRuntime:
         workflow.add_node("permission_guard", self.nodes.permission_guard)
         workflow.add_node("router", self.nodes.router)
         workflow.add_node("context_builder", self.nodes.context_builder)
+        workflow.add_node("skill_matcher", self.nodes.skill_matcher)
         workflow.add_node("research", self.nodes.research)
         workflow.add_node("rag", self.nodes.rag)
         workflow.add_node("artifact", self.nodes.artifact)
         workflow.add_node("skill_librarian", self.nodes.skill_librarian)
         workflow.add_node("tool", self.nodes.tool)
         workflow.add_node("memory_writer", self.nodes.memory_writer)
+        workflow.add_node("skill_draft_detector", self.nodes.skill_draft_detector)
         workflow.add_node("evaluator", self.nodes.evaluator)
 
         workflow.set_entry_point("permission_guard")
         workflow.add_conditional_edges("permission_guard", self._after_permission, {"continue": "router", "done": "evaluator"})
         workflow.add_edge("router", "context_builder")
-        workflow.add_conditional_edges("context_builder", self._route_after_context, {"research": "research", "rag": "rag", "artifact": "artifact", "skill": "skill_librarian", "tool": "tool", "memory": "memory_writer"})
+        workflow.add_edge("context_builder", "skill_matcher")
+        workflow.add_conditional_edges("skill_matcher", self._route_after_context, {"research": "research", "rag": "rag", "artifact": "artifact", "skill": "skill_librarian", "tool": "tool", "memory": "memory_writer"})
         workflow.add_edge("research", "memory_writer")
         workflow.add_edge("rag", "memory_writer")
         workflow.add_edge("artifact", "memory_writer")
         workflow.add_edge("skill_librarian", "memory_writer")
         workflow.add_edge("tool", "memory_writer")
-        workflow.add_edge("memory_writer", "evaluator")
+        workflow.add_edge("memory_writer", "skill_draft_detector")
+        workflow.add_edge("skill_draft_detector", "evaluator")
         workflow.add_edge("evaluator", END)
         return workflow.compile()
 

@@ -12,7 +12,7 @@ class InfoItemRepository(BaseRepository[InfoItem]):
     model = InfoItem
 
     def get_by_content_hash(self, content_hash: str) -> InfoItem | None:
-        return self.db.execute(select(InfoItem).where(InfoItem.content_hash == content_hash)).scalar_one_or_none()
+        return self.db.execute(select(InfoItem).where(InfoItem.content_hash == content_hash).order_by(InfoItem.id).limit(1)).scalar_one_or_none()
 
     def upsert_by_hash(self, **values) -> tuple[InfoItem, bool]:
         existing = self.get_by_content_hash(values["content_hash"])

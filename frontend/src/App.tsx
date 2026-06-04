@@ -6,6 +6,7 @@ import { ApprovalsPage } from './pages/ApprovalsPage'
 import { ArtifactsPage } from './pages/ArtifactsPage'
 import { FeedCardDetailPage } from './pages/FeedCardDetailPage'
 import { FeedPage } from './pages/FeedPage'
+import { HomePage } from './pages/HomePage'
 import { LoginPage } from './pages/LoginPage'
 import { McpToolCallsPage } from './pages/McpToolCallsPage'
 import { MemoryPage } from './pages/MemoryPage'
@@ -31,7 +32,7 @@ export default function App() {
           </RequireAuth>
         }
       >
-        <Route index element={<Navigate to="/feed" replace />} />
+        <Route index element={<HomePage />} />
         <Route path="feed" element={<FeedPage />} />
         <Route path="feed/:cardId" element={<FeedCardDetailPage />} />
         <Route path="research" element={<ResearchRunsPage />} />
@@ -45,7 +46,7 @@ export default function App() {
         <Route path="profile" element={<ProfilePage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
-      <Route path="*" element={<Navigate to="/feed" replace />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   )
 }

@@ -8,6 +8,8 @@ class AgentRuntimeState(TypedDict, total=False):
     run_id: int
     user_input: str
     mode: str
+    source: str
+    page_context: dict[str, Any]
     route: AgentRoute
     status: str
     permission: dict[str, Any]
@@ -17,6 +19,10 @@ class AgentRuntimeState(TypedDict, total=False):
     artifacts: list[dict[str, Any]]
     memory_updates: list[dict[str, Any]]
     skill_drafts: list[dict[str, Any]]
+    matched_skill: dict[str, Any]
+    candidate_skills: list[dict[str, Any]]
+    created_skill_draft: dict[str, Any]
+    skill_reuse: dict[str, Any]
     tool_call: dict[str, Any]
     evaluation: dict[str, Any]
     final_output: str

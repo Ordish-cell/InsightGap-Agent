@@ -9,7 +9,12 @@ from src.web_app.db.repositories.agent_repository import AgentRunRepository, Age
 
 
 async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    user_input = payload.get("user_input", "")
+    user_input = payload.get("user_input") or payload.get("input") or payload.get("query") or ""
+    payload = {**payload, "user_input": user_input}
+    page_context = payload.get("page_context") or {}
+    selected_feed_card_id = page_context.get("selected_feed_card_id") or page_context.get("feed_card_id")
+    if selected_feed_card_id and not payload.get("feed_card_id"):
+        payload["feed_card_id"] = selected_feed_card_id
     run_repo = AgentRunRepository(db)
     run = run_repo.create(
         user_id=user_id,
@@ -17,9 +22,9 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any]) ->
         mode=payload.get("mode", "react"),
         status="running",
         user_input=user_input,
-        graph_state={},
+        graph_state={"source": payload.get("source", "agent_page"), "page_context": page_context},
     )
-    state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "user_input": user_input, "mode": run.mode})
+    state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context})
     run_repo.update(run, status=state.get("status", "completed"), graph_state=_json_safe(dict(state)), result_summary=state.get("final_output", ""), error_message=state.get("error", ""))
     return _run_response(run.id, state)
 
@@ -65,6 +70,10 @@ def _run_response(run_id: int, state: dict[str, Any]) -> dict[str, Any]:
         "artifacts": state.get("artifacts", []),
         "memory_updates": state.get("memory_updates", []),
         "skill_drafts": state.get("skill_drafts", []),
+        "matched_skill": state.get("matched_skill"),
+        "candidate_skills": state.get("candidate_skills", []),
+        "created_skill_draft": state.get("created_skill_draft"),
+        "reusable_score": (state.get("skill_reuse") or {}).get("reusable_score"),
         "tool_call": state.get("tool_call", {}),
         "evaluation": state.get("evaluation", {}),
         "error": state.get("error", ""),

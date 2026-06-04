@@ -100,6 +100,11 @@ export interface AgentRun {
   route?: string
   status?: string
   final_output?: string
+  artifacts?: Artifact[]
+  matched_skill?: SkillDraft & { match_score?: number; match_reason?: string; auto_use?: boolean }
+  candidate_skills?: Array<SkillDraft & { match_score?: number; match_reason?: string; auto_use?: boolean }>
+  created_skill_draft?: SkillDraft
+  reusable_score?: number
   tool_call?: McpToolCall
   evaluation?: UnknownRecord
   [key: string]: unknown

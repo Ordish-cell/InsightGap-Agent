@@ -16,7 +16,7 @@ D:\pythonproject\open_deep_research
 cd D:\pythonproject\open_deep_research
 
 $env:PYTHONPATH="src"
-uv run uvicorn web_app.main:app --reload
+.\.venv\Scripts\python.exe -m uvicorn src.web_app.main:app --host 127.0.0.1 --port 8000
 ```
 
 后端地址：

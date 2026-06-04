@@ -4,13 +4,19 @@ from pydantic import BaseModel, Field
 
 
 class AgentRunRequest(BaseModel):
-    user_input: str
+    user_input: str = ""
+    input: str | None = None
     mode: str = "react"
     run_type: str = "agent_runtime"
     route: Literal["research", "rag", "artifact", "skill", "memory", "tool"] | None = None
     tool_name: str | None = None
     tool_input: dict[str, Any] = Field(default_factory=dict)
     feed_card_id: int | None = None
+    source: str = "agent_page"
+    page_context: dict[str, Any] = Field(default_factory=dict)
+    auto_skill: bool = True
+    use_existing_skills: bool = True
+    create_skill_draft_if_reusable: bool = True
     query: str | None = None
     depth: Literal["quick", "standard", "deep"] = "standard"
     save_artifact: bool = True

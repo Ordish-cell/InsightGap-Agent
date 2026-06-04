@@ -1,9 +1,13 @@
 import { apiBaseUrl, apiRequest } from './client'
+import { normalizeAgentStep } from './normalizers'
 import type { AgentRun, AgentStep } from './types'
 
 export const createRun = (payload: Record<string, unknown>) => apiRequest<AgentRun>('/agent/runs', { method: 'POST', body: payload })
 export const createLegacyRun = (payload: Record<string, unknown>) => apiRequest<AgentRun>('/agent/run', { method: 'POST', body: payload })
-export const getSteps = (runId: number | string) => apiRequest<{ run_id: number; steps: AgentStep[] }>(`/agent/runs/${runId}/steps`)
+export const getSteps = async (runId: number | string) => {
+  const result = await apiRequest<{ run_id: number; steps: AgentStep[] }>(`/agent/runs/${runId}/steps`)
+  return { ...result, steps: (result.steps || []).map(normalizeAgentStep) }
+}
 
 export function createRunStream(runId: number | string, handlers: { onMessage?: (event: MessageEvent) => void; onError?: () => void }) {
   const token = localStorage.getItem('authToken')
