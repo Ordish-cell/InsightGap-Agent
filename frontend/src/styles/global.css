@@ -848,6 +848,30 @@ label {
   line-height: 1.62;
 }
 
+.feed-value-line {
+  margin: 0;
+  color: #2d2d2d;
+  line-height: 1.55;
+  font-size: 14px;
+}
+
+.feed-relevance-line,
+.feed-benefit-line {
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
+}
+
+.feed-relevance-line strong,
+.feed-benefit-line strong {
+  font-size: 12px;
+  color: #555;
+  letter-spacing: 0.02em;
+}
+
 .mini-insight {
   display: grid;
   gap: 6px;
@@ -1177,6 +1201,30 @@ label {
   margin: 0;
   color: var(--muted);
   font-size: 13px;
+}
+
+.trace-item.approval {
+  background: #fff7e8;
+  border-color: #ffe0a6;
+}
+
+.approval-inline-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.approval-inline-actions small {
+  min-height: 24px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: #151515;
+  color: #fff;
+  font-weight: 800;
 }
 
 .agent-meta-card {
@@ -2421,6 +2469,101 @@ body:has(.simple-login-page) {
 .home-page {
   min-height: 100dvh;
   overflow: hidden;
+}
+
+/* ── Growth Profile (Memory Page) ─────────────────────────────────── */
+
+.growth-categories {
+  display: grid;
+  gap: 24px;
+}
+
+.growth-category {
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 20px;
+  background: rgb(255 255 255 / 78%);
+}
+
+.growth-category-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 14px;
+}
+
+.growth-category-head h3 {
+  margin: 0;
+  font-size: 17px;
+  letter-spacing: -0.03em;
+}
+
+.growth-memory-list {
+  display: grid;
+  gap: 10px;
+}
+
+.growth-memory-item {
+  display: grid;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: #fbfaf7;
+}
+
+.growth-memory-item.superseded {
+  opacity: 0.55;
+  background: #f5f5f5;
+  text-decoration: line-through;
+  text-decoration-color: #c0c0c0;
+}
+
+.growth-memory-item.archived {
+  opacity: 0.60;
+  background: #f9f9fb;
+}
+
+.growth-memory-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.growth-memory-item p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+  font-size: 14px;
+}
+
+.growth-memory-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.view-tabs .button.ghost {
+  border-color: transparent;
+  background: transparent;
+}
+
+.mini-pill.active {
+  background: #d4edda;
+  border-color: #a8d8b8;
+  color: #1a5c2a;
+}
+
+.mini-pill.superseded {
+  background: #f8d7da;
+  border-color: #e8b4b8;
+  color: #7a2a30;
+}
+
+.mini-pill.muted {
+  background: #f0f0f0;
+  border-color: #ddd;
+  color: #888;
 }
 
 .home-page .chat-scroll {

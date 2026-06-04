@@ -50,15 +50,22 @@ export interface FeedScore {
   opportunity_value?: number
   source_credibility?: number
   actionability?: number
+  profile_match?: number
+  semantic_memory_match?: number
   [key: string]: unknown
 }
 
 export interface FeedCard {
   id: number
   title: string
+  display_title?: string
+  original_title?: string
   one_sentence_value?: string
   why_you?: string
+  why_relevant?: string
+  benefit?: string
   information_gap?: string
+  next_action?: string
   summary?: string
   exposure_bucket?: string
   relation_type?: string
@@ -66,7 +73,8 @@ export interface FeedCard {
   domain?: string
   source_url?: string
   final_score?: number
-  score_detail?: FeedScore
+  score?: FeedScore
+  score_detail?: FeedScore & { original_title?: string; why_relevant?: string; benefit?: string; next_action?: string; summary?: string; [key: string]: unknown }
   evidence?: EvidenceItem[]
   suggested_actions?: string[]
   low_confidence?: boolean
@@ -116,6 +124,17 @@ export interface AgentStep {
   status?: string
   input?: UnknownRecord
   output?: UnknownRecord
+  [key: string]: unknown
+}
+
+export interface AgentEvent {
+  id?: number
+  run_id?: number
+  thread_id?: string
+  event_type?: string
+  node_name?: string
+  payload?: UnknownRecord
+  created_at?: string
   [key: string]: unknown
 }
 

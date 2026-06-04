@@ -123,5 +123,112 @@ class SkillService:
         feed_card = context.get("feed_card") or {}
         return " ".join(str(feed_card.get(key, "")) for key in ("title", "one_sentence_value", "why_you", "information_gap", "summary", "domain", "source_type"))
 
+    # ── Skill Evolution ───────────────────────────────────────────────
+
+    def record_skill_usage(self, skill_id: int, user_id: int, success: bool, db: Session | None = None) -> dict[str, Any]:
+        """Record a skill usage event and update evolution stats."""
+        if not db:
+            return {"skill_id": skill_id, "recorded": False}
+        repo = SkillRepository(db)
+        skill = repo.get_by_user(user_id, skill_id)
+        if not skill:
+            return {"skill_id": skill_id, "error": "not_found"}
+
+        stats = self._get_evolution_stats(skill)
+        if success:
+            stats["success_count"] = stats.get("success_count", 0) + 1
+        else:
+            stats["failure_count"] = stats.get("failure_count", 0) + 1
+
+        total = stats["success_count"] + stats["failure_count"]
+        stats["confidence"] = round(stats["success_count"] / max(1, total), 2)
+        stats["last_used_at"] = __import__("datetime").datetime.now(__import__("datetime").UTC).isoformat()
+
+        # Store evolution stats in eval_checks
+        updated_checks = self._merge_evolution_into_checks(skill.eval_checks or [], stats)
+        repo.update(skill, eval_checks=updated_checks)
+        return {"skill_id": skill_id, "stats": stats}
+
+    def get_skill_evolution(self, skill_id: int, user_id: int, db: Session | None = None) -> dict[str, Any]:
+        """Get evolution stats for a skill."""
+        if not db:
+            return {}
+        repo = SkillRepository(db)
+        skill = repo.get_by_user(user_id, skill_id)
+        if not skill:
+            return {}
+        return self._get_evolution_stats(skill)
+
+    def detect_repeated_workflow(
+        self, user_id: int, user_input: str, db: Session | None = None
+    ) -> dict[str, Any]:
+        """Check if the current task is similar to previously completed tasks.
+        Returns a reusable_score boost if a repeated pattern is detected."""
+        if not db:
+            return {"repeated": False, "boost": 0.0}
+
+        skills = SkillRepository(db).list_by_user(user_id)
+        input_terms = self._terms(user_input)
+
+        best_score = 0.0
+        best_skill = None
+        for skill in skills:
+            if skill.status in ("disabled",):
+                continue
+            skill_terms = self._terms(" ".join([
+                skill.name, skill.description, skill.trigger_text,
+                " ".join(map(str, skill.context_recipe or [])),
+            ]))
+            if not input_terms or not skill_terms:
+                continue
+            overlap = len(input_terms & skill_terms)
+            similarity = overlap / max(1, len(input_terms | skill_terms))
+            if similarity > best_score:
+                best_score = similarity
+                best_skill = self._to_dict(skill)
+
+        stats = self._get_evolution_stats(best_skill) if best_skill else {}
+        success_count = stats.get("success_count", 0)
+
+        # Boost reusable_score if a repeated pattern is found with >= 2 prior successes
+        boost = 0.0
+        if best_score >= 0.50 and success_count >= 2:
+            boost = min(0.25, 0.10 * success_count)
+
+        return {
+            "repeated": boost > 0,
+            "boost": round(boost, 2),
+            "similar_skill_id": best_skill.get("id") if best_skill else None,
+            "similarity": round(best_score, 2),
+            "prior_success_count": success_count,
+        }
+
+    def _get_evolution_stats(self, skill) -> dict[str, Any]:
+        """Extract evolution stats from skill's eval_checks."""
+        checks = getattr(skill, "eval_checks", None) or []
+        for item in checks:
+            if isinstance(item, dict) and item.get("_type") == "skill_evolution":
+                return {
+                    "success_count": item.get("success_count", 0),
+                    "failure_count": item.get("failure_count", 0),
+                    "confidence": item.get("confidence", 0.5),
+                    "last_used_at": item.get("last_used_at", ""),
+                }
+        return {"success_count": 0, "failure_count": 0, "confidence": 0.5, "last_used_at": ""}
+
+    def _merge_evolution_into_checks(self, checks: list, stats: dict) -> list:
+        """Merge evolution stats into the eval_checks list."""
+        new_checks = []
+        found = False
+        for item in checks:
+            if isinstance(item, dict) and item.get("_type") == "skill_evolution":
+                new_checks.append({"_type": "skill_evolution", **stats})
+                found = True
+            else:
+                new_checks.append(item)
+        if not found:
+            new_checks.append({"_type": "skill_evolution", **stats})
+        return new_checks
+
 
 skill_service = SkillService()

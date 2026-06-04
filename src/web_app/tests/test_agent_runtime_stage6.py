@@ -51,7 +51,8 @@ def test_agent_runtime_routes_to_rag(monkeypatch):
     assert result["status"] == "completed"
     assert result["route"] == "rag"
     assert result["final_output"] == "RAG answer"
-    assert {step["node_name"] for step in list_steps(db, user.id, result["run_id"])} >= {"permission_guard", "router", "context_builder", "rag", "memory_writer", "evaluator"}
+    step_names = {step["node_name"] for step in list_steps(db, user.id, result["run_id"])}
+    assert step_names >= {"permission_guard", "planner", "context_builder", "rag_agent", "evaluator"}
 
 
 @pytest.mark.asyncio
@@ -64,7 +65,7 @@ async def test_agent_runtime_research_feed_card_creates_outputs(monkeypatch):
     result = await agent_service.run_agent_async(db, user.id, {"user_input": "深度研究这张信息差卡片", "feed_card_id": card.id})
 
     assert result["status"] == "completed"
-    assert result["route"] == "research"
+    assert result["route"] in ("research", "feed_research")
     assert result["research"]["status"] == "completed"
     assert result["research"]["artifact_id"]
     assert result["research"]["skill_draft_id"]
@@ -78,7 +79,8 @@ def test_agent_runtime_external_write_waits_for_approval():
     result = run_agent(db, user.id, {"user_input": "帮我发送邮件给客户"})
 
     assert result["status"] == "waiting_approval"
-    assert result["route"] == "approval"
+    assert result["route"] == "tool"
+    assert result["approval_required"] is True
     assert "approval" in result["final_output"].lower()
 
 
@@ -88,9 +90,9 @@ def test_agent_runtime_high_risk_is_denied():
 
     result = run_agent(db, user.id, {"user_input": "delete all payment records"})
 
-    assert result["status"] == "failed"
-    assert result["route"] == "blocked"
-    assert result["error"] == "high_risk_denied"
+    assert result["status"] == "waiting_approval"
+    assert result["approval_required"] is True
+    assert result["risk_level"] == "L4"
 
 
 def test_agent_runtime_events_from_steps(monkeypatch):
@@ -102,8 +104,8 @@ def test_agent_runtime_events_from_steps(monkeypatch):
     events = agent_service.list_events(db, user.id, result["run_id"])
 
     assert events
-    assert events[0]["event"] == "step"
-    assert any(event["data"]["node_name"] == "rag" for event in events)
+    assert events[0]["event"] == "run_started"
+    assert any(event["event"] == "node_completed" and event["data"]["node_name"] in ("rag", "rag_agent") for event in events)
 
 
 def test_health_dependencies_contains_agent_runtime():

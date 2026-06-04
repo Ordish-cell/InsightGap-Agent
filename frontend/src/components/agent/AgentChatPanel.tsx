@@ -2,12 +2,12 @@ import { FormEvent, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 
 import * as agent from '../../api/agent'
-import type { AgentRun, AgentStep, Artifact, SkillDraft } from '../../api/types'
-import { statusLabel } from '../../utils/labels'
+import type { AgentEvent, AgentRun, AgentStep, Artifact, SkillDraft } from '../../api/types'
 import { JsonBlock } from '../common/JsonBlock'
 import { StatusPill } from '../common/StatusPill'
 
 type ChatMessage = { id: string; role: 'user' | 'assistant'; content: string }
+
 type AgentChatPanelProps = {
   source?: string
   pageContext?: Record<string, unknown>
@@ -17,20 +17,60 @@ type AgentChatPanelProps = {
   locale?: 'en' | 'zh'
 }
 
-function stepLabel(step: AgentStep, locale: 'en' | 'zh') {
-  const name = String(step.node_name || '').toLowerCase()
-  if (name.includes('permission')) return locale === 'zh' ? '检查安全权限' : 'Permission check'
-  if (name.includes('router')) return locale === 'zh' ? '识别任务路线' : 'Route task'
-  if (name.includes('context') || name.includes('feed_card')) return locale === 'zh' ? '构建上下文' : 'Build context'
-  if (name.includes('skill_matcher')) return locale === 'zh' ? '匹配 Skill' : 'Match Skill'
-  if (name.includes('rag')) return locale === 'zh' ? '检索知识库' : 'Search knowledge'
-  if (name.includes('research')) return locale === 'zh' ? '执行研究' : 'Run research'
-  if (name.includes('tool')) return locale === 'zh' ? '调用工具' : 'Call tool'
-  if (name.includes('artifact')) return locale === 'zh' ? '生成 Artifact' : 'Create artifact'
-  if (name.includes('memory')) return locale === 'zh' ? '写入记忆' : 'Write memory'
-  if (name.includes('skill')) return locale === 'zh' ? '处理 Skill' : 'Handle Skill'
-  if (name.includes('eval')) return locale === 'zh' ? '评估结果' : 'Evaluate result'
+function nodeLabel(name = '', locale: 'en' | 'zh') {
+  const node = name.toLowerCase()
+  const zh: Record<string, string> = {
+    permission: '风险识别',
+    home_intent: '需求判断',
+    planner: '计划生成',
+    context: '构建上下文',
+    skill_matcher: '匹配 Skill',
+    research: '深度研究',
+    rag: '知识库检索',
+    artifact: '生成成果',
+    tool: '工具执行',
+    memory: '写入记忆',
+    skill: '沉淀 Skill',
+    evaluator: '结果评估',
+    final: '最终回复',
+  }
+  const en: Record<string, string> = {
+    permission: 'Risk check',
+    home_intent: 'Intent triage',
+    planner: 'Plan',
+    context: 'Build context',
+    skill_matcher: 'Match Skill',
+    research: 'Research',
+    rag: 'Knowledge search',
+    artifact: 'Create artifact',
+    tool: 'Tool action',
+    memory: 'Write memory',
+    skill: 'Skill handling',
+    evaluator: 'Evaluate',
+    final: 'Final response',
+  }
+  const dict = locale === 'zh' ? zh : en
+  for (const key of Object.keys(dict)) {
+    if (node.includes(key)) return dict[key]
+  }
   return locale === 'zh' ? '执行步骤' : 'Run step'
+}
+
+function eventLabel(eventType = '', locale: 'en' | 'zh') {
+  if (locale !== 'zh') return eventType || 'completed'
+  const labels: Record<string, string> = {
+    run_started: '任务已开始',
+    run_completed: '任务已完成',
+    run_failed: '任务失败',
+    run_cancelled: '任务已取消',
+    node_started: '开始执行',
+    node_completed: '执行完成',
+    node_failed: '执行失败',
+    approval_required: '等待审批',
+    approval_approved: '审批已通过',
+    approval_rejected: '审批已拒绝',
+  }
+  return labels[eventType] || eventType || '已完成'
 }
 
 function skillName(skill: unknown) {
@@ -38,26 +78,71 @@ function skillName(skill: unknown) {
   return item?.name || item?.title || ''
 }
 
-export function AgentRunTimeline({ steps, running, locale = 'en' }: { steps: AgentStep[]; running: boolean; locale?: 'en' | 'zh' }) {
-  if (!running && !steps.length) return null
+function parseEvent(raw: string): AgentEvent | null {
+  try {
+    const parsed = JSON.parse(raw) as AgentEvent | { data?: AgentEvent }
+    if ('payload' in parsed || 'event_type' in parsed) return parsed as AgentEvent
+    const nested = (parsed as { data?: unknown }).data
+    return nested && typeof nested === 'object' ? (nested as AgentEvent) : null
+  } catch {
+    return null
+  }
+}
+
+type ExecutionTimelineProps = {
+  events: AgentEvent[]
+  steps: AgentStep[]
+  running: boolean
+  locale?: 'en' | 'zh'
+  onApprove?: (approvalId: number) => void
+  onReject?: (approvalId: number) => void
+}
+
+export function ExecutionTimeline({ events, steps, running, locale = 'en', onApprove, onReject }: ExecutionTimelineProps) {
+  const timeline = events.length
+    ? events.filter((event) => event.event_type !== 'node_started' || event.node_name)
+    : steps.map((step) => ({ id: step.id, event_type: step.status || 'step', node_name: step.node_name, payload: { status: step.status } }) as AgentEvent)
+
+  if (!running && !timeline.length) return null
+
   return (
     <article className="chat-message assistant">
       <div className="agent-trace">
         <div className="trace-header">
           <span className={running ? 'thinking-dot active' : 'thinking-dot'} />
-          <strong>{running ? (locale === 'zh' ? 'Agent 正在执行' : 'Running Agent') : locale === 'zh' ? 'Agent 已完成' : 'Agent completed'}</strong>
+          <strong>{running ? (locale === 'zh' ? 'Agent 正在执行' : 'Running Agent') : locale === 'zh' ? '执行时间线' : 'Execution timeline'}</strong>
         </div>
         <div className="trace-list">
-          {steps.length ? (
-            steps.map((step) => (
-              <div className="trace-item" key={step.id}>
-                <span className="trace-icon">✓</span>
-                <div>
-                  <strong>{stepLabel(step, locale)}</strong>
-                  <p>{statusLabel(step.status)}</p>
+          {timeline.length ? (
+            timeline.map((event, index) => {
+              const payload = event.payload || {}
+              const approvalId = Number(payload.approval_id || (payload.approval_payload as { approval_id?: number } | undefined)?.approval_id || 0)
+              const isApproval = event.event_type === 'approval_required'
+              return (
+                <div className={isApproval ? 'trace-item approval' : 'trace-item'} key={`${event.event_type}-${event.node_name}-${event.id || index}`}>
+                  <span className="trace-icon">{event.event_type?.includes('failed') ? '!' : '✓'}</span>
+                  <div>
+                    <strong>{isApproval ? (locale === 'zh' ? '需要审批' : 'Approval required') : nodeLabel(event.node_name || event.event_type, locale)}</strong>
+                    <p>{eventLabel(event.event_type || String(payload.status || 'completed'), locale)}</p>
+                    {isApproval ? (
+                      <div className="approval-inline-actions">
+                        <small>{String(payload.risk_level || payload.permission_level || 'L3')}</small>
+                        {approvalId ? (
+                          <>
+                            <button className="light-mini-button" onClick={() => onApprove?.(approvalId)}>
+                              {locale === 'zh' ? '批准执行' : 'Approve'}
+                            </button>
+                            <button className="light-mini-button" onClick={() => onReject?.(approvalId)}>
+                              {locale === 'zh' ? '拒绝' : 'Reject'}
+                            </button>
+                          </>
+                        ) : null}
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
-              </div>
-            ))
+              )
+            })
           ) : (
             <div className="trace-item">
               <span className="trace-icon loading">…</span>
@@ -77,6 +162,7 @@ function SkillMatchBadge({ run, locale = 'en' }: { run: AgentRun | null; locale?
   const matched = run?.matched_skill
   const candidates = run?.candidate_skills || []
   if (!matched && !candidates.length) return null
+
   return (
     <article className="chat-message assistant">
       <div className="agent-meta-card">
@@ -98,10 +184,11 @@ function SkillMatchBadge({ run, locale = 'en' }: { run: AgentRun | null; locale?
 
 function SkillDraftNotice({ draft, locale = 'en' }: { draft?: SkillDraft | null; locale?: 'en' | 'zh' }) {
   if (!draft) return null
+
   return (
     <article className="chat-message assistant">
       <div className="agent-meta-card">
-        <strong>{locale === 'zh' ? `已生成 Skill 草案：${draft.name || draft.description || `#${draft.id}`}` : `Skill draft created: ${draft.name || draft.description || `#${draft.id}`}`}</strong>
+        <strong>{locale === 'zh' ? `已生成 Skill 草稿：${draft.name || draft.description || `#${draft.id}`}` : `Skill draft created: ${draft.name || draft.description || `#${draft.id}`}`}</strong>
         <Link className="light-mini-button" to="/skills">
           {locale === 'zh' ? '去 Skills 审核' : 'Review in Skills'}
         </Link>
@@ -112,6 +199,7 @@ function SkillDraftNotice({ draft, locale = 'en' }: { draft?: SkillDraft | null;
 
 function ArtifactInlineList({ artifacts, locale = 'en' }: { artifacts?: Artifact[]; locale?: 'en' | 'zh' }) {
   if (!artifacts?.length) return null
+
   return (
     <article className="chat-message assistant">
       <div className="agent-meta-card">
@@ -126,33 +214,54 @@ function ArtifactInlineList({ artifacts, locale = 'en' }: { artifacts?: Artifact
   )
 }
 
-export function AgentChatPanel({ source = 'agent_page', pageContext = {}, placeholder = 'Enter a task for the Agent', initialTitle = 'What should we build or research?', debug = false, locale = 'en' }: AgentChatPanelProps) {
+export function AgentChatPanel({
+  source = 'agent_page',
+  pageContext = {},
+  placeholder = 'Enter a task for the Agent',
+  initialTitle = 'What should we build or research?',
+  debug = false,
+  locale = 'en',
+}: AgentChatPanelProps) {
   const bottomRef = useRef<HTMLDivElement | null>(null)
   const [userInput, setUserInput] = useState('')
   const [run, setRun] = useState<AgentRun | null>(null)
   const [steps, setSteps] = useState<AgentStep[]>([])
+  const [events, setEvents] = useState<AgentEvent[]>([])
   const [stream, setStream] = useState<string[]>([])
   const [running, setRunning] = useState(false)
   const [error, setError] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
 
-  const hasConversation = messages.length > 0 || running || Boolean(run) || steps.length > 0 || Boolean(error)
+  const hasConversation = messages.length > 0 || running || Boolean(run) || steps.length > 0 || events.length > 0 || Boolean(error)
 
   useEffect(() => {
     if (hasConversation) bottomRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
-  }, [hasConversation, messages, steps, running, run])
+  }, [hasConversation, messages, steps, events, running, run])
+
+  async function handleApproval(approvalId: number, approved: boolean) {
+    try {
+      if (approved) await agent.approveRunApproval(approvalId, { decision: 'approved' })
+      else await agent.rejectRunApproval(approvalId, { decision: 'rejected' })
+      setEvents((items) => [...items, { event_type: approved ? 'approval_approved' : 'approval_rejected', payload: { approval_id: approvalId } }])
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : locale === 'zh' ? '审批操作失败。' : 'Approval action failed.')
+    }
+  }
 
   async function submit(event: FormEvent) {
     event.preventDefault()
     const input = userInput.trim()
     if (!input || running) return
+
     setUserInput('')
     setError('')
     setRunning(true)
     setRun(null)
     setSteps([])
+    setEvents([])
     setStream([])
     setMessages((items) => [...items, { id: `${Date.now()}-user`, role: 'user', content: input }])
+
     try {
       const nextRun = await agent.createRun({
         user_input: input,
@@ -164,22 +273,25 @@ export function AgentChatPanel({ source = 'agent_page', pageContext = {}, placeh
         create_skill_draft_if_reusable: true,
       })
       setRun(nextRun)
+
       const runId = nextRun.run_id || nextRun.id
       if (runId) {
-        const sourceStream = agent.createRunStream(runId, {
+        const eventStream = agent.createRunEventStream(runId, {
           onMessage: async (message) => {
             setStream((items) => [...items.slice(-12), message.data])
+            const parsed = parseEvent(message.data)
+            if (parsed) setEvents((items) => [...items, parsed])
             try {
               const result = await agent.getSteps(runId)
               setSteps(result.steps || [])
             } catch {
-              /* keep current trace when step polling fails */
+              /* keep current timeline when step polling fails */
             }
           },
-          onError: () => setStream((items) => [...items, 'stream unavailable']),
+          onError: () => setStream((items) => [...items, 'events unavailable']),
         })
         setTimeout(async () => {
-          sourceStream.close()
+          eventStream.close()
           try {
             const result = await agent.getSteps(runId)
             setSteps(result.steps || [])
@@ -188,7 +300,9 @@ export function AgentChatPanel({ source = 'agent_page', pageContext = {}, placeh
           }
         }, 2600)
       }
-      setMessages((items) => [...items, { id: `${Date.now()}-assistant`, role: 'assistant', content: nextRun.final_output || (locale === 'zh' ? 'Agent 已完成，但当前没有可展示的输出。' : 'Agent completed, but no displayable output was returned.') }])
+
+      const fallback = locale === 'zh' ? 'Agent 已完成，但当前没有可展示的输出。' : 'Agent completed, but no displayable output was returned.'
+      setMessages((items) => [...items, { id: `${Date.now()}-assistant`, role: 'assistant', content: nextRun.final_output || fallback }])
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : locale === 'zh' ? 'Agent 运行失败，请稍后重试。' : 'Agent run failed. Please try again.')
     } finally {
@@ -201,14 +315,14 @@ export function AgentChatPanel({ source = 'agent_page', pageContext = {}, placeh
       <textarea value={userInput} onChange={(event) => setUserInput(event.target.value)} placeholder={placeholder} />
       <div className="composer-footer">
         <div className="composer-tools">
-          <button type="button" aria-label="Agent tools">
+          <button type="button" aria-label={locale === 'zh' ? 'Agent 工具' : 'Agent tools'}>
             +
           </button>
           <span>{locale === 'zh' ? '研究' : 'Research'}</span>
           <span>{locale === 'zh' ? '成果' : 'Artifact'}</span>
           <span>{locale === 'zh' ? '技能' : 'Skill'}</span>
         </div>
-        <button className={userInput.trim() ? 'send-button active' : 'send-button'} type="submit" disabled={!userInput.trim() || running} aria-label="Send">
+        <button className={userInput.trim() ? 'send-button active' : 'send-button'} type="submit" disabled={!userInput.trim() || running} aria-label={locale === 'zh' ? '发送' : 'Send'}>
           →
         </button>
       </div>
@@ -231,7 +345,7 @@ export function AgentChatPanel({ source = 'agent_page', pageContext = {}, placeh
                   <div className="message-bubble">{message.content}</div>
                 </article>
               ))}
-              <AgentRunTimeline steps={steps} running={running} locale={locale} />
+              <ExecutionTimeline events={events} steps={steps} running={running} locale={locale} onApprove={(id) => handleApproval(id, true)} onReject={(id) => handleApproval(id, false)} />
               <SkillMatchBadge run={run} locale={locale} />
               <SkillDraftNotice draft={run?.created_skill_draft || null} locale={locale} />
               <ArtifactInlineList artifacts={run?.artifacts} locale={locale} />
@@ -252,7 +366,7 @@ export function AgentChatPanel({ source = 'agent_page', pageContext = {}, placeh
               </div>
               <details>
                 <summary>Runtime debug</summary>
-                <JsonBlock value={{ run, stream, steps }} />
+                <JsonBlock value={{ run, stream, steps, events }} />
               </details>
             </div>
           ) : null}

@@ -88,8 +88,16 @@ export function HomePage() {
                   <span className="mini-pill">{item.label}</span>
                   <span className="mini-pill score">分数：{Math.round((item.card.final_score || 0) * 100)}</span>
                 </div>
-                <h3>{item.card.title}</h3>
-                <p>{item.card.one_sentence_value || item.card.summary || '这条信号可能带来新的判断角度。'}</p>
+                <h3>{item.card.display_title || item.card.title}</h3>
+                <p className="feed-value-line">{item.card.one_sentence_value || item.card.summary || '这条信号可能带来新的判断角度。'}</p>
+                <div className="feed-relevance-line">
+                  <strong>相关</strong>
+                  <span>{item.card.why_relevant || item.card.why_you || '与你当前关注的方向有交集。'}</span>
+                </div>
+                <div className="feed-benefit-line">
+                  <strong>好处</strong>
+                  <span>{item.card.benefit || '可能对你的产品和技术决策有参考价值。'}</span>
+                </div>
                 <div className="mini-insight">
                   <strong>信息差</strong>
                   <span>{item.card.information_gap || '暂无明确信息差说明，可由后续研究补全。'}</span>

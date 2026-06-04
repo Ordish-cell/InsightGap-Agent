@@ -201,7 +201,7 @@ class AgentStep(Base):
     __tablename__ = "agent_steps"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id"), index=True, nullable=False)
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id"), nullable=False)
     node_name: Mapped[str] = mapped_column(String(128), nullable=False)
     agent_name: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     action_type: Mapped[str] = mapped_column(String(128), default="", nullable=False)
@@ -210,6 +210,20 @@ class AgentStep(Base):
     status: Mapped[str] = mapped_column(String(32), default="created", nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AgentEvent(Base):
+    __tablename__ = "agent_events"
+    __table_args__ = (Index("ix_agent_events_run_id", "run_id"), Index("ix_agent_events_user_run", "user_id", "run_id"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id"), nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(255), default="", index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    node_name: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
 class MCPServer(Base, TimestampMixin):

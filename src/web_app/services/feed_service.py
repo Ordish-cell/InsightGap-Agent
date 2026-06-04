@@ -8,12 +8,13 @@ from src.web_app.db.repositories.agent_repository import AgentRunRepository
 from src.web_app.db.repositories.feed_repository import FeedFeedbackRepository, FeedRepository
 from src.web_app.db.repositories.info_repository import InfoItemRepository
 from src.web_app.db.repositories.profile_repository import ProfileRepository
-from src.web_app.feed.card_generator import generate_feed_card
+from src.web_app.feed.card_generator import generate_display_title, generate_feed_card, is_mostly_english
 from src.web_app.feed.dedup import deduplicate_items
 from src.web_app.feed.mixer import mix_cards
 from src.web_app.feed.normalizer import normalize_raw_item
 from src.web_app.feed.scorer import FeedScorer
 from src.web_app.feed.sources.manager import SearchSourceManager
+from src.web_app.services.memory_service import memory_service
 
 FEEDBACK_ACTIONS = {"save", "ignore", "useful", "not_relevant", "open", "deep_research", "generate_report", "create_skill_draft"}
 
@@ -26,6 +27,7 @@ def refresh_feed(db: Session, user_id: int) -> dict:
     info_repo = InfoItemRepository(db)
     feed_repo = FeedRepository(db)
     feedback_stats = FeedFeedbackRepository(db).get_user_feedback_stats(user_id)
+    semantic_memories = _safe_get_semantic_memories(user_id, db)
     scorer = FeedScorer()
     created_info = updated_info = 0
     candidate_cards: list[dict[str, Any]] = []
@@ -47,7 +49,7 @@ def refresh_feed(db: Session, user_id: int) -> dict:
         )
         created_info += int(created)
         updated_info += int(not created)
-        score = scorer.score(info_item, profile, feedback_stats)
+        score = scorer.score(info_item, profile, feedback_stats, semantic_memories)
         if score.get("filtered"):
             continue
         card = generate_feed_card(info_item, score, profile)
@@ -58,24 +60,31 @@ def refresh_feed(db: Session, user_id: int) -> dict:
     rows = []
     for card in mixed:
         score_detail = dict(card["score"])
-        score_detail.update({"source_type": card["source_type"], "domain": card["domain"], "confidence": card["confidence"], "summary": card["summary"]})
-        rows.append(
-            {
-                "user_id": user_id,
-                "info_item_id": card["info_item_id"],
-                "card_type": card["card_type"],
-                "title": card["title"],
-                "one_sentence_value": card["one_sentence_value"],
-                "why_you": card["why_you"],
-                "information_gap": card["information_gap"],
-                "evidence": card["evidence"],
-                "suggested_actions": card["suggested_actions"],
-                "score_detail": score_detail,
-                "final_score": card["final_score"],
-                "exposure_bucket": card["relation_type"],
-                "status": "active",
-            }
-        )
+        score_detail.update({
+            "source_type": card["source_type"],
+            "domain": card["domain"],
+            "confidence": card["confidence"],
+            "summary": card["summary"],
+            "original_title": card.get("original_title", card["title"]),
+            "why_relevant": card.get("why_relevant", card.get("why_you", "")),
+            "benefit": card.get("benefit", ""),
+            "next_action": card.get("next_action", ""),
+        })
+        rows.append({
+            "user_id": user_id,
+            "info_item_id": card["info_item_id"],
+            "card_type": card["card_type"],
+            "title": card["title"],
+            "one_sentence_value": card["one_sentence_value"],
+            "why_you": card["why_you"],
+            "information_gap": card["information_gap"],
+            "evidence": card["evidence"],
+            "suggested_actions": card["suggested_actions"],
+            "score_detail": score_detail,
+            "final_score": card["final_score"],
+            "exposure_bucket": card["relation_type"],
+            "status": "active",
+        })
     created_cards = feed_repo.bulk_create(rows) if rows else []
     return {
         "created_info_items": created_info,
@@ -139,20 +148,44 @@ def stats(db: Session, user_id: int) -> dict:
 
 def card_to_dict(card) -> dict:
     detail = card.score_detail or {}
+    score_fields = {"personal_relevance", "novelty", "cross_domain_distance", "opportunity_value", "source_credibility", "actionability", "final", "profile_match", "semantic_memory_match"}
+
+    db_title = card.title or ""
+    original_title = detail.get("original_title", "")
+    source_type = detail.get("source_type", "")
+    domain = detail.get("domain", "ai")
+
+    # If no original_title stored, the DB title IS the original (pre-Phase11B cards)
+    if not original_title:
+        original_title = db_title
+
+    # Determine display title: use DB title if already Chinese, else generate
+    if is_mostly_english(db_title):
+        display_title = generate_display_title(db_title, source_type, [], domain)
+    else:
+        display_title = db_title
+
     return {
         "id": str(card.id),
         "card_type": card.card_type,
-        "title": card.title,
+        "title": display_title,
+        "display_title": display_title,
+        "original_title": original_title,
         "one_sentence_value": card.one_sentence_value,
         "why_you": card.why_you,
+        "why_relevant": detail.get("why_relevant", card.why_you),
+        "benefit": detail.get("benefit", ""),
         "information_gap": card.information_gap,
+        "next_action": detail.get("next_action", ""),
         "summary": detail.get("summary", ""),
         "source_type": detail.get("source_type", ""),
         "domain": detail.get("domain", ""),
         "relation_type": card.exposure_bucket,
+        "exposure_bucket": card.exposure_bucket,
         "evidence": card.evidence or [],
         "suggested_actions": card.suggested_actions or [],
-        "score": {key: value for key, value in detail.items() if key in {"personal_relevance", "novelty", "cross_domain_distance", "opportunity_value", "source_credibility", "actionability", "final"}},
+        "score": {key: value for key, value in detail.items() if key in score_fields},
+        "score_detail": {key: value for key, value in detail.items() if key not in score_fields and key not in ("summary",)},
         "final_score": card.final_score,
         "confidence": detail.get("confidence", "medium"),
         "status": card.status,
@@ -176,6 +209,13 @@ def _profile_with_defaults(profile):
     if not profile.far_domains:
         profile.far_domains = ["创业机会", "行业情报", "投资研究", "教育产品"]
     return profile
+
+
+def _safe_get_semantic_memories(user_id: int, db: Session) -> list[dict[str, Any]]:
+    try:
+        return memory_service.get_semantic_memories(user_id, db)
+    except Exception:
+        return []
 
 
 def _run_async(coro):

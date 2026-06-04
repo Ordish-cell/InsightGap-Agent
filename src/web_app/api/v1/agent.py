@@ -7,6 +7,7 @@ from src.web_app.agent.schemas import AgentRunRequest
 from src.web_app.db.session import get_db
 from src.web_app.schemas.common import ok
 from src.web_app.services.agent_service import get_run as get_run_data, list_events, list_steps, run_agent_async
+from src.web_app.services.approval_service import update_approval_status
 from src.web_app.services.auth_service import get_current_user_id
 
 router = APIRouter()
@@ -39,3 +40,21 @@ def stream_run(run_id: int, user_id: int = Depends(get_current_user_id), db: Ses
         yield from to_sse(list_events(db, user_id, run_id))
 
     return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@router.get("/runs/{run_id}/events")
+def run_events(run_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    def events():
+        yield from to_sse(list_events(db, user_id, run_id))
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
+
+@router.post("/approvals/{approval_id}/approve")
+def approve_agent_approval(approval_id: int, payload: dict | None = None, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    return ok(update_approval_status(db, user_id, approval_id, "approved", payload or {}))
+
+
+@router.post("/approvals/{approval_id}/reject")
+def reject_agent_approval(approval_id: int, payload: dict | None = None, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    return ok(update_approval_status(db, user_id, approval_id, "rejected", payload or {}))
