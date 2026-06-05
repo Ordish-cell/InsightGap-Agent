@@ -1,7 +1,7 @@
 from sqlalchemy import select
 
 from src.web_app.db.repositories.base_repository import BaseRepository
-from src.web_app.models.orm import AgentEvent, AgentRun, AgentStep
+from src.web_app.models.orm import AgentEvent, AgentRun, AgentStep, LLMCall
 
 
 class AgentRunRepository(BaseRepository[AgentRun]):
@@ -23,4 +23,12 @@ class AgentEventRepository(BaseRepository[AgentEvent]):
 
     def list_by_run(self, user_id: int, run_id: int) -> list[AgentEvent]:
         stmt = select(AgentEvent).where(AgentEvent.user_id == user_id, AgentEvent.run_id == run_id).order_by(AgentEvent.id)
+        return list(self.db.execute(stmt).scalars())
+
+
+class LLMCallRepository(BaseRepository[LLMCall]):
+    model = LLMCall
+
+    def list_by_run(self, user_id: int, run_id: int) -> list[LLMCall]:
+        stmt = select(LLMCall).where(LLMCall.user_id == user_id, LLMCall.run_id == run_id).order_by(LLMCall.id)
         return list(self.db.execute(stmt).scalars())

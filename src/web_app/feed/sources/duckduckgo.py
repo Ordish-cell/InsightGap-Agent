@@ -9,7 +9,7 @@ class DuckDuckGoSource(FeedSource):
     source_type = "web"
 
     def __init__(self):
-        self.enabled = settings.feed_duckduckgo_enabled
+        self.enabled = settings.feed_duckduckgo_enabled and settings.feed_source_duckduckgo_enabled
         self.max_items = settings.feed_duckduckgo_max_items
 
     async def fetch(self) -> list[RawFeedItem]:

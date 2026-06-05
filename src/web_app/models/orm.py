@@ -226,6 +226,31 @@ class AgentEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
+class LLMCall(Base):
+    __tablename__ = "llm_calls"
+    __table_args__ = (Index("ix_llm_calls_run_id", "run_id"), Index("ix_llm_calls_user_run", "user_id", "run_id"))
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True)
+    thread_id: Mapped[str] = mapped_column(String(255), default="", index=True, nullable=False)
+    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), index=True, nullable=True)
+    node_name: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    purpose: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    tier: Mapped[str] = mapped_column(String(32), nullable=False)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    estimated_input_chars: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    estimated_output_chars: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
 class MCPServer(Base, TimestampMixin):
     __tablename__ = "mcp_servers"
 

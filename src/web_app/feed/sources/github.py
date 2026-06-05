@@ -12,7 +12,7 @@ class GitHubSource(FeedSource):
     source_type = "github"
 
     def __init__(self):
-        self.enabled = settings.feed_github_enabled
+        self.enabled = settings.feed_github_enabled and settings.feed_source_github_enabled
         self.max_items = settings.feed_github_max_items
 
     async def fetch(self) -> list[RawFeedItem]:

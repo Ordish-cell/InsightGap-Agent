@@ -11,7 +11,7 @@ class ArxivSource(FeedSource):
     source_type = "paper"
 
     def __init__(self):
-        self.enabled = settings.feed_arxiv_enabled
+        self.enabled = settings.feed_arxiv_enabled and settings.feed_source_arxiv_enabled
         self.max_items = settings.feed_arxiv_max_items
 
     async def fetch(self) -> list[RawFeedItem]:

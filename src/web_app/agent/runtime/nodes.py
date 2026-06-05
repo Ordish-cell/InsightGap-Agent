@@ -2,7 +2,13 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from src.web_app.agent.runtime.checkpoint import record_step
+from src.web_app.agent.llm.config import get_llm_settings
+from src.web_app.agent.llm.errors import LLMInvocationError, LLMParseError, LLMUnavailableError
+from src.web_app.agent.llm.router import resolve_model_name
+from src.web_app.agent.runtime.checkpoint import record_event, record_step
+from src.web_app.agent.runtime.intent_llm import infer_home_intent_with_llm
+from src.web_app.agent.runtime.intent_schema import HomeIntentResult
+from src.web_app.agent.runtime.langgraph_status import append_status_step
 from src.web_app.agent.runtime.planner import plan_route
 from src.web_app.agent.runtime.router import route_user_input
 from src.web_app.agent.runtime.state import AgentRuntimeState, append_error, append_output, mark_completed
@@ -52,25 +58,69 @@ class RuntimeNodes:
         user_input = state.get("user_input", "") or state.get("query", "")
         page_context = self.payload.get("page_context") or state.get("page_context") or {}
         feed_card_id = self.payload.get("feed_card_id") or page_context.get("selected_feed_card_id") or page_context.get("feed_card_id")
-        route_plan = plan_route(
-            user_input=user_input,
-            feed_card_id=feed_card_id,
-            forced_route=self.payload.get("route"),
-            forced_intent=self.payload.get("intent"),
+        thread_id = state.get("thread_id", "")
+        record_event(
+            self.db,
+            state["run_id"],
+            "home_intent_started",
+            {"node_name": "home_intent_react", "input_preview": user_input[:200]},
+            node_name="home_intent_react",
+            user_id=state.get("user_id"),
+            thread_id=thread_id,
         )
-        home_intent = {
-            "detected_intent": route_plan.get("intent", "chat"),
-            "confidence": 0.72 if route_plan.get("reason") != "default_chat_route" else 0.5,
-            "risk_level": route_plan.get("risk_level", "L0"),
-            "required_capabilities": [node.replace("_agent", "") for node in route_plan.get("route", []) if node.endswith("_agent")],
-            "expected_output": route_plan.get("expected_output", "answer"),
-            "needs_approval": route_plan.get("needs_approval", False),
-            "needs_clarification": False,
-            "reasoning_summary": route_plan.get("reason", "default_chat_route"),
-            "suggested_route_hints": route_plan.get("route", []),
-        }
+        home_intent = self._rule_home_intent(user_input, feed_card_id)
+        fallback_reason = ""
+        llm_settings = get_llm_settings()
+        if llm_settings.enabled and llm_settings.intent_llm_enabled:
+            try:
+                llm_intent = infer_home_intent_with_llm(
+                    self.db,
+                    run_id=state["run_id"],
+                    thread_id=thread_id,
+                    user_id=state["user_id"],
+                    user_input=user_input,
+                    page_context=page_context,
+                    selected_feed_card_id=feed_card_id,
+                )
+                home_intent = self._apply_rule_risk_floor(llm_intent, home_intent)
+            except (LLMUnavailableError, LLMInvocationError, LLMParseError) as exc:
+                fallback_reason = str(exc)
+                home_intent["fallback_used"] = True
+                home_intent["raw_intent_source"] = "fallback"
+                record_event(
+                    self.db,
+                    state["run_id"],
+                    "home_intent_fallback_used",
+                    {"reason": fallback_reason[:200], "input_preview": user_input[:200]},
+                    node_name="home_intent_react",
+                    user_id=state.get("user_id"),
+                    thread_id=thread_id,
+                )
         state["home_intent"] = home_intent
+        append_status_step(
+            state,
+            key="home_intent",
+            node_name="home_intent_react",
+            detail=f"识别为 {home_intent.get('intent') or home_intent.get('detected_intent')}，风险等级 {home_intent.get('risk_level')}",
+            model=home_intent.get("model_used"),
+            extra={
+                "intent": home_intent.get("intent") or home_intent.get("detected_intent"),
+                "risk_level": home_intent.get("risk_level"),
+                "needs_approval": home_intent.get("needs_approval"),
+                "fallback_used": home_intent.get("fallback_used", False),
+                "reason_summary": home_intent.get("reason_summary") or home_intent.get("reasoning_summary", ""),
+            },
+        )
         record_step(self.db, state["run_id"], "home_intent_react", "triage_intent", {"user_input": user_input, "page_context": page_context}, {"home_intent": home_intent})
+        record_event(
+            self.db,
+            state["run_id"],
+            "home_intent_completed",
+            {"home_intent": home_intent, "fallback_reason": fallback_reason},
+            node_name="home_intent_react",
+            user_id=state.get("user_id"),
+            thread_id=thread_id,
+        )
         mark_completed(state, "home_intent_react")
         return state
 
@@ -129,6 +179,19 @@ class RuntimeNodes:
                     {"route": route, "feed_card_id": feed_card_id},
                     {"memory_count": len(memories), "feed_card_loaded": bool(feed_card_context),
                      "gssc_debug": gssc_debug, "context": context_text})
+        append_status_step(
+            state,
+            key="context_builder",
+            node_name="context_builder",
+            detail=f"已选择 {len(gssc_debug.get('selected_sources', []))} 类上下文，记忆 {len(memories)} 条",
+            extra={
+                "selected_sources": gssc_debug.get("selected_sources", []),
+                "dropped_sources": gssc_debug.get("dropped_sources", []),
+                "token_budget_used": gssc_debug.get("token_budget_used", 0),
+                "memory_count": len(memories),
+                "feed_card_loaded": bool(feed_card_context),
+            },
+        )
         if feed_card_id and not feed_card_context:
             record_step(self.db, state["run_id"], "feed_card_context", "load_context",
                         {"feed_card_id": feed_card_id},
@@ -154,6 +217,17 @@ class RuntimeNodes:
             "match_skill",
             {"user_input": state.get("user_input", ""), "feed_card_id": (state.get("context") or {}).get("feed_card", {}).get("id")},
             {"matched_skill": state.get("matched_skill"), "candidate_skills": state.get("candidate_skills", [])},
+        )
+        append_status_step(
+            state,
+            key="skill_matcher",
+            node_name="skill_matcher",
+            detail="命中可复用 Skill" if state.get("matched_skill") else "未命中可自动使用的 Skill",
+            extra={
+                "matched": bool(state.get("matched_skill")),
+                "auto_use": bool(state.get("matched_skill")),
+                "score": (state.get("matched_skill") or {}).get("match_score"),
+            },
         )
         return state
 
@@ -364,6 +438,13 @@ class RuntimeNodes:
         }
         if not state.get("final_output") and status == "completed":
             state["final_output"] = "Agent runtime completed."
+        append_status_step(
+            state,
+            key="evaluator",
+            node_name="evaluator",
+            detail=f"评估完成，状态 {status}",
+            extra={"status": status, "errors": len(state.get("errors", [])), "warnings": []},
+        )
         record_step(self.db, state["run_id"], "evaluator", "evaluate", {"route": state.get("route")}, {"evaluation": state["evaluation"]})
         mark_completed(state, "evaluator")
         return state
@@ -383,9 +464,11 @@ class RuntimeNodes:
             feed_card_id=feed_card_id,
             forced_route=self.payload.get("route"),
             forced_intent=self.payload.get("intent"),
+            home_intent=state.get("home_intent"),
         )
         state["route_plan"] = route_plan
-        state["route"] = route_plan.get("intent", "chat")  # legacy compat
+        route_intent = route_plan.get("intent", "chat")
+        state["route"] = "tool" if str(route_intent).startswith("tool.") else route_intent  # legacy compat
         state["approval_required"] = route_plan.get("needs_approval", False)
 
         if route_plan.get("needs_approval"):
@@ -406,9 +489,30 @@ class RuntimeNodes:
             state["approval_payload"]["approval_id"] = approval.id
 
         mark_completed(state, "planner")
+        append_status_step(
+            state,
+            key="planner",
+            node_name="planner",
+            detail=f"计划调用 {len(route_plan.get('route', []))} 个关键节点，风险等级 {route_plan.get('risk_level', 'L0')}",
+            model=resolve_model_name("planner").model,
+            extra={
+                "route": route_plan.get("route", []),
+                "risk_level": route_plan.get("risk_level", "L0"),
+                "steps_count": len(route_plan.get("route", [])),
+            },
+        )
         record_step(self.db, state["run_id"], "planner", "plan_route",
                     {"user_input": user_input, "feed_card_id": feed_card_id},
                     {"route_plan": route_plan})
+        record_event(
+            self.db,
+            state["run_id"],
+            "plan_created",
+            {"route_plan": route_plan, "requires_approval": state.get("approval_required", False)},
+            node_name="planner",
+            user_id=state.get("user_id"),
+            thread_id=state.get("thread_id", ""),
+        )
         return state
 
     async def research_agent(self, state: AgentRuntimeState) -> AgentRuntimeState:
@@ -453,6 +557,18 @@ class RuntimeNodes:
             record_step(self.db, state["run_id"], "research_agent", "deep_research",
                         {"feed_card_id": feed_card_id_int, "query": request.query},
                         {"research_run_id": result.get("id"), "status": result.get("status")})
+            append_status_step(
+                state,
+                key="research_agent",
+                node_name="research_agent",
+                detail=f"研究状态 {result.get('status', 'completed')}，生成 Artifact {1 if result.get('artifact_id') else 0} 个",
+                model=resolve_model_name("research", complexity="high").model,
+                extra={
+                    "summary": result.get("summary", ""),
+                    "source_count": len(result.get("evidence", [])),
+                    "artifact_count": 1 if result.get("artifact_id") else 0,
+                },
+            )
         except Exception as exc:
             append_error(state, "research_agent", str(exc))
             record_step(self.db, state["run_id"], "research_agent", "deep_research",
@@ -476,6 +592,18 @@ class RuntimeNodes:
                         {"query": state.get("user_input", "")},
                         {"answer_mode": result.get("answer_mode"),
                          "evidence_count": len(result.get("evidence", []))})
+            append_status_step(
+                state,
+                key="rag_agent",
+                node_name="rag_agent",
+                detail=f"检索到 {len(result.get('evidence', []))} 条证据",
+                model=resolve_model_name("rag").model,
+                extra={
+                    "evidence_count": len(result.get("evidence", [])),
+                    "embedding_model": resolve_model_name("embedding").model,
+                    "answer_model": resolve_model_name("rag").model,
+                },
+            )
         except Exception as exc:
             append_error(state, "rag_agent", str(exc))
             state["rag_result"] = {"answer": "", "evidence": [], "error": str(exc)}
@@ -527,6 +655,14 @@ class RuntimeNodes:
             append_output(state, "artifact_agent", artifact)
             record_step(self.db, state["run_id"], "artifact_agent", "save_artifact",
                         {"filename": filename}, {"artifact": artifact})
+            append_status_step(
+                state,
+                key="artifact_agent",
+                node_name="artifact_agent",
+                detail=f"已生成 {artifact_type} Artifact",
+                model=resolve_model_name("artifact").model,
+                extra={"artifact_type": artifact_type, "artifact_id": item.id, "title": item.title},
+            )
         except Exception as exc:
             append_error(state, "artifact_agent", str(exc))
         mark_completed(state, "artifact_agent")
@@ -551,6 +687,14 @@ class RuntimeNodes:
                 append_output(state, "tool_agent", state["tool_result"])
                 record_step(self.db, state["run_id"], "tool_agent", "mcp_approval_required",
                             {"route_plan": route_plan}, {"tool_result": state["tool_result"]})
+                append_status_step(
+                    state,
+                    key="tool_agent",
+                    node_name="tool_agent",
+                    status="waiting_approval",
+                    detail=f"工具动作需要审批，风险等级 {route_plan.get('risk_level', 'L3')}",
+                    extra={"risk_level": route_plan.get("risk_level", "L3"), "dry_run": True, "approval_required": True},
+                )
                 mark_completed(state, "tool_agent")
                 return state
 
@@ -566,6 +710,13 @@ class RuntimeNodes:
                 append_output(state, "tool_agent", {"tool_name": tool_name, "status": result.get("status")})
                 record_step(self.db, state["run_id"], "tool_agent", "mcp_call",
                             {"tool_name": tool_name}, {"status": result.get("status")})
+                append_status_step(
+                    state,
+                    key="tool_agent",
+                    node_name="tool_agent",
+                    detail=f"工具 {tool_name} 状态 {result.get('status')}",
+                    extra={"risk_level": route_plan.get("risk_level", "L0"), "dry_run": bool(self.payload.get("dry_run", False)), "approval_required": False},
+                )
         except Exception as exc:
             append_error(state, "tool_agent", str(exc))
         mark_completed(state, "tool_agent")
@@ -616,6 +767,14 @@ class RuntimeNodes:
             append_output(state, "memory_agent", state["memory_result"])
             record_step(self.db, state["run_id"], "memory_agent", "write_memory", {},
                         {"memory_result": state["memory_result"]})
+            append_status_step(
+                state,
+                key="memory_agent",
+                node_name="memory_agent",
+                detail=f"写入记忆 {state['memory_result']['saved_count']} 条",
+                model=resolve_model_name("memory", complexity="low").model,
+                extra={"memory_writes": state["memory_result"]["saved_count"]},
+            )
         except Exception as exc:
             append_error(state, "memory_agent", str(exc))
         mark_completed(state, "memory_agent")
@@ -660,6 +819,14 @@ class RuntimeNodes:
             append_output(state, "skill_agent", state["skill_result"])
             record_step(self.db, state["run_id"], "skill_agent", "detect_reuse", {},
                         {"skill_result": state["skill_result"], "created_skill_draft": created})
+            append_status_step(
+                state,
+                key="skill_agent",
+                node_name="skill_agent",
+                detail="已生成 Skill 草稿" if created else "未生成 Skill 草稿",
+                model=resolve_model_name("skill", complexity="low").model,
+                extra={"skill_drafts": len(state.get("skill_drafts", [])), "created": created is not None},
+            )
         except Exception as exc:
             append_error(state, "skill_agent", str(exc))
         mark_completed(state, "skill_agent")
@@ -697,6 +864,7 @@ class RuntimeNodes:
 
         final_payload = {
             "run_id": str(state.get("run_id", "")),
+            "thread_id": state.get("thread_id", ""),
             "intent": intent,
             "route": route_plan.get("route", []),
             "answer": final_answer,
@@ -713,6 +881,20 @@ class RuntimeNodes:
             "errors": errors,
             "agent_outputs": state.get("agent_outputs", []),
         }
+        append_status_step(
+            state,
+            key="final_response",
+            node_name="final_response",
+            detail="已生成最终回答" if final_answer else "最终回答为空",
+            model=resolve_model_name("final").model,
+            extra={
+                "answer_generated": bool(final_answer),
+                "cards_count": 0,
+                "artifacts_count": len(state.get("artifacts", [])),
+                "tool_calls_count": 1 if state.get("tool_call") else 0,
+            },
+        )
+        final_payload["langgraphstatus"] = state.get("langgraphstatus", {})
         state["final_payload"] = final_payload
         state["status"] = status
 
@@ -724,6 +906,40 @@ class RuntimeNodes:
         return state
 
     # ── Helper methods ──────────────────────────────────────────────
+
+    def _rule_home_intent(self, user_input: str, feed_card_id: Any) -> dict[str, Any]:
+        route_plan = plan_route(
+            user_input=user_input,
+            feed_card_id=feed_card_id,
+            forced_route=self.payload.get("route"),
+            forced_intent=self.payload.get("intent"),
+        )
+        result = HomeIntentResult(
+            intent=route_plan.get("intent", "chat"),
+            confidence=0.72 if route_plan.get("reason") != "default_chat_route" else 0.5,
+            risk_level=route_plan.get("risk_level", "L0"),
+            needs_approval=route_plan.get("needs_approval", False),
+            needs_clarification=False,
+            required_agents=route_plan.get("route", []),
+            expected_output=route_plan.get("expected_output", "answer"),
+            reason_summary=route_plan.get("reason", "default_chat_route"),
+            suggested_route_hints=route_plan.get("route", []),
+            fallback_used=False,
+            raw_intent_source="rule",
+        )
+        return result.to_home_intent_dict()
+
+    def _apply_rule_risk_floor(self, llm_intent: HomeIntentResult, rule_intent: dict[str, Any]) -> dict[str, Any]:
+        order = {"L0": 0, "L1": 1, "L2": 2, "L3": 3, "L4": 4}
+        data = llm_intent.to_home_intent_dict()
+        rule_risk = str(rule_intent.get("risk_level", "L0"))
+        llm_risk = str(data.get("risk_level", "L0"))
+        if order.get(rule_risk, 0) > order.get(llm_risk, 0):
+            data["risk_level"] = rule_risk
+            data["needs_approval"] = rule_risk in {"L3", "L4"} or bool(data.get("needs_approval"))
+            data["reason_summary"] = f"{data.get('reason_summary', '')}；规则风险兜底提升为 {rule_risk}".strip("；")
+            data["reasoning_summary"] = data["reason_summary"]
+        return data
 
     def _build_conversation_summary(self, run_id: int) -> str:
         """Build a short conversation summary from recent agent steps of this run."""

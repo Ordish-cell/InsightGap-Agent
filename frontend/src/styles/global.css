@@ -1203,6 +1203,19 @@ label {
   font-size: 13px;
 }
 
+.trace-model-line {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.langgraph-status-panel .trace-header small {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .trace-item.approval {
   background: #fff7e8;
   border-color: #ffe0a6;

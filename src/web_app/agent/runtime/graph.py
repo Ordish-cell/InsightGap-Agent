@@ -9,11 +9,9 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from src.web_app.agent.runtime.checkpointers import build_checkpointer
 from src.web_app.agent.runtime.fallback import run_fallback
 from src.web_app.agent.runtime.nodes import RuntimeNodes
 from src.web_app.agent.runtime.state import AgentRuntimeState, append_output
-from src.web_app.core.config import settings
 
 
 class AgentRuntime:
@@ -135,8 +133,7 @@ class AgentRuntime:
         # Final response → END
         workflow.add_edge("final_response", END)
 
-        checkpointer = build_checkpointer(settings.redis_url)
-        return workflow.compile(checkpointer=checkpointer) if checkpointer else workflow.compile()
+        return workflow.compile()
 
     # ── Conditional routing ──────────────────────────────────────
 

@@ -2,7 +2,7 @@ from typing import Any, Literal, TypedDict
 
 AgentRoute = Literal["research", "rag", "artifact", "skill", "memory", "tool", "blocked", "approval", "chat", "feed_research", "mixed"]
 
-AgentIntent = Literal["chat", "research", "rag", "artifact", "tool", "memory", "skill", "feed_research", "mixed"]
+AgentIntent = Literal["chat", "research", "rag", "artifact", "tool", "tool.email", "tool.browser", "tool.comment", "tool.form_submit", "memory", "skill", "feed_research", "mixed"]
 
 RiskLevel = Literal["L0", "L1", "L2", "L3", "L4"]
 
@@ -31,6 +31,7 @@ class AgentRuntimeState(TypedDict, total=False):
     # ── Planner output ─────────────────────────────────────────────
     route_plan: RoutePlan
     home_intent: dict[str, Any]
+    langgraphstatus: dict[str, Any]
     current_node: str
     completed_nodes: list[str]
     errors: list[dict[str, Any]]

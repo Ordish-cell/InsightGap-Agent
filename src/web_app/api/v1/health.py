@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from src.web_app.core.config import settings
-from src.web_app.db.session import check_mysql_health, check_redis_health
+from src.web_app.db.session import check_db_health, check_redis_health
 from src.web_app.rag.qdrant_client import check_qdrant_health
 from src.web_app.rag.embeddings import get_embedding_dimension
 from src.web_app.services.feed_service import source_health
@@ -22,7 +22,7 @@ def health():
 def dependencies():
     return ok(
         {
-            "mysql": check_mysql_health(),
+            "database": check_db_health(),
             "redis": check_redis_health(),
             "qdrant": check_qdrant_health(),
             "qdrant_collection": settings.qdrant_collection,

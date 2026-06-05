@@ -4,6 +4,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from src.web_app.context.builder import ContextBuilder
+from src.web_app.agent.llm.router import resolve_model_name
 from src.web_app.core.config import settings
 from src.web_app.models.orm import Document, DocumentChunk
 from src.web_app.rag.embeddings import embed_text
@@ -13,7 +14,7 @@ from src.web_app.rag.vector_store import QdrantVectorStore
 class RAGService:
     def dependency_status(self) -> dict[str, Any]:
         configured = bool(settings.qdrant_url)
-        return {"qdrant_configured": configured, "collection": settings.qdrant_collection}
+        return {"qdrant_configured": configured, "collection": settings.qdrant_collection, "embedding_model": resolve_model_name("embedding").model, "answer_model": resolve_model_name("rag").model}
 
     def ingest_text(self, user_id: int, document_id: int, text: str) -> dict[str, Any]:
         return {"status": "deprecated", "reason": "Use DocumentService.ingest_document for persisted RAG ingestion", "user_id": user_id, "document_id": document_id}
@@ -33,7 +34,7 @@ class RAGService:
                 "answer": "当前知识库中没有找到足够证据回答该问题。",
                 "answer_mode": "no_evidence",
                 "evidence": [],
-                "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0},
+                "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0, "embedding_model": resolve_model_name("embedding").model, "answer_model": resolve_model_name("rag").model},
             }
         evidence = [
             {
@@ -53,7 +54,7 @@ class RAGService:
             "answer": answer,
             "answer_mode": "extractive_fallback",
             "evidence": evidence,
-            "context": {"gssc_used": True, "selected_chunks": len(evidence), "token_estimate": max(1, len(context) // 4)},
+            "context": {"gssc_used": True, "selected_chunks": len(evidence), "token_estimate": max(1, len(context) // 4), "embedding_model": resolve_model_name("embedding").model, "answer_model": resolve_model_name("rag").model},
         }
 
     def stats(self, db: Session, user_id: int) -> dict[str, Any]:

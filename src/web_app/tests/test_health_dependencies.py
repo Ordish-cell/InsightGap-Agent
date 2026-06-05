@@ -8,4 +8,4 @@ def test_health_dependencies_no_crash():
     assert response.status_code == 200
     data = response.json()
     assert data["success"] is True
-    assert "mysql" in data["data"]
+    assert "database" in data["data"]

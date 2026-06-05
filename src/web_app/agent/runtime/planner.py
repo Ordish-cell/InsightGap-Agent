@@ -58,6 +58,7 @@ def plan_route(
     context_summary: str = "",
     forced_route: str | None = None,
     forced_intent: str | None = None,
+    home_intent: dict[str, Any] | None = None,
 ) -> RoutePlan:
     """Produce a RoutePlan from user_input and optional context.
     Rule-based, deterministic. No LLM.
@@ -82,6 +83,13 @@ def plan_route(
     is_tool = any(term in text for term in _TOOL_TERMS) or any(term in text for term in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "打开网页", "删除", "支付", "付款", "转账"])
     is_memory = any(term in text for term in _MEMORY_TERMS)
     is_skill = any(term in text for term in _SKILL_TERMS)
+
+    llm_intent = str((home_intent or {}).get("intent") or (home_intent or {}).get("detected_intent") or "")
+    if not forced and llm_intent in {"chat", "research", "rag", "artifact", "feed_research", "tool", "tool.email", "tool.browser", "tool.comment", "tool.form_submit", "memory", "skill", "mixed"}:
+        intent = llm_intent  # type: ignore[assignment]
+        reasons.append("home_intent_used")
+        if llm_intent.startswith("tool."):
+            is_tool = True
 
     # Feed card deep-dive takes priority
     if feed_card_id and is_research:
@@ -130,7 +138,7 @@ def plan_route(
     if intent in ("artifact", "mixed") or is_artifact:
         route.append("artifact_agent")
         reasons.append("artifact_agent_in_route")
-    if intent == "tool" or is_tool:
+    if intent == "tool" or str(intent).startswith("tool.") or is_tool:
         route.append("tool_agent")
         reasons.append("tool_agent_in_route")
 
@@ -162,10 +170,18 @@ def plan_route(
             reasons.append("external_write_l3")
         elif intent == "tool":
             risk_level = "L2"
-    elif intent in ("research", "rag"):
+    elif intent in ("research", "feed_research", "rag"):
         risk_level = "L1"
     elif intent == "artifact":
         risk_level = "L2"
+
+    if home_intent:
+        llm_risk = str(home_intent.get("risk_level") or "L0")
+        if llm_risk in {"L0", "L1", "L2", "L3", "L4"}:
+            risk_level = _max_risk(risk_level, llm_risk)  # type: ignore[arg-type]
+        needs_approval = needs_approval or risk_level in {"L3", "L4"} or bool(home_intent.get("needs_approval"))
+        route = _merge_route(route, home_intent.get("suggested_route_hints") or home_intent.get("required_agents") or [])
+        reasons.append("risk_guard_applied")
 
     # Expected output
     expected_output_map = {
@@ -189,3 +205,25 @@ def plan_route(
         "reason": "; ".join(reasons) if reasons else "default_chat_route",
     }
     return route_plan
+
+
+def _max_risk(left: RiskLevel, right: str) -> RiskLevel:
+    order = {"L0": 0, "L1": 1, "L2": 2, "L3": 3, "L4": 4}
+    return left if order[left] >= order.get(right, 0) else right  # type: ignore[return-value]
+
+
+def _merge_route(rule_route: list[str], hints: Any) -> list[str]:
+    executable = {"research_agent", "rag_agent", "artifact_agent", "tool_agent", "memory_agent", "skill_agent", "evaluator", "final_response"}
+    merged: list[str] = []
+    if isinstance(hints, list):
+        for item in hints:
+            if item in executable and item not in merged:
+                merged.append(item)
+    for item in rule_route:
+        if item in executable and item not in merged:
+            merged.append(item)
+    if "evaluator" not in merged:
+        merged.append("evaluator")
+    if "final_response" not in merged:
+        merged.append("final_response")
+    return merged

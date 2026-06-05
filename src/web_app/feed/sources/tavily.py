@@ -11,7 +11,7 @@ class TavilySource(FeedSource):
     source_type = "web"
 
     def __init__(self):
-        self.enabled = settings.feed_tavily_enabled and bool(settings.tavily_api_key)
+        self.enabled = settings.feed_tavily_enabled and settings.feed_source_tavily_enabled and bool(settings.tavily_api_key)
         self.max_items = settings.feed_tavily_max_items
 
     async def fetch(self) -> list[RawFeedItem]:

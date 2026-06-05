@@ -78,6 +78,22 @@ function skillName(skill: unknown) {
   return item?.name || item?.title || ''
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? (value as Record<string, unknown>) : {}
+}
+
+function runAnswer(run: AgentRun) {
+  const finalPayload = asRecord(run.final_payload)
+  return String(finalPayload.answer || run.final_answer || run.final_output || '')
+}
+
+function runLangGraphStatus(run: AgentRun | null) {
+  if (!run) return null
+  const direct = asRecord(run.langgraphstatus)
+  if (Object.keys(direct).length) return direct
+  return asRecord(asRecord(run.final_payload).langgraphstatus)
+}
+
 function parseEvent(raw: string): AgentEvent | null {
   try {
     const parsed = JSON.parse(raw) as AgentEvent | { data?: AgentEvent }
@@ -152,6 +168,41 @@ export function ExecutionTimeline({ events, steps, running, locale = 'en', onApp
               </div>
             </div>
           )}
+        </div>
+      </div>
+    </article>
+  )
+}
+
+function LangGraphStatusPanel({ run, locale = 'en' }: { run: AgentRun | null; locale?: 'en' | 'zh' }) {
+  const status = runLangGraphStatus(run)
+  const steps = Array.isArray(status?.steps) ? (status.steps as Record<string, unknown>[]) : []
+  const riskLevel = status?.risk_level ? String(status.risk_level) : ''
+  if (!steps.length) return null
+  return (
+    <article className="chat-message assistant">
+      <div className="agent-trace langgraph-status-panel">
+        <div className="trace-header">
+          <span className="thinking-dot" />
+          <strong>{locale === 'zh' ? '关键步骤' : 'Key steps'}</strong>
+          {riskLevel ? <small>{locale === 'zh' ? `风险 ${riskLevel}` : `Risk ${riskLevel}`}</small> : null}
+        </div>
+        <div className="trace-list">
+          {steps.map((step, index) => (
+            <div className="trace-item" key={`${String(step.key || step.node_name || 'step')}-${index}`}>
+              <span className="trace-icon">{step.status === 'failed' ? '!' : '✓'}</span>
+              <div>
+                <strong>{String(step.title || nodeLabel(String(step.node_name || ''), locale))}</strong>
+                <p>{String(step.detail || step.status || '')}</p>
+                {step.model || step.fallback_used ? (
+                  <small className="trace-model-line">
+                    {step.model ? String(step.model) : ''}
+                    {step.fallback_used ? (locale === 'zh' ? ' · 已使用规则兜底' : ' · fallback used') : ''}
+                  </small>
+                ) : null}
+              </div>
+            </div>
+          ))}
         </div>
       </div>
     </article>
@@ -302,7 +353,7 @@ export function AgentChatPanel({
       }
 
       const fallback = locale === 'zh' ? 'Agent 已完成，但当前没有可展示的输出。' : 'Agent completed, but no displayable output was returned.'
-      setMessages((items) => [...items, { id: `${Date.now()}-assistant`, role: 'assistant', content: nextRun.final_output || fallback }])
+      setMessages((items) => [...items, { id: `${Date.now()}-assistant`, role: 'assistant', content: runAnswer(nextRun) || fallback }])
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : locale === 'zh' ? 'Agent 运行失败，请稍后重试。' : 'Agent run failed. Please try again.')
     } finally {
@@ -346,6 +397,7 @@ export function AgentChatPanel({
                 </article>
               ))}
               <ExecutionTimeline events={events} steps={steps} running={running} locale={locale} onApprove={(id) => handleApproval(id, true)} onReject={(id) => handleApproval(id, false)} />
+              <LangGraphStatusPanel run={run} locale={locale} />
               <SkillMatchBadge run={run} locale={locale} />
               <SkillDraftNotice draft={run?.created_skill_draft || null} locale={locale} />
               <ArtifactInlineList artifacts={run?.artifacts} locale={locale} />

@@ -11,7 +11,7 @@ class SerpApiSource(FeedSource):
     source_type = "web"
 
     def __init__(self):
-        self.enabled = settings.feed_serpapi_enabled and bool(settings.serpapi_api_key)
+        self.enabled = settings.feed_serpapi_enabled and settings.feed_source_serpapi_enabled and bool(settings.serpapi_api_key)
         self.max_items = settings.feed_serpapi_max_items
 
     async def fetch(self) -> list[RawFeedItem]:

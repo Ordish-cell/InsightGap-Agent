@@ -89,6 +89,7 @@ def _run_response(run_id: int, state: dict[str, Any]) -> dict[str, Any]:
         "final_output": state.get("final_output", ""),
         "final_answer": state.get("final_answer", ""),
         "final_payload": state.get("final_payload"),
+        "langgraphstatus": state.get("langgraphstatus", {}),
         "research": state.get("research", {}) or state.get("research_result", {}),
         "rag": state.get("rag", {}) or state.get("rag_result", {}),
         "artifacts": state.get("artifacts", []),

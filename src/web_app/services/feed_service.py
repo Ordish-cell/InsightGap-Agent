@@ -101,6 +101,36 @@ def list_cards(db: Session, user_id: int, status: str | None = None, exposure_bu
     return {"cards": [card_to_dict(card) for card in cards], "next_cursor": offset + len(cards) if len(cards) == limit else None, "mix": profile.feed_ratio_config}
 
 
+def list_home_cards(db: Session, user_id: int) -> dict:
+    count = settings.feed_home_card_count
+    cards = FeedRepository(db).list_by_user(user_id, status=None, limit=count)
+    refresh_result: dict[str, Any] | None = None
+    errors: list[str] = []
+    if len(cards) < count and settings.feed_refresh_on_home_empty:
+        try:
+            refresh_result = refresh_feed(db, user_id)
+            cards = FeedRepository(db).list_by_user(user_id, status=None, limit=count)
+        except Exception as exc:
+            errors.append(str(exc)[:300])
+    if len(cards) < count and settings.feed_require_real_cards:
+        return {
+            "cards": [card_to_dict(card) for card in cards],
+            "required_count": count,
+            "is_complete": False,
+            "error": "NOT_ENOUGH_REAL_FEED_CARDS",
+            "message": f"Only {len(cards)} real FeedCards are available. Mock cards are disabled.",
+            "refresh_result": refresh_result,
+            "errors": errors,
+        }
+    return {
+        "cards": [card_to_dict(card) for card in cards[:count]],
+        "required_count": count,
+        "is_complete": len(cards) >= count,
+        "refresh_result": refresh_result,
+        "errors": errors,
+    }
+
+
 def get_card_detail(db: Session, user_id: int, card_id: int) -> dict:
     card = FeedRepository(db).get_by_user(user_id, card_id)
     if not card:
@@ -179,6 +209,10 @@ def card_to_dict(card) -> dict:
         "next_action": detail.get("next_action", ""),
         "summary": detail.get("summary", ""),
         "source_type": detail.get("source_type", ""),
+        "source_name": detail.get("source_name", detail.get("source_type", "")),
+        "source_url": _first_source_url(card),
+        "published_at": detail.get("published_at"),
+        "fetched_at": card.created_at.isoformat() if card.created_at else None,
         "domain": detail.get("domain", ""),
         "relation_type": card.exposure_bucket,
         "exposure_bucket": card.exposure_bucket,
@@ -216,6 +250,16 @@ def _safe_get_semantic_memories(user_id: int, db: Session) -> list[dict[str, Any
         return memory_service.get_semantic_memories(user_id, db)
     except Exception:
         return []
+
+
+def _first_source_url(card) -> str:
+    detail = card.score_detail or {}
+    if detail.get("source_url"):
+        return str(detail["source_url"])
+    for item in card.evidence or []:
+        if isinstance(item, dict) and (item.get("source_url") or item.get("url")):
+            return str(item.get("source_url") or item.get("url"))
+    return ""
 
 
 def _run_async(coro):

@@ -44,6 +44,8 @@ function getInitialFeedOpen() {
 export function HomePage() {
   const navigate = useNavigate()
   const [cards, setCards] = useState<FeedCard[]>([])
+  const [feedLoading, setFeedLoading] = useState(true)
+  const [feedError, setFeedError] = useState('')
   const [feedOpen, setFeedOpen] = useState(getInitialFeedOpen)
   const [selectedFeedCardId, setSelectedFeedCardId] = useState<number | null>(null)
 
@@ -51,7 +53,17 @@ export function HomePage() {
   const selectedFeedCard = useMemo(() => cards.find((card) => card.id === selectedFeedCardId), [cards, selectedFeedCardId])
 
   useEffect(() => {
-    feed.listCards().then(setCards).catch(() => setCards([]))
+    setFeedLoading(true)
+    feed.homeCards()
+      .then((result) => {
+        setCards(result.cards || [])
+        setFeedError(result.is_complete === false ? result.message || '真实 FeedCard 不足 3 条，请稍后刷新。' : '')
+      })
+      .catch((exc) => {
+        setCards([])
+        setFeedError(exc instanceof Error ? exc.message : '首页信息差加载失败。')
+      })
+      .finally(() => setFeedLoading(false))
   }, [])
   useEffect(() => {
     localStorage.setItem('homeFeedOpen', String(feedOpen))
@@ -81,6 +93,21 @@ export function HomePage() {
         </div>
         {feedOpen ? (
           <div className="floating-feed-grid">
+            {feedLoading ? (
+              <article className="floating-feed-card explicit">
+                <h3>正在加载真实信息差</h3>
+                <p className="feed-value-line">正在读取数据库并按配置尝试刷新真实来源。</p>
+              </article>
+            ) : null}
+            {!feedLoading && feedError ? (
+              <article className="floating-feed-card adjacent">
+                <h3>真实信息差暂时不足</h3>
+                <p className="feed-value-line">{feedError}</p>
+                <Link className="light-mini-button" to="/feed">
+                  去信息流查看
+                </Link>
+              </article>
+            ) : null}
             {homeFeeds.map((item, index) => (
               <article className={`floating-feed-card ${item.className}`} style={{ animationDelay: `${index * 140}ms` }} key={`${item.label}-${item.card.id}`}>
                 <div className="floating-feed-card-top">

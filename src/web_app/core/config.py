@@ -8,11 +8,11 @@ class Settings(BaseSettings):
     app_env: str = "local"
     secret_key: str = "change-me"
     access_token_expire_minutes: int = 10080
-    mysql_host: str = "127.0.0.1"
-    mysql_port: int = 3306
-    mysql_user: str = "root"
-    mysql_password: str = ""
-    mysql_database: str = "open_deep_research"
+    postgres_host: str = "127.0.0.1"
+    postgres_port: int = 5432
+    postgres_user: str = "postgres"
+    postgres_password: str = ""
+    postgres_database: str = "agent_os"
     redis_url: str = "redis://127.0.0.1:6379/0"
     qdrant_url: str = ""
     qdrant_api_key: str = ""
@@ -80,6 +80,57 @@ class Settings(BaseSettings):
     feed_min_personal_relevance: float = 0.15
     feed_min_source_credibility: float = 0.40
     feed_low_confidence_max_ratio: float = 0.20
+    agent_llm_enabled: bool = True
+    agent_llm_provider: str = "aliyun"
+    agent_llm_timeout_seconds: int = 60
+    agent_llm_max_retries: int = 2
+    agent_llm_temperature: float = 0.2
+    dashscope_api_key: str = ""
+    aliyun_bailian_api_key: str = ""
+    aliyun_bailian_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    agent_llm_base_url: str = ""
+    agent_llm_api_key: str = ""
+    agent_fast_model: str = "qwen3.6-flash"
+    agent_balanced_model: str = "qwen3.6-max-preview"
+    agent_strong_model: str = "qwen3.7-plus"
+    agent_llm_model: str = "qwen3.6-plus"
+    agent_intent_model: str = "qwen3.6-flash"
+    agent_safety_model: str = "qwen3.6-flash"
+    agent_planner_model: str = "qwen3.6-max-preview"
+    agent_rag_model: str = "qwen3.6-max-preview"
+    agent_research_model: str = "qwen3.7-plus"
+    agent_artifact_model: str = "qwen3.6-plus"
+    agent_memory_model: str = "qwen3.6-flash"
+    agent_skill_model: str = "qwen3.6-flash"
+    agent_final_model: str = "qwen3.6-plus"
+    agent_embedding_provider: str = "aliyun"
+    agent_embedding_model: str = "text-embedding-v4"
+    agent_intent_llm_enabled: bool = True
+    agent_planner_llm_enabled: bool = False
+    agent_memory_llm_enabled: bool = True
+    agent_skill_llm_enabled: bool = True
+    agent_safety_llm_enabled: bool = True
+    agent_llm_usage_log_enabled: bool = True
+    agent_llm_log_prompt_preview: bool = False
+    agent_llm_log_raw_output: bool = False
+    feed_real_sources_enabled: bool = True
+    feed_allow_mock_data: bool = False
+    feed_home_card_count: int = 3
+    feed_require_real_cards: bool = True
+    feed_source_arxiv_enabled: bool = True
+    feed_source_github_enabled: bool = True
+    feed_source_duckduckgo_enabled: bool = True
+    feed_source_tavily_enabled: bool = False
+    feed_source_serpapi_enabled: bool = False
+    feed_source_manual_seed_enabled: bool = True
+    feed_refresh_on_home_empty: bool = True
+    feed_refresh_min_real_cards: int = 3
+    feed_refresh_timeout_seconds: int = 45
+    feed_refresh_dedup_enabled: bool = True
+    agent_timeline_enabled: bool = True
+    agent_langgraph_status_enabled: bool = True
+    agent_langgraph_status_max_steps: int = 12
+    agent_chat_real_messages_enabled: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -89,11 +140,12 @@ class Settings(BaseSettings):
     )
 
     @property
-    def mysql_url(self) -> str:
-        password = self.mysql_password
+    def database_url(self) -> str:
+        password = self.postgres_password
+        encoded_password = password  # consider url-encoding if password has special chars
         return (
-            f"mysql+pymysql://{self.mysql_user}:{password}"
-            f"@{self.mysql_host}:{self.mysql_port}/{self.mysql_database}"
+            f"postgresql+psycopg2://{self.postgres_user}:{encoded_password}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_database}"
         )
 
     @property

@@ -8,9 +8,9 @@ DEFAULT_SEEDS = [
     {
         "source_id": "seed_agent_001",
         "source_type": "manual",
-        "title": "LangGraph multi-agent runtime patterns are worth watching",
-        "summary": "Agent orchestration is moving from simple ReAct loops toward recoverable, observable, evaluable graph runtimes.",
-        "url": "https://example.com/langgraph-agent-runtime",
+        "title": "LangGraph is a practical foundation for multi-agent runtimes",
+        "summary": "LangGraph provides graph-based orchestration primitives for stateful, observable agent workflows.",
+        "url": "https://github.com/langchain-ai/langgraph",
         "published_at": "2026-06-01T00:00:00",
         "tags": ["agent", "langgraph", "multi-agent"],
         "domain_hints": ["ai", "agent", "devtools"],
@@ -18,9 +18,9 @@ DEFAULT_SEEDS = [
     {
         "source_id": "seed_rag_001",
         "source_type": "manual",
-        "title": "RAG evaluation is becoming a product advantage",
-        "summary": "Teams that track retrieval evidence, faithfulness, and actionability can ship safer knowledge agents.",
-        "url": "https://example.com/rag-evaluation-product",
+        "title": "RAGAS tracks retrieval and generation quality for RAG systems",
+        "summary": "RAG evaluation tooling is becoming important for evidence-aware knowledge agents.",
+        "url": "https://github.com/explodinggradients/ragas",
         "published_at": "2026-06-01T00:00:00",
         "tags": ["rag", "evaluation", "agent"],
         "domain_hints": ["ai", "research", "product"],
@@ -28,9 +28,9 @@ DEFAULT_SEEDS = [
     {
         "source_id": "seed_startup_001",
         "source_type": "manual",
-        "title": "Browser agents may create new workflow automation startups",
-        "summary": "The opportunity is less about demos and more about approval gates, replayability, and domain-specific workflows.",
-        "url": "https://example.com/browser-agent-startups",
+        "title": "MCP standardizes tool context for agent systems",
+        "summary": "The Model Context Protocol creates a reusable integration layer for agent tools and data sources.",
+        "url": "https://modelcontextprotocol.io/",
         "published_at": "2026-06-01T00:00:00",
         "tags": ["browser agent", "startup", "automation"],
         "domain_hints": ["startup", "automation", "agent"],
@@ -43,7 +43,7 @@ class ManualSeedSource(FeedSource):
     source_type = "manual"
 
     def __init__(self):
-        self.enabled = settings.feed_manual_seed_enabled
+        self.enabled = settings.feed_manual_seed_enabled and settings.feed_source_manual_seed_enabled
         self.max_items = settings.feed_refresh_max_items
 
     async def fetch(self) -> list[RawFeedItem]:

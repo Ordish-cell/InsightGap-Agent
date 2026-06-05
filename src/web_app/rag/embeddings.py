@@ -4,6 +4,7 @@ from typing import Any
 
 import requests
 
+from src.web_app.agent.llm.embedding import get_embedding_model
 from src.web_app.core.config import settings
 
 
@@ -30,21 +31,25 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         return []
     if any(not text for text in cleaned):
         return [_zero_vector() for _ in cleaned]
-    if settings.embed_model_type.lower() == "dashscope":
+    model_info = get_embedding_model()
+    provider = (model_info.get("provider") or settings.embed_model_type).lower()
+    if provider in {"aliyun", "dashscope"}:
         return _embed_dashscope(cleaned)
-    if settings.embed_model_type.lower() in {"sentence-transformers", "sentence_transformers", "local"}:
+    if provider in {"sentence-transformers", "sentence_transformers", "local"}:
         return _embed_sentence_transformers(cleaned)
-    raise RuntimeError(f"Unsupported embedding provider: {settings.embed_model_type}")
+    raise RuntimeError(f"Unsupported embedding provider: {provider}")
 
 
 def _embed_dashscope(texts: list[str]) -> list[list[float]]:
-    if not settings.embed_api_key:
+    api_key = settings.embed_api_key or settings.dashscope_api_key or settings.aliyun_bailian_api_key
+    if not api_key:
         raise RuntimeError("DashScope embedding API key is not configured")
-    url = settings.embed_base_url.rstrip("/") + "/embeddings"
+    model_info = get_embedding_model()
+    url = (settings.embed_base_url or settings.aliyun_bailian_base_url).rstrip("/") + "/embeddings"
     response = requests.post(
         url,
-        headers={"Authorization": f"Bearer {settings.embed_api_key}"},
-        json={"model": settings.embed_model_name, "input": texts},
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": model_info["model"], "input": texts},
         timeout=30,
     )
     response.raise_for_status()
@@ -59,7 +64,7 @@ def _embed_dashscope(texts: list[str]) -> list[list[float]]:
 def _sentence_model():
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(settings.embed_model_name or "sentence-transformers/all-MiniLM-L6-v2")
+    return SentenceTransformer(settings.agent_embedding_model or settings.embed_model_name or "sentence-transformers/all-MiniLM-L6-v2")
 
 
 def _embed_sentence_transformers(texts: list[str]) -> list[list[float]]:
