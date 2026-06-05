@@ -214,6 +214,13 @@ button:disabled {
     transform 150ms ease;
 }
 
+.nav-button {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  text-align: left;
+}
+
 .sidebar.collapsed .nav-link {
   grid-template-columns: 1fr;
   justify-items: center;
@@ -263,6 +270,85 @@ button:disabled {
   color: #8a95a3;
   font-size: 11px;
   white-space: nowrap;
+}
+
+.sidebar-conversation-panel {
+  display: grid;
+  gap: 8px;
+  margin: 2px 0 8px 40px;
+  padding: 8px;
+  border: 1px solid rgb(255 255 255 / 72%);
+  border-radius: 12px;
+  background: rgb(255 255 255 / 42%);
+}
+
+.sidebar-conversation-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.sidebar-conversation-actions button {
+  min-height: 28px;
+  border: 1px solid var(--sidebar-border);
+  border-radius: 9px;
+  background: rgb(255 255 255 / 74%);
+  color: #4e5c6c;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.sidebar-conversation-actions button:hover {
+  color: #111;
+  border-color: #cbd8e6;
+}
+
+.sidebar-conversation-list {
+  max-height: min(38dvh, 360px);
+  display: grid;
+  gap: 5px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.sidebar-conversation-empty {
+  padding: 8px 4px;
+  color: #758292;
+  font-size: 12px;
+}
+
+.sidebar-conversation-item {
+  width: 100%;
+  display: grid;
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  background: transparent;
+  color: #293644;
+  text-align: left;
+}
+
+.sidebar-conversation-item:hover {
+  border-color: var(--sidebar-border);
+  background: rgb(255 255 255 / 70%);
+}
+
+.sidebar-conversation-item strong,
+.sidebar-conversation-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-conversation-item strong {
+  font-size: 12px;
+}
+
+.sidebar-conversation-item span {
+  color: #758292;
+  font-size: 11px;
 }
 
 .sidebar-bottom {
@@ -2807,6 +2893,43 @@ body:has(.simple-login-page) {
 .run-step p {
   margin: 2px 0 0;
   color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.run-step-body {
+  min-width: 0;
+}
+
+.run-step-thought {
+  margin-top: 5px !important;
+  color: #34302b !important;
+  font-size: 14px !important;
+  line-height: 1.62 !important;
+}
+
+.run-step-meta {
+  display: grid;
+  gap: 5px;
+  margin-top: 8px;
+}
+
+.run-step-meta-row {
+  display: grid;
+  grid-template-columns: 86px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+}
+
+.run-step-meta-row span {
+  color: #8a847c;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.run-step-meta-row p {
+  margin: 0;
+  color: #625d56;
   font-size: 12px;
   line-height: 1.5;
 }

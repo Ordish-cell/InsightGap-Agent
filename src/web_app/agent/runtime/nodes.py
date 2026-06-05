@@ -1,10 +1,14 @@
+import json
+import time
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from src.web_app.agent.llm.config import get_llm_settings
 from src.web_app.agent.llm.errors import LLMInvocationError, LLMParseError, LLMUnavailableError
+from src.web_app.agent.llm.factory import get_chat_model
 from src.web_app.agent.llm.router import resolve_model_name
+from src.web_app.agent.llm.usage import record_llm_call
 from src.web_app.agent.runtime.checkpoint import record_event, record_step
 from src.web_app.agent.runtime.intent_llm import infer_home_intent_with_llm
 from src.web_app.agent.runtime.intent_schema import HomeIntentResult
@@ -833,11 +837,10 @@ class RuntimeNodes:
         return state
 
     async def final_response(self, state: AgentRuntimeState) -> AgentRuntimeState:
-        """Final Response: aggregate all agent outputs into final_answer and final_payload."""
+        """Final Response: use the configured final LLM to write the user-facing answer."""
         route_plan = state.get("route_plan") or {}
         intent = route_plan.get("intent", "chat")
 
-        # Build final_answer from all agent outputs
         answer_parts = []
         research = state.get("research_result") or state.get("research") or {}
         if research.get("summary"):
@@ -848,17 +851,17 @@ class RuntimeNodes:
         if state.get("final_output") and not answer_parts:
             answer_parts.append(state["final_output"])
 
-        if answer_parts:
-            final_answer = "\n\n".join(answer_parts)
-        elif state.get("status") == "waiting_approval":
-            final_answer = state.get("final_output") or "Approval required before continuing."
+        draft_answer = "\n\n".join(answer_parts)
+        if state.get("status") == "waiting_approval":
+            final_answer = state.get("final_output") or "Approval required（需要审批）：这个操作需要先通过审批。我还没有执行外部写入或不可逆动作。"
+        elif draft_answer.strip():
+            final_answer = draft_answer.strip()
         else:
-            final_answer = state.get("final_output") or "Agent run completed."
+            final_answer = await self._generate_final_answer_with_llm(state, draft_answer)
 
         state["final_answer"] = final_answer
-        state["final_output"] = final_answer  # legacy compat
+        state["final_output"] = final_answer
 
-        # Build structured final_payload for frontend
         errors = state.get("errors", [])
         status = state.get("status") or ("failed" if errors else "completed")
 
@@ -894,6 +897,7 @@ class RuntimeNodes:
                 "tool_calls_count": 1 if state.get("tool_call") else 0,
             },
         )
+        await self._enrich_trace_with_llm(state)
         final_payload["langgraphstatus"] = state.get("langgraphstatus", {})
         state["final_payload"] = final_payload
         state["status"] = status
@@ -905,8 +909,251 @@ class RuntimeNodes:
                      "error_count": len(errors)})
         return state
 
-    # ── Helper methods ──────────────────────────────────────────────
+    async def _enrich_trace_with_llm(self, state: AgentRuntimeState) -> None:
+        """Add user-visible ReAct-style stage summaries without exposing private chain-of-thought."""
+        status = state.get("langgraphstatus") or {}
+        steps = list(status.get("steps") or [])
+        if not steps or not get_llm_settings().enabled:
+            return
 
+        resolution = resolve_model_name("final")
+        prompt = self._build_trace_prompt(state, steps)
+        started = time.perf_counter()
+        output_text = ""
+        try:
+            model = get_chat_model("final", temperature=0.2)
+            message = await model.ainvoke(prompt)
+            output_text = self._message_content(message).strip()
+            rows = self._parse_trace_rows(output_text)
+            if not rows:
+                return
+            by_key = {str(item.get("key") or ""): item for item in rows if item.get("key")}
+            enriched = []
+            for step in steps:
+                key = str(step.get("key") or "")
+                row = by_key.get(key)
+                if row:
+                    step = {
+                        **step,
+                        "llm_stage_output": str(row.get("thought") or row.get("summary") or ""),
+                        "thought": str(row.get("thought") or step.get("thought") or ""),
+                        "action": str(row.get("action") or step.get("action") or step.get("title") or ""),
+                        "observation": str(row.get("observation") or step.get("observation") or step.get("detail") or ""),
+                        "next_action": str(row.get("next_action") or step.get("next_action") or ""),
+                    }
+                enriched.append(step)
+            status["steps"] = enriched
+            status["trace_style"] = "react_visible_summary"
+            state["langgraphstatus"] = status
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            record_llm_call(
+                self.db,
+                run_id=state.get("run_id"),
+                thread_id=state.get("thread_id", ""),
+                user_id=state.get("user_id"),
+                node_name="trace_visualizer",
+                purpose="final",
+                provider=resolution.provider,
+                model=resolution.model,
+                tier=resolution.tier,
+                latency_ms=latency_ms,
+                status="completed",
+                estimated_input_chars=len(prompt),
+                estimated_output_chars=len(output_text),
+                metadata={"stage_count": len(enriched)},
+            )
+            record_event(
+                self.db,
+                state["run_id"],
+                "thought_summary",
+                {"title": "trace_visualizer", "summary": "Generated visible ReAct stage summaries.", "stage_count": len(enriched), "model": resolution.model},
+                node_name="trace_visualizer",
+                user_id=state.get("user_id"),
+                thread_id=state.get("thread_id", ""),
+            )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            record_llm_call(
+                self.db,
+                run_id=state.get("run_id"),
+                thread_id=state.get("thread_id", ""),
+                user_id=state.get("user_id"),
+                node_name="trace_visualizer",
+                purpose="final",
+                provider=resolution.provider,
+                model=resolution.model,
+                tier=resolution.tier,
+                latency_ms=latency_ms,
+                status="failed",
+                error_message=str(exc),
+                estimated_input_chars=len(prompt),
+                estimated_output_chars=len(output_text),
+                metadata={"stage_count": len(steps)},
+            )
+
+    def _build_trace_prompt(self, state: AgentRuntimeState, steps: list[dict[str, Any]]) -> str:
+        rows = [
+            {
+                "key": item.get("key"),
+                "title": item.get("title"),
+                "status": item.get("status"),
+                "thought": item.get("thought"),
+                "action": item.get("action"),
+                "observation": item.get("observation"),
+                "next_action": item.get("next_action"),
+            }
+            for item in steps
+        ]
+        payload = {
+            "user_input": state.get("user_input", ""),
+            "intent": (state.get("route_plan") or {}).get("intent") or (state.get("home_intent") or {}).get("intent", "chat"),
+            "risk_level": (state.get("route_plan") or {}).get("risk_level") or (state.get("home_intent") or {}).get("risk_level", "L0"),
+            "steps": rows,
+        }
+        return (
+            "You write the visible reasoning/status trace for an agent UI, similar to Codex progress summaries.\n"
+            "Do not reveal hidden chain-of-thought. Write only concise user-visible ReAct-style summaries.\n"
+            "Return strict JSON only: an array of objects with keys: key, thought, action, observation, next_action.\n"
+            "Use Simplified Chinese for all user-facing text. Keep each field short, natural, and specific to the step.\n"
+            "The 'thought' field should be one sentence that explains what the agent is checking or deciding at this stage.\n"
+            f"Input data: {json.dumps(payload, ensure_ascii=False, default=str)}"
+        )
+
+    def _parse_trace_rows(self, text: str) -> list[dict[str, Any]]:
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.strip("`")
+            if cleaned.lower().startswith("json"):
+                cleaned = cleaned[4:].strip()
+        start = cleaned.find("[")
+        end = cleaned.rfind("]")
+        if start >= 0 and end >= start:
+            cleaned = cleaned[start : end + 1]
+        data = json.loads(cleaned)
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+
+    async def _generate_final_answer_with_llm(self, state: AgentRuntimeState, draft_answer: str) -> str:
+        user_input = state.get("user_input", "")
+        if not get_llm_settings().enabled:
+            return self._fallback_final_answer(state, draft_answer)
+
+        resolution = resolve_model_name("final")
+        prompt = self._build_final_answer_prompt(state, draft_answer)
+        started = time.perf_counter()
+        output_text = ""
+        try:
+            model = get_chat_model("final", temperature=0.35)
+            message = await model.ainvoke(prompt)
+            output_text = self._message_content(message).strip()
+            if not output_text:
+                raise LLMInvocationError("Final LLM returned empty output")
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            record_llm_call(
+                self.db,
+                run_id=state.get("run_id"),
+                thread_id=state.get("thread_id", ""),
+                user_id=state.get("user_id"),
+                node_name="final_response",
+                purpose="final",
+                provider=resolution.provider,
+                model=resolution.model,
+                tier=resolution.tier,
+                latency_ms=latency_ms,
+                status="completed",
+                estimated_input_chars=len(prompt),
+                estimated_output_chars=len(output_text),
+                metadata={"input_preview": user_input[:200]},
+            )
+            record_event(
+                self.db,
+                state["run_id"],
+                "thought_summary",
+                {"title": "生成最终回答", "summary": "已调用最终回复模型，把执行结果整理成用户可读回答。", "model": resolution.model},
+                node_name="final_response",
+                user_id=state.get("user_id"),
+                thread_id=state.get("thread_id", ""),
+            )
+            return output_text
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            record_llm_call(
+                self.db,
+                run_id=state.get("run_id"),
+                thread_id=state.get("thread_id", ""),
+                user_id=state.get("user_id"),
+                node_name="final_response",
+                purpose="final",
+                provider=resolution.provider,
+                model=resolution.model,
+                tier=resolution.tier,
+                latency_ms=latency_ms,
+                status="failed",
+                error_message=str(exc),
+                estimated_input_chars=len(prompt),
+                estimated_output_chars=len(output_text),
+                metadata={"input_preview": user_input[:200]},
+            )
+            record_event(
+                self.db,
+                state["run_id"],
+                "thought_summary",
+                {"title": "最终模型不可用", "summary": "最终回复模型调用失败，已改用安全兜底回答。", "error": str(exc)[:200]},
+                node_name="final_response",
+                user_id=state.get("user_id"),
+                thread_id=state.get("thread_id", ""),
+            )
+            return self._fallback_final_answer(state, draft_answer)
+
+    def _build_final_answer_prompt(self, state: AgentRuntimeState, draft_answer: str) -> str:
+        route_plan = state.get("route_plan") or {}
+        payload = {
+            "user_input": state.get("user_input", ""),
+            "intent": route_plan.get("intent", "chat"),
+            "risk_level": route_plan.get("risk_level", "L0"),
+            "needs_approval": route_plan.get("needs_approval", False),
+            "draft_answer": draft_answer,
+            "context_summary": (state.get("context") or {}).get("conversation_summary", ""),
+            "feed_card": (state.get("context") or {}).get("feed_card", {}),
+            "research": state.get("research_result") or state.get("research") or {},
+            "rag": state.get("rag_result") or state.get("rag") or {},
+            "artifacts": state.get("artifacts", []),
+            "tool_result": state.get("tool_result") or state.get("tool_call") or {},
+            "memory_updates_count": len(state.get("memory_updates", [])),
+            "skill_drafts_count": len(state.get("skill_drafts", [])),
+            "errors": state.get("errors", []),
+        }
+        return (
+            "你是信息差 Agent OS 的最终回复节点。请直接回答用户，不要输出 JSON，不要输出 Markdown 代码块，不要暴露 chain-of-thought。\n"
+            "你可以用自然中文说明你正在或已经做了什么，但只能给用户可读的简短执行摘要，不能泄露私密推理。\n"
+            "如果只是问候或闲聊，要像正常助手一样回答，不要说 Agent Run 完成。\n"
+            "如果没有真实执行研究、生成 Artifact 或外部工具动作，必须诚实说明，不要假装已经完成。\n"
+            "如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
+            "回答要贴合用户原话，优先给结论，然后给下一步可做什么。中文为主。\n"
+            f"运行数据：{json.dumps(payload, ensure_ascii=False, default=str)}"
+        )
+
+    def _fallback_final_answer(self, state: AgentRuntimeState, draft_answer: str) -> str:
+        user_input = str(state.get("user_input") or "").strip()
+        route_plan = state.get("route_plan") or {}
+        if any(token in user_input for token in ("你好", "您好", "你是谁", "你是誰")) or user_input.lower() in {"hi", "hello", "hey"}:
+            return "你好，我是你的信息差 Agent OS 助手。你可以让我分析首页信息差、做深度研究、生成报告或代码成果，也可以把反复使用的流程沉淀成长期记忆和 Skill。"
+        normalized = draft_answer.strip().lower().rstrip(".。")
+        if draft_answer and normalized not in {"agent run completed", "agent runtime completed"}:
+            return draft_answer.strip()
+        intent = route_plan.get("intent", "chat")
+        if intent == "research":
+            return "我已识别这是一个研究任务，并完成了需求判断和执行规划。当前没有产生可验证的完整研究结果，因此不会假装已经完成深度研究。你可以继续指定研究范围，我会进入资料检索和结构化报告生成。"
+        if intent == "artifact":
+            return "我已识别这是一个成果生成任务，并完成了初步规划。当前还没有生成实际 Artifact。你可以继续指定要生成文档、报告、网站还是代码。"
+        return "我已经完成本次请求的基础判断和上下文检查。你可以继续补充目标，我会沿用当前会话上下文继续处理。"
+
+    def _message_content(self, message: Any) -> str:
+        content = getattr(message, "content", message)
+        if isinstance(content, list):
+            return "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
+        return str(content)
     def _rule_home_intent(self, user_input: str, feed_card_id: Any) -> dict[str, Any]:
         route_plan = plan_route(
             user_input=user_input,

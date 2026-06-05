@@ -1,20 +1,21 @@
 import { useEffect, useRef, useState } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
 
+import * as agent from '../../api/agent'
 import { me } from '../../api/auth'
-import type { CurrentUser } from '../../api/types'
+import type { AgentConversation, CurrentUser } from '../../api/types'
 
 type NavItem = { label: string; short: string; href: string; icon: string }
 
 const links: NavItem[] = [
   { label: '首页', short: '首页', href: '/', icon: '⌂' },
   { label: '信息流', short: '信息', href: '/feed', icon: '◆' },
-  { label: '深度研究', short: '研究', href: '/research', icon: '◉' },
+  { label: '深度研究', short: '研究', href: '/research', icon: '◎' },
   { label: '成果库', short: '成果', href: '/artifacts', icon: '▣' },
-  { label: '长期记忆', short: '记忆', href: '/memory', icon: '◎' },
+  { label: '长期记忆', short: '记忆', href: '/memory', icon: '◌' },
   { label: '技能库', short: '技能', href: '/skills', icon: '✓' },
   { label: '审批台', short: '审批', href: '/approvals', icon: '!' },
-  { label: '工具审计', short: '工具', href: '/mcp', icon: '◌' },
+  { label: '工具审计', short: '工具', href: '/mcp', icon: '◈' },
 ]
 
 export function Sidebar() {
@@ -23,13 +24,18 @@ export function Sidebar() {
   const [menuOpen, setMenuOpen] = useState(false)
   const [user, setUser] = useState<CurrentUser | null>(null)
   const [expanded, setExpanded] = useState(() => localStorage.getItem('sidebarExpanded') !== 'false')
+  const [conversationOpen, setConversationOpen] = useState(false)
+  const [conversationLoading, setConversationLoading] = useState(false)
+  const [conversations, setConversations] = useState<AgentConversation[]>([])
 
   useEffect(() => {
     localStorage.setItem('sidebarExpanded', String(expanded))
   }, [expanded])
+
   useEffect(() => {
     me().then(setUser).catch(() => setUser(null))
   }, [])
+
   useEffect(() => {
     function close(event: MouseEvent) {
       if (!menuRef.current?.contains(event.target as Node)) setMenuOpen(false)
@@ -37,6 +43,34 @@ export function Sidebar() {
     window.addEventListener('mousedown', close)
     return () => window.removeEventListener('mousedown', close)
   }, [])
+
+  async function loadConversations() {
+    setConversationLoading(true)
+    try {
+      const result = await agent.listConversations({ status: 'active', limit: 50 })
+      setConversations(result.items || [])
+    } finally {
+      setConversationLoading(false)
+    }
+  }
+
+  function toggleConversations() {
+    const next = !conversationOpen
+    setConversationOpen(next)
+    if (next) void loadConversations()
+  }
+
+  function openConversation(conversationId: string) {
+    sessionStorage.setItem('agentOpenConversationId', conversationId)
+    navigate('/')
+    window.dispatchEvent(new CustomEvent('agent:open-conversation', { detail: { conversationId } }))
+  }
+
+  function newConversation() {
+    sessionStorage.removeItem('agentOpenConversationId')
+    navigate('/')
+    window.dispatchEvent(new CustomEvent('agent:new-conversation'))
+  }
 
   function logout() {
     localStorage.removeItem('authToken')
@@ -72,6 +106,39 @@ export function Sidebar() {
             ) : null}
           </NavLink>
         ))}
+
+        <button className={conversationOpen ? 'nav-link nav-button active' : 'nav-link nav-button'} type="button" onClick={toggleConversations}>
+          <span className="nav-icon">☰</span>
+          {expanded ? (
+            <>
+              <span className="nav-label">会话管理</span>
+              <span className="nav-short">{conversationOpen ? '收起' : '展开'}</span>
+            </>
+          ) : null}
+        </button>
+
+        {expanded && conversationOpen ? (
+          <div className="sidebar-conversation-panel">
+            <div className="sidebar-conversation-actions">
+              <button type="button" onClick={newConversation}>
+                新建会话
+              </button>
+              <button type="button" onClick={() => void loadConversations()}>
+                刷新
+              </button>
+            </div>
+            <div className="sidebar-conversation-list">
+              {conversationLoading ? <span className="sidebar-conversation-empty">正在加载会话</span> : null}
+              {!conversationLoading && !conversations.length ? <span className="sidebar-conversation-empty">还没有会话</span> : null}
+              {conversations.map((item) => (
+                <button className="sidebar-conversation-item" type="button" key={item.conversation_id} onClick={() => openConversation(item.conversation_id)}>
+                  <strong>{item.title || '未命名会话'}</strong>
+                  <span>{item.last_message_preview || '暂无消息'}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
       </nav>
 
       <div className="sidebar-bottom" ref={menuRef}>
@@ -86,7 +153,7 @@ export function Sidebar() {
             </div>
             <div className="account-popover-line" />
             <NavLink className="account-menu-item" to="/profile" onClick={() => setMenuOpen(false)}>
-              <span>◉</span>
+              <span>◐</span>
               <strong>个人资料</strong>
             </NavLink>
             <NavLink className="account-menu-item" to="/settings" onClick={() => setMenuOpen(false)}>
@@ -100,7 +167,7 @@ export function Sidebar() {
             </NavLink>
             <div className="account-popover-line" />
             <button className="account-menu-item danger" onClick={logout}>
-              <span>→</span>
+              <span>↗</span>
               <strong>退出登录</strong>
             </button>
           </div>

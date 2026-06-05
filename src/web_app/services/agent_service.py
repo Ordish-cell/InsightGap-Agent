@@ -274,31 +274,26 @@ def build_user_facing_answer(state: dict[str, Any]) -> str:
     errors = [str(item) for item in state.get("errors", []) if item] or ([str(state.get("error"))] if state.get("error") else [])
     if status == "failed" or errors:
         reason = errors[0] if errors else "runtime returned a failure state"
-        return f"这次执行失败了，原因是：{reason}。你可以重试，或让我继续帮你排查这条 Agent Run。"
+        return f"Run failed: {reason}. You can retry or ask me to inspect this Agent Run."
 
     route_plan = state.get("route_plan") or {}
     home_intent = state.get("home_intent") or {}
     intent = str(route_plan.get("intent") or home_intent.get("intent") or state.get("route") or "chat")
     risk_level = str(route_plan.get("risk_level") or home_intent.get("risk_level") or "L0")
     if status == "waiting_approval" or route_plan.get("needs_approval") or home_intent.get("needs_approval"):
-        return f"我已识别到这是 {risk_level} 风险操作，需要先通过审批。当前没有执行外部写入或不可逆动作，只保留了可审计的运行记录。"
+        return f"Approval required: this is a {risk_level} risk action and must be approved before execution. I have not performed any external write or irreversible operation."
 
     user_input = str(state.get("user_input") or "").strip()
     if _looks_like_greeting(user_input):
-        return "你好，我是你的信息差 Agent OS 助手。你可以让我分析首页信息差、做深度研究、生成报告或代码成果，也可以把反复使用的流程沉淀成长期记忆和 Skill。"
+        return "\u4f60\u597d\uff0c\u6211\u662f\u4fe1\u606f\u5dee Agent OS \u52a9\u624b\u3002\u4f60\u53ef\u4ee5\u8ba9\u6211\u7814\u7a76\u4fe1\u606f\u3001\u751f\u6210\u6210\u679c\u6216\u6c89\u6dc0 Skill\u3002"
     if intent == "research":
-        return "我已识别这是一个研究任务，并完成了需求判断和执行规划。当前这次运行没有产生可验证的完整研究结果，因此不会假装已经完成深度研究。你可以继续指定研究范围，我会进入资料检索和结构化报告生成。"
+        return "\u6211\u5df2\u8bc6\u522b\u8fd9\u662f\u7814\u7a76\u4efb\u52a1\uff0c\u5e76\u5b8c\u6210\u4e86\u521d\u6b65\u89c4\u5212\u3002\u5f53\u524d\u6ca1\u6709\u53ef\u5c55\u793a\u7684\u5b8c\u6574\u7814\u7a76\u7ed3\u679c\u3002"
     if intent == "artifact":
-        return "我已识别这是一个成果生成任务，并完成了初步规划。当前没有生成实际 Artifact，因此不会把计划当成成品展示。你可以继续指定要生成文档、报告、网站还是代码。"
+        return "\u6211\u5df2\u8bc6\u522b\u8fd9\u662f\u6210\u679c\u751f\u6210\u4efb\u52a1\uff0c\u4f46\u5f53\u524d\u8fd8\u6ca1\u6709\u751f\u6210\u5b9e\u9645 Artifact\u3002"
     if intent == "tool":
-        return "我已识别这是一个工具相关任务。当前没有执行高风险外部动作；如涉及发邮件、发布、删除或支付等操作，会先进入审批状态。"
+        return "\u6211\u5df2\u8bc6\u522b\u8fd9\u662f\u5de5\u5177\u76f8\u5173\u4efb\u52a1\u3002\u5982\u679c\u6d89\u53ca\u5916\u90e8\u5199\u5165\u6216\u9ad8\u98ce\u9669\u52a8\u4f5c\uff0c\u4f1a\u5148\u8fdb\u5165\u5ba1\u6279\u72b6\u6001\u3002"
 
-    steps = ((state.get("langgraphstatus") or {}).get("steps") or [])
-    completed = [str(item.get("title") or item.get("key") or "") for item in steps if isinstance(item, dict) and item.get("status") in {"completed", "waiting_approval"}]
-    if completed:
-        return f"已完成本次 Agent Run。关键步骤包括：{'、'.join(completed[:4])}。你可以展开上方执行过程查看状态记录和验证信息。"
-    return "已完成本次 Agent Run，并保留了可审计的执行记录。你可以继续追问，系统会沿用当前会话上下文。"
-
+    return "\u6211\u5df2\u7ecf\u5b8c\u6210\u57fa\u7840\u5224\u65ad\u3002\u4f60\u53ef\u4ee5\u7ee7\u7eed\u8865\u5145\u76ee\u6807\uff0c\u6211\u4f1a\u6cbf\u7528\u5f53\u524d\u4f1a\u8bdd\u4e0a\u4e0b\u6587\u3002"
 
 def _run_response(
     run_id: int,
@@ -401,13 +396,14 @@ def _short_title(value: str) -> str:
 
 def _looks_like_greeting(value: str) -> bool:
     lowered = value.lower()
-    return lowered in {"hi", "hello", "hey"} or any(token in value for token in ("你好", "您好", "你是谁", "你是誰"))
+    return lowered in {"hi", "hello", "hey"} or any(token in value for token in ("\u4f60\u597d", "\u60a8\u597d", "\u4f60\u662f\u8c01", "\u4f60\u662f\u8ab0"))
 
 
 def _is_generic_completed_answer(value: str) -> bool:
-    normalized = value.strip().rstrip(".。").lower()
-    return normalized in GENERIC_COMPLETED_ANSWERS
-
+    normalized = value.strip().rstrip(".\u3002").lower()
+    if normalized in GENERIC_COMPLETED_ANSWERS:
+        return True
+    return normalized.startswith("\u5df2\u5b8c\u6210\u672c\u6b21 agent run") or normalized.startswith("\u5df2\u5b8c\u6210\u672c\u6b21 agent")
 
 def _conversation_response(item, messages: list[Any] | None = None) -> dict[str, Any]:
     if not item:
