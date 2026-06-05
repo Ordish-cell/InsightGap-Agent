@@ -188,13 +188,66 @@ class AgentRun(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(64), default="", index=True, nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(255), default="", index=True, nullable=False)
     run_type: Mapped[str] = mapped_column(String(64), default="chat", nullable=False)
     mode: Mapped[str] = mapped_column(String(32), default="react", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="created", nullable=False)
     user_input: Mapped[str] = mapped_column(Text, default="", nullable=False)
     graph_state: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     result_summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    final_answer: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    final_response: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    langgraphstatus_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    elapsed_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AgentConversation(Base, TimestampMixin):
+    __tablename__ = "agent_conversations"
+    __table_args__ = (
+        Index("ix_agent_conversations_user_status", "user_id", "status"),
+        Index("ix_agent_conversations_user_conversation", "user_id", "conversation_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    title: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    source: Mapped[str] = mapped_column(String(64), default="agent_page", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(255), default="", index=True, nullable=False)
+    selected_feed_card_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selected_feed_card_title: Mapped[str] = mapped_column(String(512), default="", nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    last_message_preview: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    last_run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True)
+    message_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_active_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class AgentChatMessage(Base, TimestampMixin):
+    __tablename__ = "agent_chat_messages"
+    __table_args__ = (
+        Index("ix_agent_chat_messages_conversation_created", "conversation_id", "created_at"),
+        Index("ix_agent_chat_messages_user_conversation", "user_id", "conversation_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    message_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True)
+    thread_id: Mapped[str] = mapped_column(String(255), default="", nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    content: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="completed", nullable=False)
+    elapsed_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    langgraphstatus_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    steps_json: Mapped[list[Any]] = mapped_column(JSON, default=json_default, nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class AgentStep(Base):

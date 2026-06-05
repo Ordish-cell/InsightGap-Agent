@@ -105,9 +105,20 @@ export interface ResearchRun {
 export interface AgentRun {
   run_id?: number
   id?: number
+  conversation_id?: string
+  thread_id?: string
   route?: string
   status?: string
+  elapsed_ms?: number
+  answer?: string
+  final_answer?: string
   final_output?: string
+  final_response?: UnknownRecord
+  final_payload?: UnknownRecord
+  assistant_message?: AgentChatMessage
+  user_message?: AgentChatMessage
+  conversation?: AgentConversation
+  langgraphstatus?: UnknownRecord
   artifacts?: Artifact[]
   matched_skill?: SkillDraft & { match_score?: number; match_reason?: string; auto_use?: boolean }
   candidate_skills?: Array<SkillDraft & { match_score?: number; match_reason?: string; auto_use?: boolean }>
@@ -115,6 +126,59 @@ export interface AgentRun {
   reusable_score?: number
   tool_call?: McpToolCall
   evaluation?: UnknownRecord
+  [key: string]: unknown
+}
+
+export interface AgentConversation {
+  id?: number
+  conversation_id: string
+  thread_id?: string
+  title?: string
+  source?: string
+  status?: string
+  selected_feed_card_id?: number | null
+  selected_feed_card_title?: string
+  metadata?: UnknownRecord
+  last_message_preview?: string
+  last_run_id?: number | null
+  message_count?: number
+  messages?: AgentChatMessage[]
+  created_at?: string
+  updated_at?: string
+  last_active_at?: string
+  [key: string]: unknown
+}
+
+export interface AgentChatMessage {
+  id?: number
+  message_id: string
+  conversation_id?: string
+  run_id?: number | null
+  thread_id?: string
+  role: 'user' | 'assistant' | 'system'
+  content?: string
+  status?: string
+  elapsed_ms?: number | null
+  langgraphstatus?: UnknownRecord
+  steps?: AgentRunStep[]
+  error_message?: string
+  metadata?: UnknownRecord
+  created_at?: string
+  updated_at?: string
+  [key: string]: unknown
+}
+
+export interface AgentRunStep {
+  key?: string
+  title?: string
+  status?: string
+  summary?: string
+  detail?: string
+  node_name?: string
+  started_at?: string
+  completed_at?: string | null
+  elapsed_ms?: number
+  events_count?: number
   [key: string]: unknown
 }
 

@@ -152,7 +152,7 @@ export function HomePage() {
       ) : null}
       <AgentChatPanel
         source="home_chat"
-        pageContext={{ page: 'home', selected_feed_card_id: selectedFeedCardId }}
+        pageContext={{ page: 'home', selected_feed_card_id: selectedFeedCardId, selected_feed_card_title: selectedFeedCard?.title || '' }}
         placeholder={selectedFeedCard ? `围绕这张卡片提问：${selectedFeedCard.title}` : '让 Agent 帮你研究、生成成果、总结信息，或沉淀成可复用 Skill'}
         initialTitle="我们该构建或研究什么？"
         locale="zh"

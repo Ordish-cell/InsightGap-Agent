@@ -1,43 +1,165 @@
 import asyncio
 from datetime import date, datetime
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
 from src.web_app.agent.runtime import AgentRuntime
 from src.web_app.agent.runtime.checkpoint import record_event
-from src.web_app.db.repositories.agent_repository import AgentEventRepository, AgentRunRepository, AgentStepRepository
+from src.web_app.db.repositories.agent_repository import (
+    AgentChatMessageRepository,
+    AgentConversationRepository,
+    AgentEventRepository,
+    AgentRunRepository,
+    AgentStepRepository,
+)
+
+
+GENERIC_COMPLETED_ANSWERS = {
+    "",
+    "agent completed",
+    "agent completed, but no displayable output was returned",
+    "agent run completed",
+    "agent runtime completed",
+}
 
 
 async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    started_at = datetime.now()
     user_input = payload.get("user_input") or payload.get("input") or payload.get("query") or ""
     payload = {**payload, "user_input": user_input}
     page_context = payload.get("page_context") or {}
-    conversation_id = payload.get("conversation_id")
+    conversation_repo = AgentConversationRepository(db)
+    message_repo = AgentChatMessageRepository(db)
+    conversation = _get_or_create_conversation(db, user_id, payload, user_input)
+    conversation_id = conversation.conversation_id
     selected_feed_card_id = page_context.get("selected_feed_card_id") or page_context.get("feed_card_id")
+    selected_feed_card_title = str(page_context.get("selected_feed_card_title") or page_context.get("feed_card_title") or "")
     if selected_feed_card_id and not payload.get("feed_card_id"):
         payload["feed_card_id"] = selected_feed_card_id
     run_repo = AgentRunRepository(db)
+    thread_id = conversation.thread_id or f"user:{user_id}:conversation:{conversation_id}"
+    if not conversation.thread_id:
+        conversation_repo.update(conversation, thread_id=thread_id)
     run = run_repo.create(
         user_id=user_id,
+        conversation_id=conversation_id,
+        thread_id=thread_id,
         run_type=payload.get("run_type", "agent_runtime"),
         mode=payload.get("mode", "react"),
         status="running",
         user_input=user_input,
-        graph_state={"source": payload.get("source", "agent_page"), "page_context": page_context},
+        graph_state={"source": payload.get("source", "agent_page"), "page_context": page_context, "thread_id": thread_id, "conversation_id": conversation_id},
     )
-    thread_id = f"user:{user_id}:conversation:{conversation_id}" if conversation_id else f"user:{user_id}:run:{run.id}"
-    run_repo.update(run, graph_state={"source": payload.get("source", "agent_page"), "page_context": page_context, "thread_id": thread_id, "conversation_id": conversation_id})
+    user_message = message_repo.create(
+        message_id=str(uuid4()),
+        conversation_id=conversation_id,
+        user_id=user_id,
+        run_id=run.id,
+        thread_id=thread_id,
+        role="user",
+        content=user_input,
+        status="completed",
+        metadata_json={"source": payload.get("source", "agent_page"), "page_context": page_context},
+    )
+    assistant_message = message_repo.create(
+        message_id=str(uuid4()),
+        conversation_id=conversation_id,
+        user_id=user_id,
+        run_id=run.id,
+        thread_id=thread_id,
+        role="assistant",
+        content="",
+        status="thinking",
+        metadata_json={"source": payload.get("source", "agent_page")},
+    )
     record_event(db, run.id, "run_started", {"user_input": user_input, "source": payload.get("source", "agent_page")}, user_id=user_id, thread_id=thread_id)
-    state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context})
-    run_repo.update(run, status=state.get("status", "completed"), graph_state=_json_safe(dict(state)), result_summary=state.get("final_output", ""), error_message=state.get("error", ""))
+    try:
+        state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context})
+    except Exception as exc:
+        state = {
+            "user_id": user_id,
+            "run_id": run.id,
+            "thread_id": thread_id,
+            "conversation_id": conversation_id,
+            "user_input": user_input,
+            "status": "failed",
+            "error": str(exc),
+            "errors": [str(exc)],
+            "final_output": "",
+            "langgraphstatus": {
+                "run_id": run.id,
+                "thread_id": thread_id,
+                "conversation_id": conversation_id,
+                "status": "failed",
+                "phase": "failed",
+                "summary": "Agent runtime failed before producing a final answer.",
+                "steps": [],
+            },
+        }
+    elapsed_ms = max(0, int((datetime.now() - started_at).total_seconds() * 1000))
+    answer = build_user_facing_answer(state)
+    state["answer"] = answer
+    state["final_answer"] = answer
+    state["final_output"] = answer
+    final_payload = dict(state.get("final_payload") or {})
+    final_payload["answer"] = answer
+    final_payload.setdefault("run_id", str(run.id))
+    final_payload.setdefault("thread_id", thread_id)
+    final_payload.setdefault("conversation_id", conversation_id)
+    state["final_payload"] = final_payload
+    langgraphstatus = dict(state.get("langgraphstatus") or {})
+    langgraphstatus.update(
+        {
+            "run_id": run.id,
+            "thread_id": thread_id,
+            "conversation_id": conversation_id,
+            "status": state.get("status", "completed"),
+            "phase": "completed" if state.get("status", "completed") == "completed" else state.get("status", "completed"),
+            "elapsed_ms": elapsed_ms,
+        }
+    )
+    state["langgraphstatus"] = langgraphstatus
+    steps = list(langgraphstatus.get("steps") or [])
+    completed_at = datetime.now() if state.get("status") in {"completed", "failed", "waiting_approval"} else None
+    run_repo.update(
+        run,
+        status=state.get("status", "completed"),
+        graph_state=_json_safe(dict(state)),
+        result_summary=answer,
+        final_answer=answer,
+        final_response=_json_safe(final_payload),
+        langgraphstatus_json=_json_safe(langgraphstatus),
+        elapsed_ms=elapsed_ms,
+        error_message=state.get("error", ""),
+        completed_at=completed_at,
+    )
+    message_repo.update(
+        assistant_message,
+        content=answer,
+        status="failed" if state.get("status") == "failed" else "completed" if state.get("status") == "completed" else state.get("status", "completed"),
+        elapsed_ms=elapsed_ms,
+        langgraphstatus_json=_json_safe(langgraphstatus),
+        steps_json=_json_safe(steps),
+        error_message=state.get("error", ""),
+        metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload)},
+    )
+    conversation_repo.touch(
+        conversation,
+        preview=answer,
+        last_run_id=run.id,
+        selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
+        selected_feed_card_title=selected_feed_card_title or None,
+    )
     if state.get("approval_required") or state.get("status") == "waiting_approval":
         record_event(db, run.id, "approval_required", state.get("approval_payload") or {}, user_id=user_id, thread_id=thread_id)
     elif state.get("status") == "failed":
-        record_event(db, run.id, "run_failed", {"status": state.get("status"), "final_output": state.get("final_output", "")}, user_id=user_id, thread_id=thread_id)
+        record_event(db, run.id, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
     else:
-        record_event(db, run.id, "run_completed", {"status": state.get("status"), "final_output": state.get("final_output", "")}, user_id=user_id, thread_id=thread_id)
-    return _run_response(run.id, state)
+        record_event(db, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)
+        record_event(db, run.id, "run_completed", {"status": state.get("status"), "answer": answer}, user_id=user_id, thread_id=thread_id)
+    return _run_response(run.id, state, conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=elapsed_ms)
 
 
 def run_agent(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -55,9 +177,15 @@ def get_run(db: Session, user_id: int, run_id: int) -> dict[str, Any]:
         "mode": run.mode,
         "user_input": run.user_input,
         "result_summary": run.result_summary,
+        "answer": run.final_answer or run.result_summary,
+        "final_answer": run.final_answer,
+        "final_response": run.final_response or {},
+        "langgraphstatus": run.langgraphstatus_json or (run.graph_state or {}).get("langgraphstatus", {}),
+        "elapsed_ms": run.elapsed_ms,
         "error_message": run.error_message,
         "graph_state": run.graph_state or {},
-        "thread_id": (run.graph_state or {}).get("thread_id", ""),
+        "conversation_id": run.conversation_id or (run.graph_state or {}).get("conversation_id", ""),
+        "thread_id": run.thread_id or (run.graph_state or {}).get("thread_id", ""),
     }
 
 
@@ -76,20 +204,134 @@ def list_events(db: Session, user_id: int, run_id: int) -> list[dict[str, Any]]:
     return [{"event": "step", "data": {"run_id": run_id, **step}} for step in list_steps(db, user_id, run_id)]
 
 
-def _run_response(run_id: int, state: dict[str, Any]) -> dict[str, Any]:
+def create_conversation(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    item = _create_conversation(db, user_id, payload, payload.get("title") or "")
+    return _conversation_response(item, messages=[])
+
+
+def list_conversations(db: Session, user_id: int, status: str = "active", limit: int = 50, offset: int = 0) -> dict[str, Any]:
+    items = AgentConversationRepository(db).list_by_user(user_id, status=status, limit=limit, offset=offset)
+    return {"items": [_conversation_response(item) for item in items]}
+
+
+def get_conversation(db: Session, user_id: int, conversation_id: str) -> dict[str, Any]:
+    conversation = _require_conversation(db, user_id, conversation_id)
+    messages = AgentChatMessageRepository(db).list_by_conversation(user_id, conversation_id)
+    return _conversation_response(conversation, messages=messages)
+
+
+def update_conversation(db: Session, user_id: int, conversation_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    repo = AgentConversationRepository(db)
+    conversation = _require_conversation(db, user_id, conversation_id)
+    values: dict[str, Any] = {}
+    if "title" in payload:
+        values["title"] = str(payload.get("title") or "")[:255]
+    if "selected_feed_card_id" in payload:
+        values["selected_feed_card_id"] = payload.get("selected_feed_card_id")
+    if "selected_feed_card_title" in payload:
+        values["selected_feed_card_title"] = str(payload.get("selected_feed_card_title") or "")[:512]
+    if "metadata" in payload or "metadata_json" in payload:
+        values["metadata_json"] = payload.get("metadata_json") or payload.get("metadata") or {}
+    if values:
+        conversation = repo.update(conversation, **values)
+    return _conversation_response(conversation, messages=AgentChatMessageRepository(db).list_by_conversation(user_id, conversation_id))
+
+
+def archive_conversation(db: Session, user_id: int, conversation_id: str) -> dict[str, Any]:
+    conversation = _require_conversation(db, user_id, conversation_id)
+    conversation = AgentConversationRepository(db).update(conversation, status="archived")
+    return _conversation_response(conversation)
+
+
+def delete_conversation(db: Session, user_id: int, conversation_id: str) -> dict[str, Any]:
+    conversation = _require_conversation(db, user_id, conversation_id)
+    conversation = AgentConversationRepository(db).update(conversation, status="deleted")
+    return _conversation_response(conversation)
+
+
+def clear_conversation(db: Session, user_id: int, conversation_id: str) -> dict[str, Any]:
+    conversation_repo = AgentConversationRepository(db)
+    conversation = _require_conversation(db, user_id, conversation_id)
+    removed = AgentChatMessageRepository(db).clear_conversation(user_id, conversation_id)
+    conversation = conversation_repo.update(conversation, message_count=0, last_message_preview="")
+    return {"conversation": _conversation_response(conversation), "cleared_messages": removed}
+
+
+def build_user_facing_answer(state: dict[str, Any]) -> str:
+    final_payload = state.get("final_payload") or {}
+    candidates = [
+        state.get("answer"),
+        final_payload.get("answer") if isinstance(final_payload, dict) else "",
+        state.get("final_answer"),
+        state.get("final_output"),
+    ]
+    for candidate in candidates:
+        text = str(candidate or "").strip()
+        if text and not _is_generic_completed_answer(text):
+            return text
+
+    status = state.get("status", "completed")
+    errors = [str(item) for item in state.get("errors", []) if item] or ([str(state.get("error"))] if state.get("error") else [])
+    if status == "failed" or errors:
+        reason = errors[0] if errors else "runtime returned a failure state"
+        return f"这次执行失败了，原因是：{reason}。你可以重试，或让我继续帮你排查这条 Agent Run。"
+
     route_plan = state.get("route_plan") or {}
+    home_intent = state.get("home_intent") or {}
+    intent = str(route_plan.get("intent") or home_intent.get("intent") or state.get("route") or "chat")
+    risk_level = str(route_plan.get("risk_level") or home_intent.get("risk_level") or "L0")
+    if status == "waiting_approval" or route_plan.get("needs_approval") or home_intent.get("needs_approval"):
+        return f"我已识别到这是 {risk_level} 风险操作，需要先通过审批。当前没有执行外部写入或不可逆动作，只保留了可审计的运行记录。"
+
+    user_input = str(state.get("user_input") or "").strip()
+    if _looks_like_greeting(user_input):
+        return "你好，我是你的信息差 Agent OS 助手。你可以让我分析首页信息差、做深度研究、生成报告或代码成果，也可以把反复使用的流程沉淀成长期记忆和 Skill。"
+    if intent == "research":
+        return "我已识别这是一个研究任务，并完成了需求判断和执行规划。当前这次运行没有产生可验证的完整研究结果，因此不会假装已经完成深度研究。你可以继续指定研究范围，我会进入资料检索和结构化报告生成。"
+    if intent == "artifact":
+        return "我已识别这是一个成果生成任务，并完成了初步规划。当前没有生成实际 Artifact，因此不会把计划当成成品展示。你可以继续指定要生成文档、报告、网站还是代码。"
+    if intent == "tool":
+        return "我已识别这是一个工具相关任务。当前没有执行高风险外部动作；如涉及发邮件、发布、删除或支付等操作，会先进入审批状态。"
+
+    steps = ((state.get("langgraphstatus") or {}).get("steps") or [])
+    completed = [str(item.get("title") or item.get("key") or "") for item in steps if isinstance(item, dict) and item.get("status") in {"completed", "waiting_approval"}]
+    if completed:
+        return f"已完成本次 Agent Run。关键步骤包括：{'、'.join(completed[:4])}。你可以展开上方执行过程查看状态记录和验证信息。"
+    return "已完成本次 Agent Run，并保留了可审计的执行记录。你可以继续追问，系统会沿用当前会话上下文。"
+
+
+def _run_response(
+    run_id: int,
+    state: dict[str, Any],
+    *,
+    conversation=None,
+    user_message=None,
+    assistant_message=None,
+    elapsed_ms: int = 0,
+) -> dict[str, Any]:
+    route_plan = state.get("route_plan") or {}
+    answer = build_user_facing_answer(state)
+    final_response = dict(state.get("final_payload") or {})
+    final_response["answer"] = answer
     return {
         "run_id": run_id,
+        "conversation_id": state.get("conversation_id", ""),
         "thread_id": state.get("thread_id", ""),
         "status": state.get("status", "completed"),
+        "elapsed_ms": elapsed_ms,
+        "answer": answer,
         "route": state.get("route"),
         "intent": route_plan.get("intent", state.get("route")),
         "route_plan": route_plan.get("route", []),
         "risk_level": route_plan.get("risk_level", "L0"),
-        "final_output": state.get("final_output", ""),
-        "final_answer": state.get("final_answer", ""),
-        "final_payload": state.get("final_payload"),
+        "final_output": answer,
+        "final_answer": answer,
+        "final_response": final_response,
+        "final_payload": final_response,
         "langgraphstatus": state.get("langgraphstatus", {}),
+        "user_message": _message_response(user_message) if user_message else None,
+        "assistant_message": _message_response(assistant_message) if assistant_message else None,
+        "conversation": _conversation_response(conversation) if conversation else None,
         "research": state.get("research", {}) or state.get("research_result", {}),
         "rag": state.get("rag", {}) or state.get("rag_result", {}),
         "artifacts": state.get("artifacts", []),
@@ -107,6 +349,110 @@ def _run_response(run_id: int, state: dict[str, Any]) -> dict[str, Any]:
         "approval_required": state.get("approval_required", False),
         "approval_payload": state.get("approval_payload"),
         "agent_outputs": state.get("agent_outputs", []),
+    }
+
+
+def _get_or_create_conversation(db: Session, user_id: int, payload: dict[str, Any], user_input: str):
+    conversation_id = str(payload.get("conversation_id") or "").strip()
+    if conversation_id:
+        return _require_conversation(db, user_id, conversation_id)
+    return _create_conversation(db, user_id, payload, user_input)
+
+
+def _create_conversation(db: Session, user_id: int, payload: dict[str, Any], title_seed: str):
+    conversation_id = str(uuid4())
+    thread_id = f"user:{user_id}:conversation:{conversation_id}"
+    page_context = payload.get("page_context") or {}
+    selected_feed_card_id = page_context.get("selected_feed_card_id") or page_context.get("feed_card_id")
+    try:
+        selected_feed_card_id = int(selected_feed_card_id) if selected_feed_card_id else None
+    except (TypeError, ValueError):
+        selected_feed_card_id = None
+    selected_feed_card_title = str(page_context.get("selected_feed_card_title") or page_context.get("feed_card_title") or "")
+    title = str(payload.get("title") or title_seed or "New Agent Run").strip()
+    return AgentConversationRepository(db).create(
+        conversation_id=conversation_id,
+        user_id=user_id,
+        title=_short_title(title),
+        source=payload.get("source", "agent_page"),
+        status="active",
+        thread_id=thread_id,
+        selected_feed_card_id=selected_feed_card_id,
+        selected_feed_card_title=selected_feed_card_title[:512],
+        metadata_json={"page_context": page_context},
+        last_message_preview="",
+        message_count=0,
+    )
+
+
+def _require_conversation(db: Session, user_id: int, conversation_id: str):
+    conversation = AgentConversationRepository(db).get_by_conversation_id(user_id, conversation_id)
+    if not conversation:
+        raise ValueError("Agent conversation not found")
+    return conversation
+
+
+def _short_title(value: str) -> str:
+    title = " ".join(value.split())
+    if not title:
+        return "New Agent Run"
+    return title[:42]
+
+
+def _looks_like_greeting(value: str) -> bool:
+    lowered = value.lower()
+    return lowered in {"hi", "hello", "hey"} or any(token in value for token in ("你好", "您好", "你是谁", "你是誰"))
+
+
+def _is_generic_completed_answer(value: str) -> bool:
+    normalized = value.strip().rstrip(".。").lower()
+    return normalized in GENERIC_COMPLETED_ANSWERS
+
+
+def _conversation_response(item, messages: list[Any] | None = None) -> dict[str, Any]:
+    if not item:
+        return {}
+    data = {
+        "id": item.id,
+        "conversation_id": item.conversation_id,
+        "thread_id": item.thread_id,
+        "title": item.title,
+        "source": item.source,
+        "status": item.status,
+        "selected_feed_card_id": item.selected_feed_card_id,
+        "selected_feed_card_title": item.selected_feed_card_title,
+        "metadata": item.metadata_json or {},
+        "last_message_preview": item.last_message_preview,
+        "last_run_id": item.last_run_id,
+        "message_count": item.message_count,
+        "created_at": item.created_at.isoformat() if item.created_at else "",
+        "updated_at": item.updated_at.isoformat() if item.updated_at else "",
+        "last_active_at": item.last_active_at.isoformat() if item.last_active_at else "",
+    }
+    if messages is not None:
+        data["messages"] = [_message_response(message) for message in messages]
+    return data
+
+
+def _message_response(item) -> dict[str, Any]:
+    if not item:
+        return {}
+    return {
+        "id": item.id,
+        "message_id": item.message_id,
+        "conversation_id": item.conversation_id,
+        "run_id": item.run_id,
+        "thread_id": item.thread_id,
+        "role": item.role,
+        "content": item.content,
+        "status": item.status,
+        "elapsed_ms": item.elapsed_ms,
+        "langgraphstatus": item.langgraphstatus_json or {},
+        "steps": item.steps_json or [],
+        "error_message": item.error_message,
+        "metadata": item.metadata_json or {},
+        "created_at": item.created_at.isoformat() if item.created_at else "",
+        "updated_at": item.updated_at.isoformat() if item.updated_at else "",
     }
 
 

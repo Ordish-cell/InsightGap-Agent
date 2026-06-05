@@ -2599,3 +2599,239 @@ body:has(.simple-login-page) {
 .home-page .floating-feed.closed {
   display: none;
 }
+
+/* Unified Agent Run chat */
+
+.codex-chat-page.with-conversations {
+  grid-template-columns: 272px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.agent-conversation-sidebar {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 18px 12px;
+  border-right: 1px solid var(--border);
+  background: rgb(255 255 255 / 62%);
+  overflow: hidden;
+}
+
+.conversation-sidebar-head,
+.conversation-sidebar-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.conversation-sidebar-head strong {
+  font-size: 15px;
+  letter-spacing: -0.03em;
+}
+
+.conversation-sidebar-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.conversation-sidebar-actions button,
+.conversation-sidebar-foot button {
+  min-width: 30px;
+  min-height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #fff;
+  color: #242424;
+  font-weight: 800;
+}
+
+.conversation-sidebar-foot button {
+  flex: 1;
+  min-height: 34px;
+  font-size: 12px;
+}
+
+.conversation-list {
+  min-height: 0;
+  display: grid;
+  align-content: start;
+  gap: 6px;
+  overflow-y: auto;
+}
+
+.conversation-empty {
+  padding: 12px 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.conversation-item {
+  width: 100%;
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  background: transparent;
+  color: #252525;
+  text-align: left;
+}
+
+.conversation-item:hover {
+  background: rgb(255 255 255 / 72%);
+}
+
+.conversation-item.active {
+  border-color: var(--border);
+  background: #fff;
+  box-shadow: var(--shadow-card);
+}
+
+.conversation-item strong,
+.conversation-item span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.conversation-item strong {
+  font-size: 13px;
+}
+
+.conversation-item span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.chat-workspace {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+}
+
+.assistant-run-message {
+  width: min(780px, 100%);
+  display: grid;
+  gap: 8px;
+}
+
+.answer-content {
+  width: 100%;
+}
+
+.run-trace {
+  width: min(780px, 100%);
+  display: grid;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
+}
+
+.run-trace-summary {
+  min-height: 34px;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #6f6a63;
+  text-align: left;
+}
+
+.run-trace-summary:disabled {
+  opacity: 1;
+}
+
+.run-trace-summary strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.run-trace-chevron {
+  margin-left: auto;
+  color: var(--faint);
+  font-size: 18px;
+}
+
+.run-step-list {
+  display: grid;
+  gap: 6px;
+  padding: 8px 0 12px;
+}
+
+.run-step {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgb(255 255 255 / 72%);
+}
+
+.run-step-mark {
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: #f0eee9;
+  color: #64605a;
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.run-step.failed .run-step-mark,
+.run-trace.failed .thinking-dot {
+  background: #fff0ee;
+  color: var(--danger);
+}
+
+.run-step.running .run-step-mark,
+.run-trace.running .thinking-dot {
+  background: #f1ecff;
+  color: #5d42cc;
+}
+
+.run-step strong {
+  display: block;
+  color: #252525;
+  font-size: 13px;
+}
+
+.run-step p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.selected-context-pill {
+  margin: 10px 12px 0;
+  padding: 8px 10px;
+  border: 1px solid #d8d1c7;
+  border-radius: 12px;
+  background: #fbf8f4;
+  color: #514d48;
+  font-size: 13px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 980px) {
+  .codex-chat-page.with-conversations {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-conversation-sidebar {
+    min-height: auto;
+    max-height: 176px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+}

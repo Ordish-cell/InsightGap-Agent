@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 class AgentRunRequest(BaseModel):
     user_input: str = ""
     input: str | None = None
+    conversation_id: str | None = None
     mode: str = "react"
     run_type: str = "agent_runtime"
     route: Literal["research", "rag", "artifact", "skill", "memory", "tool"] | None = None
