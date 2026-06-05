@@ -16,6 +16,7 @@ from src.web_app.agent.runtime.langgraph_status import append_status_step
 from src.web_app.agent.runtime.planner import plan_route
 from src.web_app.agent.runtime.router import route_user_input
 from src.web_app.agent.runtime.state import AgentRuntimeState, append_error, append_output, mark_completed
+from src.web_app.agent.runtime.visible_thoughts import emit_visible_thought, visible_thought_texts
 from src.web_app.mcp.tool_router import infer_tool
 from src.web_app.context.builder import ContextBuilder
 from src.web_app.core.constants import L3_EXTERNAL_WRITE, L4_HIGH_RISK
@@ -56,6 +57,7 @@ class RuntimeNodes:
             state["permission"]["requires_approval"] = True
             state["permission"]["reason"] = "strong_approval_required"
         record_step(self.db, state["run_id"], "permission_guard", "permission", {"user_input": text}, {"permission": state["permission"], "route": state.get("route")})
+        emit_visible_thought(self.db, state, "permission_guard")
         return state
 
     async def home_intent_react(self, state: AgentRuntimeState) -> AgentRuntimeState:
@@ -115,6 +117,7 @@ class RuntimeNodes:
                 "reason_summary": home_intent.get("reason_summary") or home_intent.get("reasoning_summary", ""),
             },
         )
+        emit_visible_thought(self.db, state, "home_intent_react")
         record_step(self.db, state["run_id"], "home_intent_react", "triage_intent", {"user_input": user_input, "page_context": page_context}, {"home_intent": home_intent})
         record_event(
             self.db,
@@ -196,6 +199,7 @@ class RuntimeNodes:
                 "feed_card_loaded": bool(feed_card_context),
             },
         )
+        emit_visible_thought(self.db, state, "context_builder")
         if feed_card_id and not feed_card_context:
             record_step(self.db, state["run_id"], "feed_card_context", "load_context",
                         {"feed_card_id": feed_card_id},
@@ -233,6 +237,7 @@ class RuntimeNodes:
                 "score": (state.get("matched_skill") or {}).get("match_score"),
             },
         )
+        emit_visible_thought(self.db, state, "skill_matcher")
         return state
 
     async def research(self, state: AgentRuntimeState) -> AgentRuntimeState:
@@ -449,6 +454,7 @@ class RuntimeNodes:
             detail=f"评估完成，状态 {status}",
             extra={"status": status, "errors": len(state.get("errors", [])), "warnings": []},
         )
+        emit_visible_thought(self.db, state, "evaluator")
         record_step(self.db, state["run_id"], "evaluator", "evaluate", {"route": state.get("route")}, {"evaluation": state["evaluation"]})
         mark_completed(state, "evaluator")
         return state
@@ -505,6 +511,7 @@ class RuntimeNodes:
                 "steps_count": len(route_plan.get("route", [])),
             },
         )
+        emit_visible_thought(self.db, state, "planner")
         record_step(self.db, state["run_id"], "planner", "plan_route",
                     {"user_input": user_input, "feed_card_id": feed_card_id},
                     {"route_plan": route_plan})
@@ -577,6 +584,7 @@ class RuntimeNodes:
             append_error(state, "research_agent", str(exc))
             record_step(self.db, state["run_id"], "research_agent", "deep_research",
                         {}, {"error": str(exc)}, status="failed")
+        emit_visible_thought(self.db, state, "research_agent")
         mark_completed(state, "research_agent")
         return state
 
@@ -611,6 +619,7 @@ class RuntimeNodes:
         except Exception as exc:
             append_error(state, "rag_agent", str(exc))
             state["rag_result"] = {"answer": "", "evidence": [], "error": str(exc)}
+        emit_visible_thought(self.db, state, "rag_agent")
         mark_completed(state, "rag_agent")
         return state
 
@@ -669,6 +678,7 @@ class RuntimeNodes:
             )
         except Exception as exc:
             append_error(state, "artifact_agent", str(exc))
+        emit_visible_thought(self.db, state, "artifact_agent")
         mark_completed(state, "artifact_agent")
         return state
 
@@ -699,6 +709,7 @@ class RuntimeNodes:
                     detail=f"工具动作需要审批，风险等级 {route_plan.get('risk_level', 'L3')}",
                     extra={"risk_level": route_plan.get("risk_level", "L3"), "dry_run": True, "approval_required": True},
                 )
+                emit_visible_thought(self.db, state, "tool_agent")
                 mark_completed(state, "tool_agent")
                 return state
 
@@ -723,6 +734,7 @@ class RuntimeNodes:
                 )
         except Exception as exc:
             append_error(state, "tool_agent", str(exc))
+        emit_visible_thought(self.db, state, "tool_agent")
         mark_completed(state, "tool_agent")
         return state
 
@@ -781,6 +793,7 @@ class RuntimeNodes:
             )
         except Exception as exc:
             append_error(state, "memory_agent", str(exc))
+        emit_visible_thought(self.db, state, "memory_agent")
         mark_completed(state, "memory_agent")
         return state
 
@@ -833,6 +846,7 @@ class RuntimeNodes:
             )
         except Exception as exc:
             append_error(state, "skill_agent", str(exc))
+        emit_visible_thought(self.db, state, "skill_agent")
         mark_completed(state, "skill_agent")
         return state
 
@@ -854,7 +868,7 @@ class RuntimeNodes:
         draft_answer = "\n\n".join(answer_parts)
         if state.get("status") == "waiting_approval":
             final_answer = state.get("final_output") or "Approval required（需要审批）：这个操作需要先通过审批。我还没有执行外部写入或不可逆动作。"
-        elif draft_answer.strip():
+        elif draft_answer.strip() and not self._is_generic_draft_answer(draft_answer):
             final_answer = draft_answer.strip()
         else:
             final_answer = await self._generate_final_answer_with_llm(state, draft_answer)
@@ -897,7 +911,10 @@ class RuntimeNodes:
                 "tool_calls_count": 1 if state.get("tool_call") else 0,
             },
         )
-        await self._enrich_trace_with_llm(state)
+        emit_visible_thought(self.db, state, "final_response")
+        await self._enrich_visible_thoughts_with_llm(state)
+        final_payload["thinking_summary"] = visible_thought_texts(state)
+        final_payload["visible_thoughts"] = state.get("visible_thoughts", [])
         final_payload["langgraphstatus"] = state.get("langgraphstatus", {})
         state["final_payload"] = final_payload
         state["status"] = status
@@ -909,15 +926,14 @@ class RuntimeNodes:
                      "error_count": len(errors)})
         return state
 
-    async def _enrich_trace_with_llm(self, state: AgentRuntimeState) -> None:
-        """Add user-visible ReAct-style stage summaries without exposing private chain-of-thought."""
-        status = state.get("langgraphstatus") or {}
-        steps = list(status.get("steps") or [])
-        if not steps or not get_llm_settings().enabled:
+    async def _enrich_visible_thoughts_with_llm(self, state: AgentRuntimeState) -> None:
+        """Optionally polish visible stage summaries without exposing private chain-of-thought."""
+        thoughts = list(state.get("visible_thoughts") or [])
+        if not thoughts or not get_llm_settings().enabled:
             return
 
         resolution = resolve_model_name("final")
-        prompt = self._build_trace_prompt(state, steps)
+        prompt = self._build_visible_thought_prompt(state, thoughts)
         started = time.perf_counter()
         output_text = ""
         try:
@@ -928,22 +944,17 @@ class RuntimeNodes:
             if not rows:
                 return
             by_key = {str(item.get("key") or ""): item for item in rows if item.get("key")}
-            enriched = []
-            for step in steps:
-                key = str(step.get("key") or "")
+            enriched_thoughts = []
+            for thought in thoughts:
+                key = str(thought.get("key") or "")
                 row = by_key.get(key)
                 if row:
-                    step = {
-                        **step,
-                        "llm_stage_output": str(row.get("thought") or row.get("summary") or ""),
-                        "thought": str(row.get("thought") or step.get("thought") or ""),
-                        "action": str(row.get("action") or step.get("action") or step.get("title") or ""),
-                        "observation": str(row.get("observation") or step.get("observation") or step.get("detail") or ""),
-                        "next_action": str(row.get("next_action") or step.get("next_action") or ""),
-                    }
-                enriched.append(step)
-            status["steps"] = enriched
-            status["trace_style"] = "react_visible_summary"
+                    thought = {**thought, "text": str(row.get("text") or row.get("summary") or thought.get("text") or "")}
+                enriched_thoughts.append(thought)
+            state["visible_thoughts"] = enriched_thoughts
+            status = state.setdefault("langgraphstatus", {})
+            status["visible_thoughts"] = enriched_thoughts
+            status["trace_style"] = "visible_thought_summary"
             state["langgraphstatus"] = status
             latency_ms = int((time.perf_counter() - started) * 1000)
             record_llm_call(
@@ -960,13 +971,13 @@ class RuntimeNodes:
                 status="completed",
                 estimated_input_chars=len(prompt),
                 estimated_output_chars=len(output_text),
-                metadata={"stage_count": len(enriched)},
+                metadata={"stage_count": len(enriched_thoughts)},
             )
             record_event(
                 self.db,
                 state["run_id"],
                 "thought_summary",
-                {"title": "trace_visualizer", "summary": "Generated visible ReAct stage summaries.", "stage_count": len(enriched), "model": resolution.model},
+                {"title": "trace_visualizer", "summary": "Generated visible stage summaries.", "stage_count": len(enriched_thoughts), "model": resolution.model},
                 node_name="trace_visualizer",
                 user_id=state.get("user_id"),
                 thread_id=state.get("thread_id", ""),
@@ -988,34 +999,30 @@ class RuntimeNodes:
                 error_message=str(exc),
                 estimated_input_chars=len(prompt),
                 estimated_output_chars=len(output_text),
-                metadata={"stage_count": len(steps)},
+                metadata={"stage_count": len(thoughts)},
             )
 
-    def _build_trace_prompt(self, state: AgentRuntimeState, steps: list[dict[str, Any]]) -> str:
+    def _build_visible_thought_prompt(self, state: AgentRuntimeState, thoughts: list[dict[str, Any]]) -> str:
         rows = [
             {
                 "key": item.get("key"),
-                "title": item.get("title"),
                 "status": item.get("status"),
-                "thought": item.get("thought"),
-                "action": item.get("action"),
-                "observation": item.get("observation"),
-                "next_action": item.get("next_action"),
+                "text": item.get("text"),
             }
-            for item in steps
+            for item in thoughts
         ]
         payload = {
             "user_input": state.get("user_input", ""),
             "intent": (state.get("route_plan") or {}).get("intent") or (state.get("home_intent") or {}).get("intent", "chat"),
             "risk_level": (state.get("route_plan") or {}).get("risk_level") or (state.get("home_intent") or {}).get("risk_level", "L0"),
-            "steps": rows,
+            "visible_thoughts": rows,
         }
         return (
-            "You write the visible reasoning/status trace for an agent UI, similar to Codex progress summaries.\n"
-            "Do not reveal hidden chain-of-thought. Write only concise user-visible ReAct-style summaries.\n"
-            "Return strict JSON only: an array of objects with keys: key, thought, action, observation, next_action.\n"
-            "Use Simplified Chinese for all user-facing text. Keep each field short, natural, and specific to the step.\n"
-            "The 'thought' field should be one sentence that explains what the agent is checking or deciding at this stage.\n"
+            "You polish visible progress narration for an agent UI, similar to Codex status updates.\n"
+            "Do not reveal hidden chain-of-thought. Do not mention internal node names or ReAct fields.\n"
+            "Return strict JSON only: an array of objects with keys: key, text.\n"
+            "Use Simplified Chinese. Each text value must be one natural user-facing sentence.\n"
+            "Explain what is happening, why it matters, or what will happen next.\n"
             f"Input data: {json.dumps(payload, ensure_ascii=False, default=str)}"
         )
 
@@ -1133,6 +1140,10 @@ class RuntimeNodes:
             "回答要贴合用户原话，优先给结论，然后给下一步可做什么。中文为主。\n"
             f"运行数据：{json.dumps(payload, ensure_ascii=False, default=str)}"
         )
+
+    def _is_generic_draft_answer(self, value: str) -> bool:
+        normalized = value.strip().rstrip(".\u3002").lower()
+        return normalized in {"", "agent completed", "agent run completed", "agent runtime completed"}
 
     def _fallback_final_answer(self, state: AgentRuntimeState, draft_answer: str) -> str:
         user_input = str(state.get("user_input") or "").strip()

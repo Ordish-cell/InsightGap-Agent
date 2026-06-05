@@ -28,13 +28,19 @@ export function createRunEventStream(runId: number | string, handlers: { onMessa
   return createFetchStream(`/agent/runs/${runId}/events`, handlers)
 }
 
+export function createRunLiveStream(payload: Record<string, unknown>, handlers: { onMessage?: (event: MessageEvent) => void; onError?: () => void }) {
+  return createFetchStream('/agent/runs/stream', handlers, { method: 'POST', body: payload })
+}
+
 export function extractRunAnswer(response: AgentRun) {
   const finalResponse = (response.final_response || {}) as Record<string, unknown>
   const finalPayload = (response.final_payload || {}) as Record<string, unknown>
+  const result = (response.result || {}) as Record<string, unknown>
   return String(
     response.answer ||
       finalResponse.answer ||
       response.assistant_message?.content ||
+      result.answer ||
       finalPayload.answer ||
       response.final_answer ||
       response.final_output ||
@@ -42,11 +48,19 @@ export function extractRunAnswer(response: AgentRun) {
   )
 }
 
-function createFetchStream(path: string, handlers: { onMessage?: (event: MessageEvent) => void; onError?: () => void }) {
+function createFetchStream(path: string, handlers: { onMessage?: (event: MessageEvent) => void; onError?: () => void }, options: { method?: string; body?: unknown } = {}) {
   const token = localStorage.getItem('authToken')
   const controller = new AbortController()
+  const headers = new Headers(token ? { Authorization: `Bearer ${token}` } : {})
+  let body: BodyInit | undefined
+  if (options.body !== undefined) {
+    headers.set('Content-Type', 'application/json')
+    body = JSON.stringify(options.body)
+  }
   fetch(`${apiBaseUrl()}${path}`, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    method: options.method || 'GET',
+    headers,
+    body,
     signal: controller.signal,
   })
     .then(async (response) => {

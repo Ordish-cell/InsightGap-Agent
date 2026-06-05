@@ -80,8 +80,10 @@ class AgentRuntimeState(TypedDict, total=False):
     final_output: str
     final_answer: str | None
     final_payload: dict[str, Any] | None
+    visible_thoughts: list[dict[str, Any]]
     error: str
     events: list[dict[str, Any]]
+    _stream_queue: Any
 
 
 # ── Helper functions for state manipulation ──────────────────────────

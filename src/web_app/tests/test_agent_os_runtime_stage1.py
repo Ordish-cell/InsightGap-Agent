@@ -1,6 +1,8 @@
 from src.web_app.agent.runtime.checkpointers import build_checkpointer
 from src.web_app.db.repositories.approval_repository import ApprovalRepository
-from src.web_app.services.agent_service import list_events, run_agent
+import pytest
+
+from src.web_app.services.agent_service import list_events, run_agent, stream_agent_run
 from src.web_app.services.approval_service import update_approval_status
 from src.web_app.models.orm import User
 from src.web_app.tests.db_test_utils import make_test_session
@@ -27,6 +29,45 @@ def test_chat_run_emits_agent_events():
     assert "run_started" in names
     assert "run_completed" in names
     assert any(event["data"]["event_type"] == "node_completed" for event in events)
+
+
+def test_chat_run_emits_visible_thoughts_without_react_fields():
+    db = make_test_session()
+    user = _user(db, "visible-thoughts@example.com")
+
+    result = run_agent(db, user.id, {"user_input": "杭州有啥好玩的？"})
+
+    thoughts = result["final_response"]["thinking_summary"]
+    assert thoughts
+    assert result["visible_thoughts"]
+    assert "answer" in result["final_response"]
+    assert all("planner" not in item and "context_builder" not in item for item in thoughts)
+
+    events = list_events(db, user.id, result["run_id"])
+    visible_events = [event for event in events if event["event"] == "visible_thought"]
+    assert visible_events
+    assert visible_events[0]["data"]["payload"]["status"] == "completed"
+    assert "text" in visible_events[0]["data"]["payload"]
+    assert "action" not in visible_events[0]["data"]["payload"]
+    assert "observation" not in visible_events[0]["data"]["payload"]
+    assert "next_action" not in visible_events[0]["data"]["payload"]
+
+
+@pytest.mark.asyncio
+async def test_agent_run_stream_emits_visible_thought_before_completion():
+    db = make_test_session()
+    user = _user(db, "visible-stream@example.com")
+
+    event_types = []
+    async for event in stream_agent_run(db, user.id, {"user_input": "hello"}):
+        event_type = event["data"]["event_type"]
+        event_types.append(event_type)
+        if event_type == "run_completed":
+            break
+
+    assert "visible_thought" in event_types
+    assert "run_completed" in event_types
+    assert event_types.index("visible_thought") < event_types.index("run_completed")
 
 
 def test_home_intent_react_detects_research_route():

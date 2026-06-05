@@ -1,0 +1,121 @@
+import { useEffect, useState } from 'react'
+
+import type { AgentChatMessage, AgentEvent, UnknownRecord } from '../../api/types'
+
+type AgentThoughtStreamProps = {
+  message: AgentChatMessage & { trace_events?: AgentEvent[] }
+  locale: 'en' | 'zh'
+  onApprove: (approvalId: number) => void
+  onReject: (approvalId: number) => void
+}
+
+const zhText = {
+  thinking: '正在思考',
+  completed: '已完成思考',
+  failed: '思考中断',
+  approve: '批准执行',
+  reject: '拒绝',
+}
+
+function text(locale: 'en' | 'zh', zh: string, en: string) {
+  return locale === 'zh' ? zh : en
+}
+
+function seconds(value?: number | null) {
+  if (!value) return ''
+  if (value < 1000) return `${Math.max(0.1, value / 1000).toFixed(1)}s`
+  return `${(value / 1000).toFixed(value > 10000 ? 0 : 1)}s`
+}
+
+function asRecord(value: unknown): UnknownRecord {
+  return value && typeof value === 'object' ? (value as UnknownRecord) : {}
+}
+
+function asThoughtText(value: unknown): string {
+  if (typeof value === 'string') return value.trim()
+  const item = asRecord(value)
+  return String(item.text || item.summary || '').trim()
+}
+
+function collectVisibleThoughts(message: AgentThoughtStreamProps['message']) {
+  const items: string[] = []
+  const push = (value: unknown) => {
+    const content = asThoughtText(value)
+    if (content && !items.includes(content)) items.push(content)
+  }
+
+  ;(message.trace_events || [])
+    .filter((event) => event.event_type === 'visible_thought')
+    .forEach((event) => push(asRecord(event.payload).text || event.payload))
+
+  const metadata = asRecord(message.metadata)
+  const finalResponse = asRecord(metadata.final_response)
+  const langgraphstatus = asRecord(message.langgraphstatus)
+  const sources = [
+    finalResponse.thinking_summary,
+    finalResponse.visible_thoughts,
+    metadata.visible_thoughts,
+    langgraphstatus.visible_thoughts,
+    (message as unknown as UnknownRecord).visible_thoughts,
+  ]
+  sources.forEach((source) => {
+    if (Array.isArray(source)) source.forEach(push)
+    else push(source)
+  })
+
+  return items
+}
+
+function approvalFrom(message: AgentThoughtStreamProps['message']) {
+  const event = (message.trace_events || []).find((item) => item.event_type === 'approval_required')
+  const payload = asRecord(event?.payload)
+  const approvalId = Number(payload.approval_id || asRecord(payload.approval_payload).approval_id || 0)
+  return { approvalId, payload }
+}
+
+export function AgentThoughtStream({ message, locale, onApprove, onReject }: AgentThoughtStreamProps) {
+  const thoughts = collectVisibleThoughts(message)
+  const status = String(message.status || 'completed')
+  const running = ['thinking', 'running', 'created', 'queued'].includes(status)
+  const failed = status === 'failed'
+  const elapsed = seconds(message.elapsed_ms)
+  const label = running ? text(locale, zhText.thinking, 'Thinking') : failed ? text(locale, zhText.failed, 'Thinking interrupted') : text(locale, zhText.completed, 'Completed reasoning')
+  const { approvalId, payload } = approvalFrom(message)
+  const [open, setOpen] = useState(running || failed)
+
+  useEffect(() => {
+    setOpen(running || failed)
+  }, [failed, running, message.message_id])
+
+  if (!thoughts.length && !running && !failed && !approvalId) return null
+
+  return (
+    <div className={running ? 'agent-thought-stream running' : failed ? 'agent-thought-stream failed' : 'agent-thought-stream'}>
+      <button className="thought-stream-status" type="button" onClick={() => setOpen((value) => !value)}>
+        <span className={running ? 'thinking-dot active' : 'thinking-dot'} />
+        <strong>
+          {label}
+          {elapsed ? ` · ${elapsed}` : ''}
+        </strong>
+        <span className="thought-stream-chevron">{open ? '∨' : '›'}</span>
+      </button>
+      {open ? (
+        <div className="thought-paragraphs">
+          {thoughts.length ? thoughts.map((item, index) => <p key={`${index}-${item}`}>{item}</p>) : <p>{text(locale, '我正在接住你的问题，并准备按当前会话上下文继续处理。', 'I am reading the request and preparing the next step from the current context.')}</p>}
+          {running ? <p className="thought-pending">{text(locale, '正在思考...', 'Thinking...')}</p> : null}
+        </div>
+      ) : null}
+      {approvalId && open ? (
+        <div className="approval-inline-actions thought-actions">
+          <small>{String(payload.risk_level || payload.permission_level || 'L3')}</small>
+          <button className="light-mini-button" type="button" onClick={() => onApprove(approvalId)}>
+            {text(locale, zhText.approve, 'Approve')}
+          </button>
+          <button className="light-mini-button" type="button" onClick={() => onReject(approvalId)}>
+            {text(locale, zhText.reject, 'Reject')}
+          </button>
+        </div>
+      ) : null}
+    </div>
+  )
+}

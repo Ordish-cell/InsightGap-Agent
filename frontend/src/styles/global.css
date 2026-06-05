@@ -2808,6 +2808,60 @@ body:has(.simple-login-page) {
   width: 100%;
 }
 
+.agent-thought-stream {
+  width: min(780px, 100%);
+  display: grid;
+  gap: 14px;
+  color: #4a453f;
+}
+
+.thought-stream-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #6f6a63;
+  text-align: left;
+}
+
+.thought-stream-status strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.thought-stream-chevron {
+  color: var(--faint);
+  font-size: 17px;
+  line-height: 1;
+}
+
+.thought-paragraphs {
+  display: grid;
+  gap: 12px;
+  max-width: 68ch;
+}
+
+.thought-paragraphs p {
+  margin: 0;
+  color: #34302b;
+  font-size: 15px;
+  line-height: 1.72;
+  text-wrap: pretty;
+}
+
+.thought-paragraphs .thought-pending {
+  color: #7b756e;
+  font-size: 13px;
+}
+
+.thought-actions {
+  margin-top: 0;
+}
+
 .run-trace {
   width: min(780px, 100%);
   display: grid;

@@ -115,6 +115,8 @@ export interface AgentRun {
   final_output?: string
   final_response?: UnknownRecord
   final_payload?: UnknownRecord
+  visible_thoughts?: unknown[]
+  thinking_summary?: string[]
   assistant_message?: AgentChatMessage
   user_message?: AgentChatMessage
   conversation?: AgentConversation

@@ -4,6 +4,7 @@ import * as agent from '../../api/agent'
 import type { AgentChatMessage, AgentEvent, AgentRun, AgentRunStep, UnknownRecord } from '../../api/types'
 import { JsonBlock } from '../common/JsonBlock'
 import { StatusPill } from '../common/StatusPill'
+import { AgentThoughtStream } from './AgentThoughtStream'
 
 type AgentChatPanelProps = {
   source?: string
@@ -310,11 +311,13 @@ function AgentRunTraceBlock({
 function AgentMessageItem({
   message,
   locale,
+  debug,
   onApprove,
   onReject,
 }: {
   message: UiMessage
   locale: 'en' | 'zh'
+  debug: boolean
   onApprove: (approvalId: number) => void
   onReject: (approvalId: number) => void
 }) {
@@ -329,7 +332,11 @@ function AgentMessageItem({
   return (
     <article className="chat-message assistant">
       <div className="assistant-run-message">
-        <AgentRunTraceBlock message={message} locale={locale} onApprove={onApprove} onReject={onReject} />
+        {debug ? (
+          <AgentRunTraceBlock message={message} locale={locale} onApprove={onApprove} onReject={onReject} />
+        ) : (
+          <AgentThoughtStream message={message} locale={locale} onApprove={onApprove} onReject={onReject} />
+        )}
         <div className="message-bubble answer-content">
           {message.content || (message.status === 'thinking' ? text(locale, zh.processing, 'Processing...') : text(locale, zh.noAnswer, 'No answer to display.'))}
         </div>
@@ -460,23 +467,24 @@ export function AgentChatPanel({
       content: '',
       conversation_id: localConversationId,
       status: 'thinking',
-      steps: [
+      trace_events: [
         {
-          key: 'understanding',
-          title: text(locale, zh.understanding, 'Understanding request'),
-          status: 'running',
-          thought: text(locale, zh.creatingRun, 'Creating the Agent Run and attaching conversation context.'),
-          action: text(locale, zh.started, 'Start run'),
-          observation: '',
-          next_action: text(locale, zh.recordsAppear, 'Readable steps appear as the run progresses.'),
+          event_type: 'visible_thought',
+          payload: {
+            text: text(locale, zh.creatingRun, 'Creating the Agent Run and attaching conversation context.'),
+            status: 'running',
+          },
         },
       ],
       local_id: `local-assistant-${now}`,
     }
     setMessages((items) => [...items, localUser, localAssistant])
 
-    try {
-      const response = await agent.createRun({
+    let liveRunId: number | undefined
+    let liveAssistantMessageId = localAssistant.message_id
+
+    streamRef.current = agent.createRunLiveStream(
+      {
         user_input: input,
         input,
         conversation_id: activeConversationId || undefined,
@@ -485,57 +493,97 @@ export function AgentChatPanel({
         auto_skill: true,
         use_existing_skills: true,
         create_skill_draft_if_reusable: true,
-      })
-      setCurrentRun(response)
-      const { userMessage, assistantMessage } = responseMessages(response, localUser, localAssistant)
-      const nextConversationId = response.conversation_id || response.conversation?.conversation_id || assistantMessage.conversation_id || ''
-      if (nextConversationId) setActiveConversationId(nextConversationId)
-      setMessages((items) =>
-        items.map((message) => {
-          if (message.message_id === localUser.message_id) return userMessage
-          if (message.message_id === localAssistant.message_id) return assistantMessage
-          return message
-        })
-      )
+      },
+      {
+        onMessage: (message) => {
+          const parsed = parseEvent(message.data)
+          if (!parsed) return
+          const payload = asRecord(parsed.payload)
 
-      const runId = response.run_id || response.id
-      if (runId) {
-        streamRef.current = agent.createRunEventStream(runId, {
-          onMessage: (message) => {
-            const parsed = parseEvent(message.data)
-            if (!parsed) return
+          if (parsed.event_type === 'run_created') {
+            const userMessage = asRecord(payload.user_message) as UiMessage
+            const assistantMessage = asRecord(payload.assistant_message) as UiMessage
+            liveRunId = Number(payload.run_id || parsed.run_id || assistantMessage.run_id || 0) || undefined
+            liveAssistantMessageId = assistantMessage.message_id || liveAssistantMessageId
+            const nextConversationId = String(payload.conversation_id || assistantMessage.conversation_id || '')
+            if (nextConversationId) setActiveConversationId(nextConversationId)
+            setMessages((items) =>
+              items.map((item) => {
+                if (item.message_id === localUser.message_id) return { ...localUser, ...userMessage }
+                if (item.message_id === localAssistant.message_id) {
+                  return {
+                    ...localAssistant,
+                    ...assistantMessage,
+                    status: 'thinking',
+                    trace_events: [...(localAssistant.trace_events || []), parsed],
+                  }
+                }
+                return item
+              })
+            )
+            return
+          }
+
+          if (parsed.event_type === 'run_completed') {
+            const response = asRecord(payload.response) as AgentRun
+            setCurrentRun(response)
+            const { userMessage, assistantMessage } = responseMessages(response, localUser, localAssistant)
+            setMessages((items) =>
+              items.map((item) => {
+                if (item.message_id === userMessage.message_id || item.message_id === localUser.message_id) return userMessage
+                if (item.message_id === assistantMessage.message_id || item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id) {
+                  return { ...assistantMessage, trace_events: [...(item.trace_events || []), parsed].slice(-48) }
+                }
+                return item
+              })
+            )
+            setRunning(false)
+            streamRef.current?.close()
+            streamRef.current = null
+            return
+          }
+
+          if (parsed.event_type === 'run_failed') {
+            const failedText = String(payload.error || payload.answer || text(locale, zh.agentFailed, 'Agent run failed. Please try again.'))
             setMessages((items) =>
               items.map((item) =>
-                item.message_id === assistantMessage.message_id || item.run_id === runId
-                  ? {
-                      ...item,
-                      trace_events: [...(item.trace_events || []), parsed].slice(-24),
-                      content: item.content || agent.extractRunAnswer(response),
-                    }
+                item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id || (liveRunId && item.run_id === liveRunId)
+                  ? { ...item, status: 'failed', content: failedText, error_message: failedText, trace_events: [...(item.trace_events || []), parsed].slice(-48) }
                   : item
               )
             )
-          },
-          onError: () => undefined,
-        })
-        window.setTimeout(() => {
-          streamRef.current?.close()
-          streamRef.current = null
-        }, 1800)
+            setError(failedText)
+            setRunning(false)
+            return
+          }
+
+          setMessages((items) =>
+            items.map((item) =>
+              item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id || (liveRunId && item.run_id === liveRunId)
+                ? {
+                    ...item,
+                    run_id: liveRunId || item.run_id,
+                    status: 'thinking',
+                    trace_events: [...(item.trace_events || []), parsed].slice(-48),
+                  }
+                : item
+            )
+          )
+        },
+        onError: () => {
+          const failedText = text(locale, zh.agentFailed, 'Agent run failed. Please try again.')
+          setMessages((items) =>
+            items.map((message) =>
+              message.message_id === localAssistant.message_id || message.message_id === liveAssistantMessageId
+                ? { ...message, status: 'failed', content: failedText, error_message: failedText }
+                : message
+            )
+          )
+          setError(failedText)
+          setRunning(false)
+        },
       }
-    } catch (exc) {
-      const failedText = exc instanceof Error ? exc.message : text(locale, zh.agentFailed, 'Agent run failed. Please try again.')
-      setMessages((items) =>
-        items.map((message) =>
-          message.message_id === localAssistant.message_id
-            ? { ...message, status: 'failed', content: failedText, error_message: failedText, steps: [{ key: 'failed', title: text(locale, zh.runFailed, 'Run failed'), status: 'failed', thought: failedText }] }
-            : message
-        )
-      )
-      setError(failedText)
-    } finally {
-      setRunning(false)
-    }
+    )
   }
 
   const composer = (
@@ -574,6 +622,7 @@ export function AgentChatPanel({
                   <AgentMessageItem
                     message={message}
                     locale={locale}
+                    debug={debug}
                     key={messageKey(message)}
                     onApprove={(id) => handleApproval(id, true)}
                     onReject={(id) => handleApproval(id, false)}

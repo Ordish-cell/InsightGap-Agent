@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from src.web_app.agent.runtime import AgentRuntime
 from src.web_app.agent.runtime.checkpoint import record_event
+from src.web_app.agent.runtime.visible_thoughts import visible_thought_texts
 from src.web_app.db.repositories.agent_repository import (
     AgentChatMessageRepository,
     AgentConversationRepository,
@@ -25,7 +26,7 @@ GENERIC_COMPLETED_ANSWERS = {
 }
 
 
-async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], stream_queue: asyncio.Queue | None = None) -> dict[str, Any]:
     started_at = datetime.now()
     user_input = payload.get("user_input") or payload.get("input") or payload.get("query") or ""
     payload = {**payload, "user_input": user_input}
@@ -75,8 +76,22 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any]) ->
         metadata_json={"source": payload.get("source", "agent_page")},
     )
     record_event(db, run.id, "run_started", {"user_input": user_input, "source": payload.get("source", "agent_page")}, user_id=user_id, thread_id=thread_id)
+    _queue_stream_event(
+        stream_queue,
+        "run_created",
+        {
+            "run_id": run.id,
+            "conversation_id": conversation_id,
+            "thread_id": thread_id,
+            "user_message": _message_response(user_message),
+            "assistant_message": _message_response(assistant_message),
+            "conversation": _conversation_response(conversation),
+        },
+        run_id=run.id,
+        thread_id=thread_id,
+    )
     try:
-        state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context})
+        state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue})
     except Exception as exc:
         state = {
             "user_id": user_id,
@@ -105,6 +120,8 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any]) ->
     state["final_output"] = answer
     final_payload = dict(state.get("final_payload") or {})
     final_payload["answer"] = answer
+    final_payload.setdefault("thinking_summary", visible_thought_texts(state))
+    final_payload.setdefault("visible_thoughts", state.get("visible_thoughts", []))
     final_payload.setdefault("run_id", str(run.id))
     final_payload.setdefault("thread_id", thread_id)
     final_payload.setdefault("conversation_id", conversation_id)
@@ -120,13 +137,14 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any]) ->
             "elapsed_ms": elapsed_ms,
         }
     )
+    langgraphstatus.setdefault("visible_thoughts", state.get("visible_thoughts", []))
     state["langgraphstatus"] = langgraphstatus
     steps = list(langgraphstatus.get("steps") or [])
     completed_at = datetime.now() if state.get("status") in {"completed", "failed", "waiting_approval"} else None
     run_repo.update(
         run,
         status=state.get("status", "completed"),
-        graph_state=_json_safe(dict(state)),
+        graph_state=_json_safe(_state_for_storage(state)),
         result_summary=answer,
         final_answer=answer,
         final_response=_json_safe(final_payload),
@@ -143,7 +161,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any]) ->
         langgraphstatus_json=_json_safe(langgraphstatus),
         steps_json=_json_safe(steps),
         error_message=state.get("error", ""),
-        metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload)},
+        metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", []))},
     )
     conversation_repo.touch(
         conversation,
@@ -154,22 +172,61 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any]) ->
     )
     if state.get("approval_required") or state.get("status") == "waiting_approval":
         record_event(db, run.id, "approval_required", state.get("approval_payload") or {}, user_id=user_id, thread_id=thread_id)
+        _queue_stream_event(stream_queue, "approval_required", state.get("approval_payload") or {}, run_id=run.id, thread_id=thread_id)
     elif state.get("status") == "failed":
         record_event(db, run.id, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
+        _queue_stream_event(stream_queue, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, run_id=run.id, thread_id=thread_id)
     else:
         record_event(db, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)
         record_event(db, run.id, "run_completed", {"status": state.get("status"), "answer": answer}, user_id=user_id, thread_id=thread_id)
-    return _run_response(run.id, state, conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=elapsed_ms)
+        _queue_stream_event(stream_queue, "final_response_created", {"answer": answer, "answer_len": len(answer)}, run_id=run.id, thread_id=thread_id)
+    response = _run_response(run.id, state, conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=elapsed_ms)
+    _queue_stream_event(stream_queue, "run_completed", {"status": state.get("status"), "answer": answer, "response": response}, run_id=run.id, thread_id=thread_id)
+    return response
 
 
 def run_agent(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     return asyncio.run(run_agent_async(db, user_id, payload))
 
 
+async def stream_agent_run(db: Session, user_id: int, payload: dict[str, Any]):
+    queue: asyncio.Queue = asyncio.Queue()
+    sentinel = object()
+
+    async def runner() -> None:
+        try:
+            await run_agent_async(db, user_id, payload, stream_queue=queue)
+        except Exception as exc:
+            queue.put_nowait(
+                {
+                    "event": "run_failed",
+                    "data": {
+                        "event_type": "run_failed",
+                        "payload": {"status": "failed", "error": str(exc)},
+                    },
+                }
+            )
+        finally:
+            queue.put_nowait(sentinel)
+
+    task = asyncio.create_task(runner())
+    try:
+        while True:
+            item = await queue.get()
+            if item is sentinel:
+                break
+            yield item
+    finally:
+        if not task.done():
+            task.cancel()
+
+
 def get_run(db: Session, user_id: int, run_id: int) -> dict[str, Any]:
     run = AgentRunRepository(db).get_by_user(user_id, run_id)
     if not run:
         raise ValueError("AgentRun not found")
+    final_response = run.final_response or {}
+    graph_state = run.graph_state or {}
     return {
         "id": run.id,
         "status": run.status,
@@ -179,13 +236,15 @@ def get_run(db: Session, user_id: int, run_id: int) -> dict[str, Any]:
         "result_summary": run.result_summary,
         "answer": run.final_answer or run.result_summary,
         "final_answer": run.final_answer,
-        "final_response": run.final_response or {},
-        "langgraphstatus": run.langgraphstatus_json or (run.graph_state or {}).get("langgraphstatus", {}),
+        "final_response": final_response,
+        "visible_thoughts": final_response.get("visible_thoughts") or graph_state.get("visible_thoughts", []),
+        "thinking_summary": final_response.get("thinking_summary") or visible_thought_texts(graph_state),
+        "langgraphstatus": run.langgraphstatus_json or graph_state.get("langgraphstatus", {}),
         "elapsed_ms": run.elapsed_ms,
         "error_message": run.error_message,
         "graph_state": run.graph_state or {},
-        "conversation_id": run.conversation_id or (run.graph_state or {}).get("conversation_id", ""),
-        "thread_id": run.thread_id or (run.graph_state or {}).get("thread_id", ""),
+        "conversation_id": run.conversation_id or graph_state.get("conversation_id", ""),
+        "thread_id": run.thread_id or graph_state.get("thread_id", ""),
     }
 
 
@@ -295,6 +354,24 @@ def build_user_facing_answer(state: dict[str, Any]) -> str:
 
     return "\u6211\u5df2\u7ecf\u5b8c\u6210\u57fa\u7840\u5224\u65ad\u3002\u4f60\u53ef\u4ee5\u7ee7\u7eed\u8865\u5145\u76ee\u6807\uff0c\u6211\u4f1a\u6cbf\u7528\u5f53\u524d\u4f1a\u8bdd\u4e0a\u4e0b\u6587\u3002"
 
+def _queue_stream_event(queue: asyncio.Queue | None, event_type: str, payload: dict[str, Any], *, run_id: int | None = None, thread_id: str = "", node_name: str = "") -> None:
+    if not queue:
+        return
+    queue.put_nowait(
+        {
+            "event": event_type,
+            "data": {
+                "run_id": run_id,
+                "thread_id": thread_id,
+                "event_type": event_type,
+                "node_name": node_name,
+                "payload": _json_safe(payload),
+                "created_at": datetime.now().isoformat(),
+            },
+        }
+    )
+
+
 def _run_response(
     run_id: int,
     state: dict[str, Any],
@@ -308,6 +385,8 @@ def _run_response(
     answer = build_user_facing_answer(state)
     final_response = dict(state.get("final_payload") or {})
     final_response["answer"] = answer
+    final_response.setdefault("thinking_summary", visible_thought_texts(state))
+    final_response.setdefault("visible_thoughts", state.get("visible_thoughts", []))
     return {
         "run_id": run_id,
         "conversation_id": state.get("conversation_id", ""),
@@ -323,6 +402,8 @@ def _run_response(
         "final_answer": answer,
         "final_response": final_response,
         "final_payload": final_response,
+        "visible_thoughts": state.get("visible_thoughts", []),
+        "thinking_summary": visible_thought_texts(state),
         "langgraphstatus": state.get("langgraphstatus", {}),
         "user_message": _message_response(user_message) if user_message else None,
         "assistant_message": _message_response(assistant_message) if assistant_message else None,
@@ -476,3 +557,9 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, list):
         return [_json_safe(item) for item in value]
     return value
+
+
+def _state_for_storage(state: dict[str, Any]) -> dict[str, Any]:
+    data = dict(state)
+    data.pop("_stream_queue", None)
+    return data

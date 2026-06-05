@@ -17,6 +17,7 @@ from src.web_app.services.agent_service import (
     list_events,
     list_steps,
     run_agent_async,
+    stream_agent_run,
     update_conversation,
 )
 from src.web_app.services.approval_service import update_approval_status
@@ -33,6 +34,16 @@ async def run_agent_legacy(payload: dict, user_id: int = Depends(get_current_use
 @router.post("/runs")
 async def create_run(payload: AgentRunRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     return ok(await run_agent_async(db, user_id, payload.model_dump()))
+
+
+@router.post("/runs/stream")
+async def create_run_stream(payload: AgentRunRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    async def events():
+        async for event in stream_agent_run(db, user_id, payload.model_dump()):
+            for chunk in to_sse([event]):
+                yield chunk
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 @router.post("/conversations")
