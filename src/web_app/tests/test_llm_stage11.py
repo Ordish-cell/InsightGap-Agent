@@ -28,6 +28,24 @@ def _user(db, email="llm-stage11@example.com"):
 
 def test_model_router_resolves_aliyun_models(monkeypatch):
     monkeypatch.setenv("AGENT_LLM_PROVIDER", "aliyun")
+    # Pin all model env vars to known values so the local .env file
+    # (which may set AGENT_INTENT_MODEL=qwen-turbo etc.) does not
+    # override the field defaults under test.
+    monkeypatch.setenv("AGENT_INTENT_MODEL", "qwen3.6-flash")
+    monkeypatch.setenv("AGENT_SAFETY_MODEL", "qwen3.6-flash")
+    monkeypatch.setenv("AGENT_MEMORY_MODEL", "qwen3.6-flash")
+    monkeypatch.setenv("AGENT_SKILL_MODEL", "qwen3.6-flash")
+    monkeypatch.setenv("AGENT_FAST_MODEL", "qwen3.6-flash")
+    monkeypatch.setenv("AGENT_PLANNER_MODEL", "qwen3.6-max-preview")
+    monkeypatch.setenv("AGENT_RAG_MODEL", "qwen3.6-max-preview")
+    monkeypatch.setenv("AGENT_BALANCED_MODEL", "qwen3.6-max-preview")
+    monkeypatch.setenv("AGENT_RESEARCH_MODEL", "qwen3.7-plus")
+    monkeypatch.setenv("AGENT_STRONG_MODEL", "qwen3.7-plus")
+    monkeypatch.setenv("AGENT_ARTIFACT_MODEL", "qwen3.6-plus")
+    monkeypatch.setenv("AGENT_FINAL_MODEL", "qwen3.6-plus")
+    monkeypatch.setenv("AGENT_LLM_MODEL", "qwen3.6-plus")
+    monkeypatch.setenv("AGENT_EMBEDDING_PROVIDER", "aliyun")
+    monkeypatch.setenv("AGENT_EMBEDDING_MODEL", "text-embedding-v4")
     _clear_llm()
 
     assert resolve_model_name("intent").model == "qwen3.6-flash"
@@ -43,8 +61,10 @@ def test_model_router_resolves_aliyun_models(monkeypatch):
 def test_llm_factory_missing_api_key_does_not_crash_service(monkeypatch):
     monkeypatch.setenv("AGENT_LLM_ENABLED", "true")
     monkeypatch.setenv("AGENT_LLM_PROVIDER", "aliyun")
-    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
-    monkeypatch.delenv("ALIYUN_BAILIAN_API_KEY", raising=False)
+    # Override .env file values — delenv only clears the OS env, but
+    # pydantic-settings still reads the .env file.
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "")
+    monkeypatch.setenv("ALIYUN_BAILIAN_API_KEY", "")
     _clear_llm()
 
     with pytest.raises(LLMUnavailableError):
@@ -130,7 +150,11 @@ def test_langgraphstatus_contains_key_steps(monkeypatch):
         assert "detail" in step
 
 
-def test_rag_embedding_model_resolution():
+def test_rag_embedding_model_resolution(monkeypatch):
+    # Pin model env vars so .env overrides don't interfere with defaults
+    monkeypatch.setenv("AGENT_RAG_MODEL", "qwen3.6-max-preview")
+    monkeypatch.setenv("AGENT_EMBEDDING_MODEL", "text-embedding-v4")
+    _clear_llm()
     assert resolve_model_name("embedding").model == "text-embedding-v4"
     assert resolve_model_name("rag").model == "qwen3.6-max-preview"
 

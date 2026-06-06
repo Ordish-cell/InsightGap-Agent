@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from src.web_app.agent.runtime import AgentRuntime
 from src.web_app.agent.runtime.checkpoint import record_event
+from src.web_app.agent.runtime.events import queue_stream_event as _queue_stream_event
 from src.web_app.agent.runtime.visible_thoughts import visible_thought_texts
 from src.web_app.db.repositories.agent_repository import (
     AgentChatMessageRepository,
@@ -91,7 +92,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         thread_id=thread_id,
     )
     try:
-        state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue})
+        state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
     except Exception as exc:
         state = {
             "user_id": user_id,
@@ -170,15 +171,16 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
         selected_feed_card_title=selected_feed_card_title or None,
     )
+    already_streamed = state.get("_answer_delta_emitted", False)
     if state.get("approval_required") or state.get("status") == "waiting_approval":
-        await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer)
+        await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
         record_event(db, run.id, "approval_required", state.get("approval_payload") or {}, user_id=user_id, thread_id=thread_id)
         _queue_stream_event(stream_queue, "approval_required", state.get("approval_payload") or {}, run_id=run.id, thread_id=thread_id)
     elif state.get("status") == "failed":
         record_event(db, run.id, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
         _queue_stream_event(stream_queue, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, run_id=run.id, thread_id=thread_id)
     else:
-        await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer)
+        await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
         record_event(db, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)
         record_event(db, run.id, "run_completed", {"status": state.get("status"), "answer": answer}, user_id=user_id, thread_id=thread_id)
         _queue_stream_event(stream_queue, "final_response_created", {"answer": answer, "answer_len": len(answer)}, run_id=run.id, thread_id=thread_id)
@@ -219,8 +221,10 @@ async def stream_agent_run(db: Session, user_id: int, payload: dict[str, Any]):
                 break
             yield item
             event_type = str((item.get("data") or {}).get("event_type") or item.get("event") or "")
-            if event_type in {"visible_thought_delta", "answer_delta"}:
-                await asyncio.sleep(0.012)
+            if event_type == "visible_thought_delta":
+                await asyncio.sleep(0.08)
+            elif event_type == "answer_delta":
+                await asyncio.sleep(0.008)
     finally:
         if not task.done():
             task.cancel()
@@ -359,35 +363,52 @@ def build_user_facing_answer(state: dict[str, Any]) -> str:
 
     return "\u6211\u5df2\u7ecf\u5b8c\u6210\u57fa\u7840\u5224\u65ad\u3002\u4f60\u53ef\u4ee5\u7ee7\u7eed\u8865\u5145\u76ee\u6807\uff0c\u6211\u4f1a\u6cbf\u7528\u5f53\u524d\u4f1a\u8bdd\u4e0a\u4e0b\u6587\u3002"
 
-def _queue_stream_event(queue: asyncio.Queue | None, event_type: str, payload: dict[str, Any], *, run_id: int | None = None, thread_id: str = "", node_name: str = "") -> None:
+async def _stream_answer_deltas(db: Session, queue: asyncio.Queue | None, run_id: int, thread_id: str, user_id: int, answer: str, already_streamed: bool = False) -> None:
     if not queue:
         return
-    queue.put_nowait(
-        {
-            "event": event_type,
-            "data": {
-                "run_id": run_id,
-                "thread_id": thread_id,
-                "event_type": event_type,
-                "node_name": node_name,
-                "payload": _json_safe(payload),
-                "created_at": datetime.now().isoformat(),
-            },
-        }
-    )
-
-
-async def _stream_answer_deltas(db: Session, queue: asyncio.Queue | None, run_id: int, thread_id: str, user_id: int, answer: str) -> None:
-    if not queue:
+    # If the runtime already streamed answer_delta + answer_completed during
+    # LLM generation, skip the fallback entirely — no duplicate events.
+    if already_streamed:
         return
-    for index, char in enumerate(str(answer or ""), start=1):
-        payload = {"text": char, "index": index}
+    # Fallback: runtime did not stream (e.g. final_response skipped, or LLM disabled).
+    _queue_stream_event(queue, "answer_started", {}, run_id=run_id, thread_id=thread_id, node_name="final_response")
+    chunks = _chunk_answer_text(str(answer or ""))
+    if not chunks:
+        chunks = [answer]
+    for index, chunk in enumerate(chunks, start=1):
+        payload = {"text": chunk, "index": index}
         record_event(db, run_id, "answer_delta", payload, node_name="final_response", user_id=user_id, thread_id=thread_id)
         _queue_stream_event(queue, "answer_delta", payload, run_id=run_id, thread_id=thread_id, node_name="final_response")
         await asyncio.sleep(0)
     completed_payload = {"answer": answer}
     record_event(db, run_id, "answer_completed", completed_payload, node_name="final_response", user_id=user_id, thread_id=thread_id)
     _queue_stream_event(queue, "answer_completed", completed_payload, run_id=run_id, thread_id=thread_id, node_name="final_response")
+
+
+def _chunk_answer_text(text: str, max_chunk: int = 200) -> list[str]:
+    """Split answer text into semantic chunks: paragraphs first, then sentences if needed."""
+    # Split by double newlines (paragraphs) first
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if not paragraphs:
+        return [text]
+    result: list[str] = []
+    for para in paragraphs:
+        if len(para) <= max_chunk:
+            result.append(para)
+        else:
+            # Split long paragraphs by sentence boundaries
+            current = ""
+            for char in para:
+                current += char
+                if char in "。！？!?；;" or len(current) >= max_chunk:
+                    stripped = current.strip()
+                    if stripped:
+                        result.append(stripped)
+                    current = ""
+            remaining = current.strip()
+            if remaining:
+                result.append(remaining)
+    return result
 
 
 def _run_response(

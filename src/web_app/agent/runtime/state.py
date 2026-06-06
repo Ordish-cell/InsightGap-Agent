@@ -85,6 +85,12 @@ class AgentRuntimeState(TypedDict, total=False):
     events: list[dict[str, Any]]
     _stream_queue: Any
 
+    # ── Streaming guard flags ───────────────────────────────────────
+    # Set by _generate_final_answer_with_llm after streaming completes;
+    # read by agent_service to skip the fallback _stream_answer_deltas.
+    _answer_delta_emitted: bool
+    _answer_completed_emitted: bool
+
 
 # ── Helper functions for state manipulation ──────────────────────────
 

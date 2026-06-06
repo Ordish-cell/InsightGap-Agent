@@ -80,7 +80,7 @@ function seconds(value?: number | null) {
 }
 
 function messageKey(message: UiMessage) {
-  return message.message_id || message.local_id || `${message.role}-${message.id || message.created_at}`
+  return message.local_id || message.message_id || `${message.role}-${message.id || message.created_at}`
 }
 
 function responseMessages(response: AgentRun, fallbackUser: UiMessage, fallbackAssistant: UiMessage) {
@@ -507,6 +507,7 @@ export function AgentChatPanel({
                   return {
                     ...localAssistant,
                     ...assistantMessage,
+                    message_id: localAssistant.message_id,
                     status: 'thinking',
                     trace_events: [],
                   }
@@ -524,8 +525,15 @@ export function AgentChatPanel({
             setMessages((items) =>
               items.map((item) => {
                 if (item.message_id === userMessage.message_id || item.message_id === localUser.message_id) return userMessage
-                if (item.message_id === assistantMessage.message_id || item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id) {
-                  return { ...assistantMessage, content: assistantMessage.content || item.content, trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT) }
+                if (item.role === 'assistant' && (item.message_id === assistantMessage.message_id || item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)) {
+                  const streamedContent = item.content
+                  const fallbackContent = assistantMessage.content || ''
+                  const finalContent = (streamedContent && streamedContent.trim()) ? streamedContent : fallbackContent
+                  return {
+                    ...assistantMessage,
+                    content: finalContent,
+                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                  }
                 }
                 return item
               })
@@ -540,7 +548,7 @@ export function AgentChatPanel({
             const delta = String(payload.text || '')
             setMessages((items) =>
               items.map((item) =>
-                item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id || (liveRunId && item.run_id === liveRunId)
+                item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
                   ? {
                       ...item,
                       run_id: liveRunId || item.run_id,
@@ -558,7 +566,7 @@ export function AgentChatPanel({
             const completedAnswer = String(payload.answer || '')
             setMessages((items) =>
               items.map((item) =>
-                item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id || (liveRunId && item.run_id === liveRunId)
+                item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
                   ? {
                       ...item,
                       run_id: liveRunId || item.run_id,
@@ -576,7 +584,7 @@ export function AgentChatPanel({
             const failedText = String(payload.error || payload.answer || text(locale, zh.agentFailed, 'Agent run failed. Please try again.'))
             setMessages((items) =>
               items.map((item) =>
-                item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id || (liveRunId && item.run_id === liveRunId)
+                item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
                   ? { ...item, status: 'failed', content: failedText, error_message: failedText, trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT) }
                   : item
               )
@@ -586,13 +594,27 @@ export function AgentChatPanel({
             return
           }
 
+          if (parsed.event_type === 'answer_started') {
+            setMessages((items) =>
+              items.map((item) =>
+                item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
+                  ? {
+                      ...item,
+                      status: item.content ? item.status : 'streaming',
+                    }
+                  : item
+              )
+            )
+            return
+          }
+
           setMessages((items) =>
             items.map((item) =>
-              item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id || (liveRunId && item.run_id === liveRunId)
+              item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
                 ? {
                     ...item,
                     run_id: liveRunId || item.run_id,
-                    status: 'thinking',
+                    status: (item.status === 'completed' || item.status === 'streaming') ? item.status : 'thinking',
                     trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
                   }
                 : item

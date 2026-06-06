@@ -84,7 +84,10 @@ def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[st
     stream_queue = state.get("_stream_queue")
     if stream_queue:
         base_payload = {name: entry[name] for name in ("id", "status", "visibility", "source", "created_at")}
-        for index, char in enumerate(text, start=1):
+        sentences = _split_sentences(text)
+        if not sentences:
+            sentences = [text]
+        for index, sentence in enumerate(sentences, start=1):
             stream_queue.put_nowait(
                 {
                     "event": "visible_thought_delta",
@@ -93,7 +96,7 @@ def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[st
                         "thread_id": state.get("thread_id", ""),
                         "event_type": "visible_thought_delta",
                         "node_name": key,
-                        "payload": {**base_payload, "text": char, "index": index, "status": "streaming"},
+                        "payload": {**base_payload, "text": sentence, "index": index, "status": "streaming"},
                         "created_at": entry["created_at"],
                     },
                 }
@@ -112,6 +115,24 @@ def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[st
             }
         )
     return text
+
+
+def _split_sentences(text: str, max_len: int = 80) -> list[str]:
+    """Split text by sentence boundaries (。！？!?；;\\n), keeping punctuation at sentence ends."""
+    result: list[str] = []
+    current = ""
+    boundaries = set("。！？；!?;\n")
+    for char in text:
+        current += char
+        if char in boundaries or len(current) >= max_len:
+            stripped = current.strip()
+            if stripped:
+                result.append(stripped)
+            current = ""
+    remaining = current.strip()
+    if remaining:
+        result.append(remaining)
+    return result
 
 
 def visible_thought_texts(state: dict[str, Any]) -> list[str]:

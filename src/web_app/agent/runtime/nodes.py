@@ -865,13 +865,30 @@ class RuntimeNodes:
         if state.get("final_output") and not answer_parts:
             answer_parts.append(state["final_output"])
 
+        # ── Enrich visible thoughts BEFORE generating the final answer ──
+        # This ensures trace_visualizer does not delay answer streaming or run_completed.
+        # For simple chat intents, skip the enrichment LLM call entirely.
+        if intent != "chat":
+            emit_visible_thought(self.db, state, "final_response")
+            await self._enrich_visible_thoughts_with_llm(state)
+
         draft_answer = "\n\n".join(answer_parts)
+        used_streaming_llm = False
         if state.get("status") == "waiting_approval":
             final_answer = state.get("final_output") or "Approval required（需要审批）：这个操作需要先通过审批。我还没有执行外部写入或不可逆动作。"
         elif draft_answer.strip() and not self._is_generic_draft_answer(draft_answer):
             final_answer = draft_answer.strip()
         else:
             final_answer = await self._generate_final_answer_with_llm(state, draft_answer)
+            used_streaming_llm = True
+
+        # ── Ensure streaming flags survive LangGraph state serialisation ──
+        # _generate_final_answer_with_llm sets these inside the astream loop,
+        # but LangGraph may copy state between nodes. Re-assert here so the
+        # fallback guard in agent_service sees them.
+        if used_streaming_llm:
+            state["_answer_delta_emitted"] = True
+            state["_answer_completed_emitted"] = True
 
         state["final_answer"] = final_answer
         state["final_output"] = final_answer
@@ -911,8 +928,8 @@ class RuntimeNodes:
                 "tool_calls_count": 1 if state.get("tool_call") else 0,
             },
         )
-        emit_visible_thought(self.db, state, "final_response")
-        await self._enrich_visible_thoughts_with_llm(state)
+        if intent == "chat":
+            emit_visible_thought(self.db, state, "final_response")
         final_payload["thinking_summary"] = visible_thought_texts(state)
         final_payload["visible_thoughts"] = state.get("visible_thoughts", [])
         final_payload["langgraphstatus"] = state.get("langgraphstatus", {})
@@ -1046,71 +1063,108 @@ class RuntimeNodes:
         if not get_llm_settings().enabled:
             return self._fallback_final_answer(state, draft_answer)
 
+        from src.web_app.agent.runtime.events import queue_stream_event  # noqa: F811
+
         resolution = resolve_model_name("final")
         prompt = self._build_final_answer_prompt(state, draft_answer)
         started = time.perf_counter()
-        output_text = ""
+        full_answer = ""
+        run_id = state.get("run_id")
+        thread_id = state.get("thread_id", "")
+        user_id = state.get("user_id")
+        queue = state.get("_stream_queue")
         try:
-            model = get_chat_model("final", temperature=0.35)
-            message = await model.ainvoke(prompt)
-            output_text = self._message_content(message).strip()
-            if not output_text:
+            model = get_chat_model("final", temperature=0.35, streaming=True)
+            # Emit answer_started (SSE + DB)
+            if queue:
+                queue_stream_event(queue, "answer_started", {}, run_id=run_id, thread_id=thread_id, node_name="final_response")
+            record_event(
+                self.db, run_id, "answer_started", {},
+                node_name="final_response", user_id=user_id, thread_id=thread_id,
+            )
+
+            chunk_index = 0
+            async for chunk in model.astream(prompt):
+                content = chunk.content if hasattr(chunk, 'content') else str(chunk)
+                if not content:
+                    continue
+                full_answer += content
+                chunk_index += 1
+                # Push to SSE only — do NOT persist each token to agent_events
+                if queue:
+                    queue_stream_event(
+                        queue, "answer_delta",
+                        {"text": content, "index": chunk_index},
+                        run_id=run_id, thread_id=thread_id, node_name="final_response",
+                    )
+
+            full_answer = full_answer.strip()
+            if not full_answer:
                 raise LLMInvocationError("Final LLM returned empty output")
+
             latency_ms = int((time.perf_counter() - started) * 1000)
             record_llm_call(
                 self.db,
-                run_id=state.get("run_id"),
-                thread_id=state.get("thread_id", ""),
-                user_id=state.get("user_id"),
-                node_name="final_response",
-                purpose="final",
-                provider=resolution.provider,
-                model=resolution.model,
-                tier=resolution.tier,
-                latency_ms=latency_ms,
-                status="completed",
+                run_id=run_id, thread_id=thread_id, user_id=user_id,
+                node_name="final_response", purpose="final",
+                provider=resolution.provider, model=resolution.model, tier=resolution.tier,
+                latency_ms=latency_ms, status="completed",
                 estimated_input_chars=len(prompt),
-                estimated_output_chars=len(output_text),
-                metadata={"input_preview": user_input[:200]},
+                estimated_output_chars=len(full_answer),
+                metadata={"input_preview": user_input[:200], "streaming": True, "chunks": chunk_index},
             )
             record_event(
-                self.db,
-                state["run_id"],
-                "thought_summary",
-                {"title": "生成最终回答", "summary": "已调用最终回复模型，把执行结果整理成用户可读回答。", "model": resolution.model},
-                node_name="final_response",
-                user_id=state.get("user_id"),
-                thread_id=state.get("thread_id", ""),
+                self.db, run_id, "thought_summary",
+                {"title": "生成最终回答", "summary": "已流式调用最终回复模型，把执行结果整理成用户可读回答。", "model": resolution.model},
+                node_name="final_response", user_id=user_id, thread_id=thread_id,
             )
-            return output_text
+            # Emit answer_completed (SSE + DB)
+            if queue:
+                queue_stream_event(
+                    queue, "answer_completed", {"answer": full_answer},
+                    run_id=run_id, thread_id=thread_id, node_name="final_response",
+                )
+            record_event(
+                self.db, run_id, "answer_completed", {"answer": full_answer},
+                node_name="final_response", user_id=user_id, thread_id=thread_id,
+            )
+            # Mark that streaming happened so agent_service fallback is skipped
+            state["_answer_delta_emitted"] = True
+            state["_answer_completed_emitted"] = True
+            return full_answer
+
         except Exception as exc:
             latency_ms = int((time.perf_counter() - started) * 1000)
             record_llm_call(
                 self.db,
-                run_id=state.get("run_id"),
-                thread_id=state.get("thread_id", ""),
-                user_id=state.get("user_id"),
-                node_name="final_response",
-                purpose="final",
-                provider=resolution.provider,
-                model=resolution.model,
-                tier=resolution.tier,
-                latency_ms=latency_ms,
-                status="failed",
-                error_message=str(exc),
+                run_id=run_id, thread_id=thread_id, user_id=user_id,
+                node_name="final_response", purpose="final",
+                provider=resolution.provider, model=resolution.model, tier=resolution.tier,
+                latency_ms=latency_ms, status="failed", error_message=str(exc),
                 estimated_input_chars=len(prompt),
-                estimated_output_chars=len(output_text),
-                metadata={"input_preview": user_input[:200]},
+                estimated_output_chars=len(full_answer),
+                metadata={"input_preview": user_input[:200], "streaming": True},
+            )
+            # Emit partial answer_completed on error so SSE is not left hanging
+            if queue:
+                queue_stream_event(
+                    queue, "answer_completed",
+                    {"answer": full_answer, "status": "partial", "error": str(exc)},
+                    run_id=run_id, thread_id=thread_id, node_name="final_response",
+                )
+            record_event(
+                self.db, run_id, "answer_completed",
+                {"answer": full_answer, "status": "partial", "error": str(exc)},
+                node_name="final_response", user_id=user_id, thread_id=thread_id,
             )
             record_event(
-                self.db,
-                state["run_id"],
-                "thought_summary",
+                self.db, run_id, "thought_summary",
                 {"title": "最终模型不可用", "summary": "最终回复模型调用失败，已改用安全兜底回答。", "error": str(exc)[:200]},
-                node_name="final_response",
-                user_id=state.get("user_id"),
-                thread_id=state.get("thread_id", ""),
+                node_name="final_response", user_id=user_id, thread_id=thread_id,
             )
+            # Still mark as emitted so agent_service fallback doesn't double-push
+            state["_answer_delta_emitted"] = True
+            state["_answer_completed_emitted"] = True
             return self._fallback_final_answer(state, draft_answer)
 
     def _build_final_answer_prompt(self, state: AgentRuntimeState, draft_answer: str) -> str:

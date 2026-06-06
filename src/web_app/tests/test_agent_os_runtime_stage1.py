@@ -72,14 +72,16 @@ async def test_agent_run_stream_emits_visible_thought_and_answer_deltas_before_c
             break
 
     assert "visible_thought_delta" in event_types
+    assert "answer_started" in event_types
     assert "answer_delta" in event_types
     assert "answer_completed" in event_types
     assert "run_completed" in event_types
-    assert event_types.index("visible_thought_delta") < event_types.index("answer_delta")
+    assert event_types.index("visible_thought_delta") < event_types.index("answer_started")
+    assert event_types.index("answer_started") < event_types.index("answer_delta")
     assert event_types.index("answer_delta") < event_types.index("answer_completed")
     assert event_types.index("answer_completed") < event_types.index("run_completed")
-    assert first_thought_delta and len(first_thought_delta["text"]) == 1
-    assert first_answer_delta and len(first_answer_delta["text"]) == 1
+    assert first_thought_delta and len(first_thought_delta["text"]) >= 1
+    assert first_answer_delta and len(first_answer_delta["text"]) >= 1
 
 
 def test_home_intent_react_detects_research_route():

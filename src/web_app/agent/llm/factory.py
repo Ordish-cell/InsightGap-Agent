@@ -6,7 +6,7 @@ from src.web_app.agent.llm.errors import LLMUnavailableError
 from src.web_app.agent.llm.router import ModelPurpose, resolve_model_name
 
 
-def get_chat_model(purpose: ModelPurpose | str, complexity: str = "normal", temperature: float | None = None) -> Any:
+def get_chat_model(purpose: ModelPurpose | str, complexity: str = "normal", temperature: float | None = None, streaming: bool = False) -> Any:
     settings = get_llm_settings()
     resolution = resolve_model_name(purpose, complexity)
     return _cached_chat_model(
@@ -18,11 +18,12 @@ def get_chat_model(purpose: ModelPurpose | str, complexity: str = "normal", temp
         max_retries=settings.max_retries,
         temperature=settings.temperature if temperature is None else temperature,
         enabled=settings.enabled,
+        streaming=streaming,
     )
 
 
 @lru_cache
-def _cached_chat_model(provider: str, model: str, base_url: str, api_key: str, timeout: int, max_retries: int, temperature: float, enabled: bool) -> Any:
+def _cached_chat_model(provider: str, model: str, base_url: str, api_key: str, timeout: int, max_retries: int, temperature: float, enabled: bool, streaming: bool = False) -> Any:
     if not enabled or provider == "disabled":
         raise LLMUnavailableError("Agent LLM is disabled")
     if provider not in {"aliyun", "openai_compatible"}:
@@ -40,6 +41,7 @@ def _cached_chat_model(provider: str, model: str, base_url: str, api_key: str, t
         timeout=timeout,
         max_retries=max_retries,
         temperature=temperature,
+        streaming=streaming,
     )
 
 
