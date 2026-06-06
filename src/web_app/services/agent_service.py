@@ -171,12 +171,14 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         selected_feed_card_title=selected_feed_card_title or None,
     )
     if state.get("approval_required") or state.get("status") == "waiting_approval":
+        await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer)
         record_event(db, run.id, "approval_required", state.get("approval_payload") or {}, user_id=user_id, thread_id=thread_id)
         _queue_stream_event(stream_queue, "approval_required", state.get("approval_payload") or {}, run_id=run.id, thread_id=thread_id)
     elif state.get("status") == "failed":
         record_event(db, run.id, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
         _queue_stream_event(stream_queue, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, run_id=run.id, thread_id=thread_id)
     else:
+        await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer)
         record_event(db, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)
         record_event(db, run.id, "run_completed", {"status": state.get("status"), "answer": answer}, user_id=user_id, thread_id=thread_id)
         _queue_stream_event(stream_queue, "final_response_created", {"answer": answer, "answer_len": len(answer)}, run_id=run.id, thread_id=thread_id)
@@ -216,6 +218,9 @@ async def stream_agent_run(db: Session, user_id: int, payload: dict[str, Any]):
             if item is sentinel:
                 break
             yield item
+            event_type = str((item.get("data") or {}).get("event_type") or item.get("event") or "")
+            if event_type in {"visible_thought_delta", "answer_delta"}:
+                await asyncio.sleep(0.012)
     finally:
         if not task.done():
             task.cancel()
@@ -370,6 +375,19 @@ def _queue_stream_event(queue: asyncio.Queue | None, event_type: str, payload: d
             },
         }
     )
+
+
+async def _stream_answer_deltas(db: Session, queue: asyncio.Queue | None, run_id: int, thread_id: str, user_id: int, answer: str) -> None:
+    if not queue:
+        return
+    for index, char in enumerate(str(answer or ""), start=1):
+        payload = {"text": char, "index": index}
+        record_event(db, run_id, "answer_delta", payload, node_name="final_response", user_id=user_id, thread_id=thread_id)
+        _queue_stream_event(queue, "answer_delta", payload, run_id=run_id, thread_id=thread_id, node_name="final_response")
+        await asyncio.sleep(0)
+    completed_payload = {"answer": answer}
+    record_event(db, run_id, "answer_completed", completed_payload, node_name="final_response", user_id=user_id, thread_id=thread_id)
+    _queue_stream_event(queue, "answer_completed", completed_payload, run_id=run_id, thread_id=thread_id, node_name="final_response")
 
 
 def _run_response(

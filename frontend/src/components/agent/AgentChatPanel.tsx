@@ -20,6 +20,8 @@ type UiMessage = AgentChatMessage & {
   trace_events?: AgentEvent[]
 }
 
+const LIVE_TRACE_LIMIT = 4000
+
 const zh = {
   started: '\u5f00\u59cb\u5904\u7406',
   understanding: '\u7406\u89e3\u8bf7\u6c42',
@@ -57,7 +59,6 @@ const zh = {
   processing: '\u6b63\u5728\u5904\u7406...',
   noAnswer: '\u6ca1\u6709\u53ef\u663e\u793a\u7684\u56de\u7b54\u3002',
   approvalFailed: '\u5ba1\u6279\u64cd\u4f5c\u5931\u8d25\u3002',
-  creatingRun: '\u6b63\u5728\u521b\u5efa Agent Run\uff0c\u5e76\u63a5\u5165\u5f53\u524d\u4f1a\u8bdd\u4e0a\u4e0b\u6587\u3002',
   agentFailed: 'Agent \u8fd0\u884c\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002',
   using: '\u5df2\u5e26\u5165\u4fe1\u606f\uff1a',
   tools: 'Agent \u5de5\u5177',
@@ -467,15 +468,7 @@ export function AgentChatPanel({
       content: '',
       conversation_id: localConversationId,
       status: 'thinking',
-      trace_events: [
-        {
-          event_type: 'visible_thought',
-          payload: {
-            text: text(locale, zh.creatingRun, 'Creating the Agent Run and attaching conversation context.'),
-            status: 'running',
-          },
-        },
-      ],
+      trace_events: [],
       local_id: `local-assistant-${now}`,
     }
     setMessages((items) => [...items, localUser, localAssistant])
@@ -515,7 +508,7 @@ export function AgentChatPanel({
                     ...localAssistant,
                     ...assistantMessage,
                     status: 'thinking',
-                    trace_events: [...(localAssistant.trace_events || []), parsed],
+                    trace_events: [],
                   }
                 }
                 return item
@@ -532,7 +525,7 @@ export function AgentChatPanel({
               items.map((item) => {
                 if (item.message_id === userMessage.message_id || item.message_id === localUser.message_id) return userMessage
                 if (item.message_id === assistantMessage.message_id || item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id) {
-                  return { ...assistantMessage, trace_events: [...(item.trace_events || []), parsed].slice(-48) }
+                  return { ...assistantMessage, content: assistantMessage.content || item.content, trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT) }
                 }
                 return item
               })
@@ -543,12 +536,48 @@ export function AgentChatPanel({
             return
           }
 
+          if (parsed.event_type === 'answer_delta') {
+            const delta = String(payload.text || '')
+            setMessages((items) =>
+              items.map((item) =>
+                item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id || (liveRunId && item.run_id === liveRunId)
+                  ? {
+                      ...item,
+                      run_id: liveRunId || item.run_id,
+                      status: 'streaming',
+                      content: `${item.content || ''}${delta}`,
+                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    }
+                  : item
+              )
+            )
+            return
+          }
+
+          if (parsed.event_type === 'answer_completed') {
+            const completedAnswer = String(payload.answer || '')
+            setMessages((items) =>
+              items.map((item) =>
+                item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id || (liveRunId && item.run_id === liveRunId)
+                  ? {
+                      ...item,
+                      run_id: liveRunId || item.run_id,
+                      status: 'completed',
+                      content: completedAnswer || item.content,
+                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    }
+                  : item
+              )
+            )
+            return
+          }
+
           if (parsed.event_type === 'run_failed') {
             const failedText = String(payload.error || payload.answer || text(locale, zh.agentFailed, 'Agent run failed. Please try again.'))
             setMessages((items) =>
               items.map((item) =>
                 item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id || (liveRunId && item.run_id === liveRunId)
-                  ? { ...item, status: 'failed', content: failedText, error_message: failedText, trace_events: [...(item.trace_events || []), parsed].slice(-48) }
+                  ? { ...item, status: 'failed', content: failedText, error_message: failedText, trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT) }
                   : item
               )
             )
@@ -564,7 +593,7 @@ export function AgentChatPanel({
                     ...item,
                     run_id: liveRunId || item.run_id,
                     status: 'thinking',
-                    trace_events: [...(item.trace_events || []), parsed].slice(-48),
+                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
                   }
                 : item
             )

@@ -11,6 +11,7 @@ type AgentThoughtStreamProps = {
 
 const zhText = {
   thinking: '正在思考',
+  answering: '正在回答',
   completed: '已完成思考',
   failed: '思考中断',
   approve: '批准执行',
@@ -44,16 +45,26 @@ function collectVisibleThoughts(message: AgentThoughtStreamProps['message']) {
     if (content && !items.includes(content)) items.push(content)
   }
 
-  ;(message.trace_events || [])
-    .filter((event) => event.event_type === 'visible_thought')
-    .forEach((event) => push(asRecord(event.payload).text || event.payload))
+  const streamed = new Map<string, string>()
+  ;(message.trace_events || []).forEach((event, index) => {
+    const payload = asRecord(event.payload)
+    if (event.event_type === 'visible_thought_delta') {
+      const id = String(payload.id || `thought-${index}`)
+      const current = streamed.get(id) || ''
+      if (payload.status === 'completed' && payload.full_text) streamed.set(id, String(payload.full_text))
+      else streamed.set(id, `${current}${String(payload.text || '')}`)
+      return
+    }
+    if (event.event_type === 'visible_thought') push(payload.text || event.payload)
+  })
+  streamed.forEach((value) => push(value))
 
   const metadata = asRecord(message.metadata)
   const finalResponse = asRecord(metadata.final_response)
   const langgraphstatus = asRecord(message.langgraphstatus)
   const sources = [
-    finalResponse.thinking_summary,
     finalResponse.visible_thoughts,
+    finalResponse.thinking_summary,
     metadata.visible_thoughts,
     langgraphstatus.visible_thoughts,
     (message as unknown as UnknownRecord).visible_thoughts,
@@ -77,9 +88,16 @@ export function AgentThoughtStream({ message, locale, onApprove, onReject }: Age
   const thoughts = collectVisibleThoughts(message)
   const status = String(message.status || 'completed')
   const running = ['thinking', 'running', 'created', 'queued'].includes(status)
+  const answering = status === 'streaming'
   const failed = status === 'failed'
   const elapsed = seconds(message.elapsed_ms)
-  const label = running ? text(locale, zhText.thinking, 'Thinking') : failed ? text(locale, zhText.failed, 'Thinking interrupted') : text(locale, zhText.completed, 'Completed reasoning')
+  const label = answering
+    ? text(locale, zhText.answering, 'Answering')
+    : running
+      ? text(locale, zhText.thinking, 'Thinking')
+      : failed
+        ? text(locale, zhText.failed, 'Thinking interrupted')
+        : text(locale, zhText.completed, 'Completed reasoning')
   const { approvalId, payload } = approvalFrom(message)
   const [open, setOpen] = useState(running || failed)
 
@@ -87,7 +105,7 @@ export function AgentThoughtStream({ message, locale, onApprove, onReject }: Age
     setOpen(running || failed)
   }, [failed, running, message.message_id])
 
-  if (!thoughts.length && !running && !failed && !approvalId) return null
+  if (!thoughts.length && !running && !failed && !answering && !approvalId) return null
 
   return (
     <div className={running ? 'agent-thought-stream running' : failed ? 'agent-thought-stream failed' : 'agent-thought-stream'}>
@@ -97,11 +115,11 @@ export function AgentThoughtStream({ message, locale, onApprove, onReject }: Age
           {label}
           {elapsed ? ` · ${elapsed}` : ''}
         </strong>
-        <span className="thought-stream-chevron">{open ? '∨' : '›'}</span>
+        {thoughts.length || approvalId ? <span className="thought-stream-chevron">{open ? 'v' : '>'}</span> : null}
       </button>
       {open ? (
         <div className="thought-paragraphs">
-          {thoughts.length ? thoughts.map((item, index) => <p key={`${index}-${item}`}>{item}</p>) : <p>{text(locale, '我正在接住你的问题，并准备按当前会话上下文继续处理。', 'I am reading the request and preparing the next step from the current context.')}</p>}
+          {thoughts.map((item, index) => <p key={`${index}-${item}`}>{item}</p>)}
           {running ? <p className="thought-pending">{text(locale, '正在思考...', 'Thinking...')}</p> : null}
         </div>
       ) : null}

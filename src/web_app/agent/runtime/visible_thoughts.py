@@ -59,8 +59,11 @@ def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[st
 
     entry = {
         "key": key,
+        "id": f"thought-{len(thoughts) + 1:03d}",
         "text": text,
         "status": status,
+        "visibility": "user",
+        "source": "visible_thought",
         "created_at": datetime.now(UTC).replace(tzinfo=None).isoformat(),
     }
     thoughts.append(entry)
@@ -80,15 +83,30 @@ def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[st
     )
     stream_queue = state.get("_stream_queue")
     if stream_queue:
+        base_payload = {name: entry[name] for name in ("id", "status", "visibility", "source", "created_at")}
+        for index, char in enumerate(text, start=1):
+            stream_queue.put_nowait(
+                {
+                    "event": "visible_thought_delta",
+                    "data": {
+                        "run_id": state.get("run_id"),
+                        "thread_id": state.get("thread_id", ""),
+                        "event_type": "visible_thought_delta",
+                        "node_name": key,
+                        "payload": {**base_payload, "text": char, "index": index, "status": "streaming"},
+                        "created_at": entry["created_at"],
+                    },
+                }
+            )
         stream_queue.put_nowait(
             {
-                "event": "visible_thought",
+                "event": "visible_thought_delta",
                 "data": {
                     "run_id": state.get("run_id"),
                     "thread_id": state.get("thread_id", ""),
-                    "event_type": "visible_thought",
+                    "event_type": "visible_thought_delta",
                     "node_name": key,
-                    "payload": {"text": text, "status": status},
+                    "payload": {**base_payload, "text": "", "full_text": text, "status": status},
                     "created_at": entry["created_at"],
                 },
             }

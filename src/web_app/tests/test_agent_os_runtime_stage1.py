@@ -54,20 +54,32 @@ def test_chat_run_emits_visible_thoughts_without_react_fields():
 
 
 @pytest.mark.asyncio
-async def test_agent_run_stream_emits_visible_thought_before_completion():
+async def test_agent_run_stream_emits_visible_thought_and_answer_deltas_before_completion():
     db = make_test_session()
     user = _user(db, "visible-stream@example.com")
 
     event_types = []
+    first_thought_delta = None
+    first_answer_delta = None
     async for event in stream_agent_run(db, user.id, {"user_input": "hello"}):
         event_type = event["data"]["event_type"]
         event_types.append(event_type)
+        if event_type == "visible_thought_delta" and first_thought_delta is None:
+            first_thought_delta = event["data"]["payload"]
+        if event_type == "answer_delta" and first_answer_delta is None:
+            first_answer_delta = event["data"]["payload"]
         if event_type == "run_completed":
             break
 
-    assert "visible_thought" in event_types
+    assert "visible_thought_delta" in event_types
+    assert "answer_delta" in event_types
+    assert "answer_completed" in event_types
     assert "run_completed" in event_types
-    assert event_types.index("visible_thought") < event_types.index("run_completed")
+    assert event_types.index("visible_thought_delta") < event_types.index("answer_delta")
+    assert event_types.index("answer_delta") < event_types.index("answer_completed")
+    assert event_types.index("answer_completed") < event_types.index("run_completed")
+    assert first_thought_delta and len(first_thought_delta["text"]) == 1
+    assert first_answer_delta and len(first_answer_delta["text"]) == 1
 
 
 def test_home_intent_react_detects_research_route():
