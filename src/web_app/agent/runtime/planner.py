@@ -43,6 +43,32 @@ _MEMORY_TERMS = [
     "remember", "save preference", "memory",
 ]
 
+# ── Explicit memory-write patterns — these override research/rag/artifact ──
+# When a user explicitly asks the agent to remember something, it is NOT a
+# research task.  These patterns are checked with the highest priority.
+_MEMORY_WRITE_PATTERNS = [
+    "记住", "帮我记", "记一下", "记下来", "记录一下",
+    "以后记得", "别忘了", "下次记住",
+    "以后都", "以后要", "以后都要", "以后用", "以后给",
+    "以后都是", "以后都要", "以后也得", "以后还想",
+    "从此以后",
+    "我的偏好是", "我的设置是",
+    "我目标是", "我的目标是",
+    "我的项目是", "我正在做",
+    "默认用", "默认使用",
+    "保存下来", "保存这个",
+    "写入记忆", "存入记忆",
+    "长期记忆", "永久记住",
+    "remember", "save preference", "save my preference",
+    "don't forget", "do not forget",
+]
+
+_STRONG_MEMORY_WRITE_PREFIXES = [
+    "以后",  # "以后报告都要表格" — preference-setting
+    "从此",  # "从此以后用中文" — long-term preference
+    "从今",
+]
+
 _SKILL_TERMS = [
     "复用", "下次复用", "工作流", "skill", "技能", "自动化流程",
     "沉淀", "做成模板", "标准化", "重复做", "自动化",
@@ -73,7 +99,7 @@ def plan_route(
 
     # ── Respect forced route from payload (backward compat) ─────
     forced = forced_route or forced_intent
-    if forced in ("research", "rag", "artifact", "skill", "memory", "tool"):
+    if forced in ("research", "rag", "artifact", "skill", "memory", "tool", "memory_write"):
         intent = forced  # type: ignore[assignment]
         reasons.append(f"forced_route={forced}")
 
@@ -84,6 +110,8 @@ def plan_route(
     is_tool = any(term in text for term in _TOOL_TERMS) or any(term in text for term in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "打开网页", "删除", "支付", "付款", "转账"])
     is_memory = any(term in text for term in _MEMORY_TERMS)
     is_skill = any(term in text for term in _SKILL_TERMS)
+    # Explicit memory write request — highest priority, overrides research/rag/artifact
+    is_memory_write = any(pattern in text for pattern in _MEMORY_WRITE_PATTERNS)
 
     llm_intent = str((home_intent or {}).get("intent") or (home_intent or {}).get("detected_intent") or "")
     if not forced and llm_intent in {"chat", "research", "rag", "artifact", "feed_research", "tool", "tool.email", "tool.browser", "tool.comment", "tool.form_submit", "memory", "skill", "mixed"}:
@@ -99,6 +127,25 @@ def plan_route(
     elif feed_card_id:
         intent = "feed_research"
         reasons.append("feed_card_attached")
+
+    # ── Explicit memory write takes priority over everything ──────
+    # When the user says "记住" or "以后" + preference, it's a memory
+    # write, not research — even if research/artifact keywords co-occur.
+    # "以后都/要/用" patterns are preference-setting and override even tool.
+    is_strong_memory_prefix = any(text.startswith(p) for p in _STRONG_MEMORY_WRITE_PREFIXES)
+    if (is_memory_write or is_strong_memory_prefix):
+        # When user is setting a preference ("以后都..."), it overrides
+        # everything including tool detection.
+        # When user says "记住...", only override research/rag/artifact,
+        # not tool (e.g. "记住执行这个命令" should still be tool).
+        if not is_tool or any(text.startswith(p) for p in _STRONG_MEMORY_WRITE_PREFIXES):
+            intent = "memory"
+            is_research = False
+            is_rag = False
+            is_artifact = False
+            if any(text.startswith(p) for p in _STRONG_MEMORY_WRITE_PREFIXES):
+                is_tool = False
+            reasons.append("memory_write_priority")
 
     # Determine primary intent
     if intent == "chat":

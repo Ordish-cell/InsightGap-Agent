@@ -769,19 +769,58 @@ class RuntimeNodes:
         return state
 
     async def memory_agent(self, state: AgentRuntimeState) -> AgentRuntimeState:
-        """Memory Agent: conditionally write memories based on task value."""
+        """Memory Agent: write semantic memories for explicit user requests,
+        and conditionally extract memories for high-value tasks."""
         if state.get("route") in {"approval", "blocked"}:
             mark_completed(state, "memory_agent")
             return state
         try:
             route_plan = state.get("route_plan") or {}
             intent = route_plan.get("intent", "chat")
+            user_input = state.get("user_input", "")
+
+            # ── Explicit memory write: user says "记住" / "帮我记" etc. ──
+            if self._is_explicit_memory_write(user_input):
+                memory_content = self._extract_memory_from_user_input(user_input)
+                mem = memory_service.add_memory(
+                    user_id=state["user_id"],
+                    content=memory_content,
+                    memory_type="semantic",
+                    importance=0.9,
+                    metadata={"source_type": "explicit_user_request", "source": "explicit_user_request",
+                              "raw_user_input": user_input, "explicit": True, "run_id": str(state["run_id"])},
+                    db=self.db,
+                )
+                state.setdefault("memory_updates", []).append(mem)
+                state["memory_write_result"] = {
+                    "success": True,
+                    "content": memory_content,
+                    "memory_type": "semantic",
+                    "memory_id": mem.get("id"),
+                }
+                state["memory_result"] = {"saved_count": 1, "semantic": 1, "episodic": 0}
+                state["final_output"] = f"已记住：{memory_content}"
+                append_output(state, "memory_agent", state["memory_write_result"])
+                record_step(self.db, state["run_id"], "memory_agent", "write_memory_explicit",
+                            {"user_input": user_input},
+                            {"memory_write_result": state["memory_write_result"]})
+                append_status_step(
+                    state,
+                    key="memory_agent",
+                    node_name="memory_agent",
+                    detail=f"已明确写入 semantic 记忆 1 条",
+                    model=resolve_model_name("memory", complexity="low").model,
+                    extra={"memory_writes": 1, "explicit": True},
+                )
+                emit_visible_thought(self.db, state, "memory_agent")
+                mark_completed(state, "memory_agent")
+                return state
+
             # Only write memory for high-value tasks, not casual chat
             if intent in ("chat",):
                 mark_completed(state, "memory_agent")
                 return state
 
-            user_input = state.get("user_input", "")
             # Aggregate output from all agent results for memory extraction
             research = state.get("research_result") or state.get("research") or {}
             rag = state.get("rag_result") or state.get("rag") or {}
@@ -1290,13 +1329,20 @@ class RuntimeNodes:
         if extra_blocks:
             system_instruction += "\n".join(extra_blocks) + "\n\n"
 
+        intent = route_plan.get("intent", "chat")
         system_instruction += (
             "[Instructions]\n"
             "1. 优先使用 Structured GSSC Context 中的 Memory、Profile、Evidence、Feed、Conversation 信息。\n"
             "2. 如果 Memory 或 Evidence 中没有相关信息，不要编造。\n"
             "3. 如果用户问「我之前说过什么」「我的偏好是什么」「我们聊过什么」，必须优先从 GSSC Context 的 Memory 和 Conversation 部分回答。\n"
-            "4. 如果证据不足，要明确说「当前上下文里没有足够记录」。\n"
-            "5. 如果只是问候或闲聊，要像正常助手一样回答。\n"
+        )
+        # The "insufficient evidence" instruction only applies to research/rag
+        # intents. For memory_write / chat / preference updates, the user input
+        # itself is the primary evidence.
+        if intent in ("research", "rag", "feed_research", "mixed"):
+            system_instruction += "4. 如果证据不足，要明确说「当前上下文里没有足够记录」。\n"
+        system_instruction += (
+            "5. 如果只是问候或闲聊，要像正常助手一样回答；如果是记忆写入类请求，直接确认已保存即可。\n"
             "6. 如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
             "7. 输出简洁、结构化、可执行。中文为主。\n"
             "\n"
@@ -1413,12 +1459,19 @@ class RuntimeNodes:
     def _fallback_final_answer(self, state: AgentRuntimeState, draft_answer: str) -> str:
         user_input = str(state.get("user_input") or "").strip()
         route_plan = state.get("route_plan") or {}
+        intent = route_plan.get("intent", "chat")
+        # ── Memory write: confirm the save ─────────────────────────
+        mem_result = state.get("memory_write_result") or {}
+        if mem_result.get("success"):
+            content = mem_result.get("content", "")
+            return f"已记住：{content}"
+        if intent == "memory" or self._is_explicit_memory_write(user_input):
+            return f"已记住：{user_input}"
         if any(token in user_input for token in ("你好", "您好", "你是谁", "你是誰")) or user_input.lower() in {"hi", "hello", "hey"}:
             return "你好，我是你的信息差 Agent OS 助手。你可以让我分析首页信息差、做深度研究、生成报告或代码成果，也可以把反复使用的流程沉淀成长期记忆和 Skill。"
         normalized = draft_answer.strip().lower().rstrip(".。")
         if draft_answer and normalized not in {"agent run completed", "agent runtime completed"}:
             return draft_answer.strip()
-        intent = route_plan.get("intent", "chat")
         if intent == "research":
             return "我已识别这是一个研究任务，并完成了需求判断和执行规划。当前没有产生可验证的完整研究结果，因此不会假装已经完成深度研究。你可以继续指定研究范围，我会进入资料检索和结构化报告生成。"
         if intent == "artifact":
@@ -1596,6 +1649,47 @@ class RuntimeNodes:
                 f"- Constraints: safety_level={skill.get('safety_level', 'read_only')}",
             ]
         )
+
+    # ── Memory write helpers ──────────────────────────────────────
+
+    _MEMORY_WRITE_PATTERNS = [
+        "记住", "帮我记", "记一下", "记下来", "记录一下",
+        "以后记得", "别忘了", "下次记住",
+        "以后都", "以后要", "以后都是", "以后都要",
+        "从此以后",
+        "我的偏好是", "我的设置是",
+        "我目标是", "我的目标是",
+        "我的项目是", "我正在做",
+        "默认用", "默认使用",
+        "保存下来", "保存这个",
+        "写入记忆", "存入记忆",
+        "长期记忆", "永久记住",
+        "remember", "save preference", "save my preference",
+        "don't forget", "do not forget",
+    ]
+
+    def _is_explicit_memory_write(self, user_input: str) -> bool:
+        """Check whether the user is explicitly asking to remember something."""
+        if not user_input:
+            return False
+        text = user_input.strip().lower()
+        return any(pattern in text for pattern in self._MEMORY_WRITE_PATTERNS)
+
+    def _extract_memory_from_user_input(self, text: str) -> str:
+        """Extract a clean memory sentence from a user input containing '记住'."""
+        import re
+        content = text.strip()
+        # Remove trailing "记住" / "帮我记" etc.
+        content = re.sub(r"[，,]*\s*(记住|帮我记|记一下|记下来|别忘了|下次记住|保存下来)[。.]*$", "", content)
+        content = re.sub(r"^[记住：:记住:\s]+", "", content)
+        content = content.strip()
+        if not content:
+            return text.strip()
+        # Normalize to third-person or factual statement
+        # Convert first-person "我" to "用户" for persistent memory
+        if content.startswith("我"):
+            content = "用户" + content[1:]
+        return content
 
     def _draft_title(self, user_input: str) -> str:
         title = " ".join(str(user_input).strip().split())[:40]

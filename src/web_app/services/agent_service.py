@@ -396,6 +396,12 @@ def build_user_facing_answer(state: dict[str, Any]) -> str:
     if status == "waiting_approval" or route_plan.get("needs_approval") or home_intent.get("needs_approval"):
         return f"Approval required: this is a {risk_level} risk action and must be approved before execution. I have not performed any external write or irreversible operation."
 
+    # \u2500\u2500 Memory write: confirm the save \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+    mem_result = state.get("memory_write_result") or {}
+    if mem_result.get("success"):
+        content = mem_result.get("content", "")
+        return f"\u5df2\u8bb0\u4f4f\uff1a{content}"
+
     user_input = str(state.get("user_input") or "").strip()
     if _looks_like_greeting(user_input):
         return "\u4f60\u597d\uff0c\u6211\u662f\u4fe1\u606f\u5dee Agent OS \u52a9\u624b\u3002\u4f60\u53ef\u4ee5\u8ba9\u6211\u7814\u7a76\u4fe1\u606f\u3001\u751f\u6210\u6210\u679c\u6216\u6c89\u6dc0 Skill\u3002"

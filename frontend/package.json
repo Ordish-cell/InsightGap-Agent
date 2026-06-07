@@ -18,7 +18,9 @@
     "@vitejs/plugin-react": "^5.1.1",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
-    "react-router-dom": "^7.9.6"
+    "react-markdown": "^10.1.0",
+    "react-router-dom": "^7.9.6",
+    "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
     "@tsconfig/node24": "^24.0.4",
