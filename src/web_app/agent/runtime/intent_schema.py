@@ -33,6 +33,37 @@ ALLOWED_AGENTS = {
     "final_response",
 }
 
+# ── Agent alias normalization ──────────────────────────────────────
+# LLM intent results may return short names (research, rag, artifact)
+# but graph nodes are registered with _agent suffix.
+AGENT_ALIAS_MAP: dict[str, str] = {
+    "research": "research_agent",
+    "deep_research": "research_agent",
+    "rag": "rag_agent",
+    "retrieval": "rag_agent",
+    "document": "rag_agent",
+    "artifact": "artifact_agent",
+    "artifacts": "artifact_agent",
+    "tool": "tool_agent",
+    "mcp": "tool_agent",
+    "memory": "memory_agent",
+    "skill": "skill_agent",
+    "chat": "final_response",
+    "context": "context_builder",
+    "skill_match": "skill_matcher",
+    "eval": "evaluator",
+    "evaluate": "evaluator",
+}
+
+
+def normalize_agent_name(name: str) -> str:
+    """Map short / alias agent names to registered graph node names."""
+    if not name:
+        return ""
+    key = name.strip().lower()
+    return AGENT_ALIAS_MAP.get(key, key)
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,11 +90,17 @@ class HomeIntentResult(BaseModel):
         if not isinstance(value, list):
             return []
         filtered: list[str] = []
-        for item in value:
-            if item in ALLOWED_AGENTS and item not in filtered:
-                filtered.append(item)
-            elif isinstance(item, str):
-                logger.warning("Unknown agent filtered from intent result: %s", item)
+        for raw in value:
+            if not isinstance(raw, str):
+                continue
+            normalized = normalize_agent_name(raw)
+            if normalized in ALLOWED_AGENTS and normalized not in filtered:
+                filtered.append(normalized)
+            else:
+                logger.warning(
+                    "Unknown agent filtered from intent result",
+                    extra={"raw_agent": raw, "normalized_agent": normalized},
+                )
         return filtered
 
     @field_validator("reason_summary")

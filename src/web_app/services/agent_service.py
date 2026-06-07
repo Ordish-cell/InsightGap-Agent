@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import date, datetime
 from typing import Any
 from uuid import uuid4
@@ -92,7 +93,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         thread_id=thread_id,
     )
     try:
-        state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
+        state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue, "_answer_started_emitted": False, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
     except Exception as exc:
         state = {
             "user_id": user_id,
@@ -325,6 +326,50 @@ def clear_conversation(db: Session, user_id: int, conversation_id: str) -> dict[
     return {"conversation": _conversation_response(conversation), "cleared_messages": removed}
 
 
+def hard_delete_conversation(db: Session, user_id: int, conversation_id: str) -> dict[str, Any]:
+    repo = AgentConversationRepository(db)
+    deleted = repo.hard_delete(user_id, conversation_id)
+    if not deleted:
+        raise ValueError("Agent conversation not found")
+    return {"conversation_id": conversation_id, "deleted_records": deleted}
+
+
+def extract_user_visible_answer(value: Any) -> str:
+    """Extract a user-readable string from any value.
+
+    Handles nested dicts (final_payload), JSON strings, and raw text.
+    Never returns a JSON blob that should stay internal.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        # Detect JSON strings that look like internal payloads
+        stripped = value.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, dict):
+                    return extract_user_visible_answer(parsed)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return value
+    if isinstance(value, dict):
+        # Extract the user-facing field from internal payload dicts
+        for key in ("answer", "final_answer", "final_output", "content", "message", "text"):
+            val = value.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        # If the dict looks like a final_payload, return empty rather than JSON
+        if any(k in value for k in ("status", "route", "artifacts", "intent")):
+            return ""
+        # For other dicts without extractable text, return empty
+        return ""
+    if isinstance(value, (list, tuple)):
+        # Don't stringify lists — they're not user-readable
+        return ""
+    return str(value)
+
+
 def build_user_facing_answer(state: dict[str, Any]) -> str:
     final_payload = state.get("final_payload") or {}
     candidates = [
@@ -334,7 +379,7 @@ def build_user_facing_answer(state: dict[str, Any]) -> str:
         state.get("final_output"),
     ]
     for candidate in candidates:
-        text = str(candidate or "").strip()
+        text = extract_user_visible_answer(candidate)
         if text and not _is_generic_completed_answer(text):
             return text
 

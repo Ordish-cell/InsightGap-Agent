@@ -4,6 +4,7 @@ import { NavLink, useNavigate } from 'react-router-dom'
 import * as agent from '../../api/agent'
 import { me } from '../../api/auth'
 import type { AgentConversation, CurrentUser } from '../../api/types'
+import { ConfirmModal } from '../common/ConfirmModal'
 
 type NavItem = { label: string; short: string; href: string; icon: string }
 
@@ -27,6 +28,7 @@ export function Sidebar() {
   const [conversationOpen, setConversationOpen] = useState(false)
   const [conversationLoading, setConversationLoading] = useState(false)
   const [conversations, setConversations] = useState<AgentConversation[]>([])
+  const [deleteTarget, setDeleteTarget] = useState<AgentConversation | null>(null)
 
   useEffect(() => {
     localStorage.setItem('sidebarExpanded', String(expanded))
@@ -70,6 +72,23 @@ export function Sidebar() {
     sessionStorage.removeItem('agentOpenConversationId')
     navigate('/')
     window.dispatchEvent(new CustomEvent('agent:new-conversation'))
+  }
+
+  async function confirmDeleteConversation() {
+    const item = deleteTarget
+    if (!item) return
+    setDeleteTarget(null)
+    try {
+      await agent.hardDeleteConversation(item.conversation_id)
+      const openId = sessionStorage.getItem('agentOpenConversationId')
+      if (openId === item.conversation_id) {
+        sessionStorage.removeItem('agentOpenConversationId')
+        window.dispatchEvent(new CustomEvent('agent:new-conversation'))
+      }
+      void loadConversations()
+    } catch {
+      // silently fail, user can retry
+    }
   }
 
   function logout() {
@@ -131,10 +150,20 @@ export function Sidebar() {
               {conversationLoading ? <span className="sidebar-conversation-empty">正在加载会话</span> : null}
               {!conversationLoading && !conversations.length ? <span className="sidebar-conversation-empty">还没有会话</span> : null}
               {conversations.map((item) => (
-                <button className="sidebar-conversation-item" type="button" key={item.conversation_id} onClick={() => openConversation(item.conversation_id)}>
-                  <strong>{item.title || '未命名会话'}</strong>
-                  <span>{item.last_message_preview || '暂无消息'}</span>
-                </button>
+                <div className="sidebar-conversation-item-row" key={item.conversation_id}>
+                  <button className="sidebar-conversation-item" type="button" onClick={() => openConversation(item.conversation_id)}>
+                    <strong>{item.title || '未命名会话'}</strong>
+                    <span>{item.last_message_preview || '暂无消息'}</span>
+                  </button>
+                  <button
+                    className="sidebar-conversation-delete"
+                    type="button"
+                    title="彻底删除会话"
+                    onClick={(e) => { e.stopPropagation(); setDeleteTarget(item) }}
+                  >
+                    ✕
+                  </button>
+                </div>
               ))}
             </div>
           </div>
@@ -177,6 +206,16 @@ export function Sidebar() {
           {expanded ? <span>设置</span> : null}
         </button>
       </div>
+
+      <ConfirmModal
+        open={Boolean(deleteTarget)}
+        title="删除会话"
+        message={`确定要彻底删除「${deleteTarget?.title || '未命名会话'}」吗？所有对话记录和 Agent 运行数据都会被永久删除，无法恢复。`}
+        confirmLabel="彻底删除"
+        danger
+        onConfirm={confirmDeleteConversation}
+        onCancel={() => setDeleteTarget(null)}
+      />
     </aside>
   )
 }

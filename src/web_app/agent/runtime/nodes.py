@@ -143,8 +143,9 @@ class RuntimeNodes:
         if state.get("route") in {"approval", "blocked"}:
             return state
         route = state.get("route", "chat")
+        user_input = state.get("user_input", "")
         profile = ProfileRepository(self.db).get_or_create_default(state["user_id"])
-        memories = memory_service.search_memory(state["user_id"], state.get("user_input", ""), min_importance=0.2, db=self.db)[:5]
+        memories = memory_service.search_memory(state["user_id"], user_input, min_importance=0.2, db=self.db)[:5]
         page_context = self.payload.get("page_context") or state.get("page_context") or {}
         feed_card_id = self.payload.get("feed_card_id") or page_context.get("selected_feed_card_id") or page_context.get("feed_card_id")
         feed_card_context = self._load_feed_card_context(state["user_id"], feed_card_id)
@@ -160,12 +161,31 @@ class RuntimeNodes:
             state["user_id"], self.db, route=route,
         )
 
+        # ── RAG Evidence (lightweight, no LLM) ──────────────────────
+        rag_evidence: list[dict[str, Any]] = []
+        try:
+            rag_evidence = rag_service.search_evidence(
+                state["user_id"], user_input, limit=5, score_threshold=0.3,
+            )
+        except Exception:
+            pass  # RAG failure must not block the pipeline
+
+        # ── Format memories as readable text blocks ─────────────────
+        memory_text = self._format_memories_for_context(memories)
+
+        # ── Format profile as readable text ─────────────────────────
+        profile_text = self._format_profile_for_context(profile)
+
+        # ── Format RAG evidence as readable text ────────────────────
+        evidence_text = self._format_rag_evidence_for_context(rag_evidence)
+
         builder = ContextBuilder(route=route)
         context_text, gssc_debug = builder.build_with_debug({
-            "task": state.get("user_input", ""),
+            "task": user_input,
             "route": route,
-            "profile": {"segment": profile.segment, "goals": profile.goals, "interests": profile.explicit_interests},
-            "memory": memories,
+            "profile": profile_text,
+            "memory": memory_text,
+            "evidence": evidence_text,
             "feed_card": feed_card_context,
             "page_context": page_context,
             "conversation_summary": conversation_summary,
@@ -173,29 +193,39 @@ class RuntimeNodes:
             "dynamic_preferences": dynamic_prefs.get("preference_summary", ""),
             "output_contract": "Return structured status, final_output, artifacts, memory_updates, skill_drafts, and evidence when available.",
         })
+        # Merge with existing context (don't overwrite fields set by earlier nodes)
+        existing_context = state.get("context") or {}
         state["context"] = {
+            **existing_context,
             "gssc_context": context_text,
+            "gssc_debug": gssc_debug,
             "memory_count": len(memories),
+            "memory_items": memories,
             "feed_card": feed_card_context,
             "page_context": page_context,
-            "gssc_debug": gssc_debug,
             "conversation_summary": conversation_summary,
             "checkpoint_summary": checkpoint_summary,
+            "profile": {"segment": profile.segment, "goals": profile.goals, "interests": profile.explicit_interests},
+            "dynamic_preferences": dynamic_prefs.get("preference_summary", ""),
+            "rag_evidence": rag_evidence,
         }
+        state["rag_evidence"] = rag_evidence
         record_step(self.db, state["run_id"], "context_builder", "context",
                     {"route": route, "feed_card_id": feed_card_id},
                     {"memory_count": len(memories), "feed_card_loaded": bool(feed_card_context),
+                     "rag_evidence_count": len(rag_evidence),
                      "gssc_debug": gssc_debug, "context": context_text})
         append_status_step(
             state,
             key="context_builder",
             node_name="context_builder",
-            detail=f"已选择 {len(gssc_debug.get('selected_sources', []))} 类上下文，记忆 {len(memories)} 条",
+            detail=f"已选择 {len(gssc_debug.get('selected_sources', []))} 类上下文，记忆 {len(memories)} 条，RAG {len(rag_evidence)} 条",
             extra={
                 "selected_sources": gssc_debug.get("selected_sources", []),
                 "dropped_sources": gssc_debug.get("dropped_sources", []),
                 "token_budget_used": gssc_debug.get("token_budget_used", 0),
                 "memory_count": len(memories),
+                "rag_evidence_count": len(rag_evidence),
                 "feed_card_loaded": bool(feed_card_context),
             },
         )
@@ -928,19 +958,30 @@ class RuntimeNodes:
                 "tool_calls_count": 1 if state.get("tool_call") else 0,
             },
         )
-        if intent == "chat":
-            emit_visible_thought(self.db, state, "final_response")
+        # Chat fast-path: no user-visible progress. Research/artifact/tool
+        # intents already emitted milestones before answer generation (above).
         final_payload["thinking_summary"] = visible_thought_texts(state)
         final_payload["visible_thoughts"] = state.get("visible_thoughts", [])
         final_payload["langgraphstatus"] = state.get("langgraphstatus", {})
         state["final_payload"] = final_payload
         state["status"] = status
 
+        gssc_context = (state.get("context") or {}).get("gssc_context", "")
+        gssc_debug = (state.get("context") or {}).get("gssc_debug", {})
         record_step(self.db, state["run_id"], "final_response", "aggregate",
                     {"intent": intent},
                     {"status": status, "answer_len": len(final_answer),
                      "artifact_count": len(state.get("artifacts", [])),
-                     "error_count": len(errors)})
+                     "error_count": len(errors),
+                     "final_prompt_uses_gssc_context": bool(gssc_context),
+                     "gssc_context_chars": len(gssc_context),
+                     "gssc_context_tokens_estimate": max(1, len(gssc_context) // 4),
+                     "has_memory_section": "Relevant Memory" in gssc_context or "[Relevant Memory]" in gssc_context,
+                     "has_rag_evidence_section": "Evidence" in gssc_context or "[Evidence]" in gssc_context,
+                     "has_profile_section": "User Profile" in gssc_context or "[User Profile]" in gssc_context,
+                     "gssc_selected_sources": gssc_debug.get("selected_sources", []),
+                     "gssc_dropped_sources": gssc_debug.get("dropped_sources", []),
+                     })
         return state
 
     async def _enrich_visible_thoughts_with_llm(self, state: AgentRuntimeState) -> None:
@@ -1082,6 +1123,7 @@ class RuntimeNodes:
                 self.db, run_id, "answer_started", {},
                 node_name="final_response", user_id=user_id, thread_id=thread_id,
             )
+            state["_answer_started_emitted"] = True
 
             chunk_index = 0
             async for chunk in model.astream(prompt):
@@ -1099,6 +1141,23 @@ class RuntimeNodes:
                     )
 
             full_answer = full_answer.strip()
+            # ── Guard: detect if LLM output internal JSON despite prompt ──
+            if self._looks_like_internal_json(full_answer):
+                extracted = self._extract_text_from_json_output(full_answer)
+                if extracted:
+                    # Replace the streamed JSON with the extracted text
+                    if queue:
+                        queue_stream_event(
+                            queue, "answer_completed",
+                            {"answer": extracted, "status": "corrected"},
+                            run_id=run_id, thread_id=thread_id, node_name="final_response",
+                        )
+                    record_event(
+                        self.db, run_id, "answer_json_corrected",
+                        {"original_len": len(full_answer), "extracted_len": len(extracted)},
+                        node_name="final_response", user_id=user_id, thread_id=thread_id,
+                    )
+                    full_answer = extracted
             if not full_answer:
                 raise LLMInvocationError("Final LLM returned empty output")
 
@@ -1169,6 +1228,94 @@ class RuntimeNodes:
 
     def _build_final_answer_prompt(self, state: AgentRuntimeState, draft_answer: str) -> str:
         route_plan = state.get("route_plan") or {}
+        context = state.get("context") or {}
+        gssc_context = context.get("gssc_context", "")
+
+        # ── Build the core prompt ───────────────────────────────────
+        # When GSSC context is available, it becomes the primary context.
+        # When it's empty, fall back to a legacy flat payload.
+        if gssc_context:
+            return self._build_gssc_prompt(state, gssc_context, draft_answer, route_plan)
+        return self._build_legacy_prompt(state, draft_answer, route_plan)
+
+    def _build_gssc_prompt(
+        self,
+        state: AgentRuntimeState,
+        gssc_context: str,
+        draft_answer: str,
+        route_plan: dict[str, Any],
+    ) -> str:
+        """Build the final LLM prompt with GSSC as the primary context source."""
+        rag_result = state.get("rag_result") or state.get("rag") or {}
+        research_result = state.get("research_result") or state.get("research") or {}
+        artifacts = state.get("artifacts", [])
+        tool_result = state.get("tool_result") or state.get("tool_call") or {}
+        errors = state.get("errors", [])
+
+        system_instruction = (
+            "你是信息差 Agent OS 的最终回复节点。你必须基于下面的结构化上下文，用自然语言回答用户。\n\n"
+
+            f"[Structured GSSC Context]\n{gssc_context}\n\n"
+
+            f"[Current User Input]\n{state.get('user_input', '')}\n\n"
+        )
+
+        # Append specialized agent results only when they carry new information
+        # not already covered by GSSC (rag_agent runs AFTER context_builder).
+        extra_blocks: list[str] = []
+        if rag_result.get("answer"):
+            extra_blocks.append(
+                f"[RAG Agent Result]\n{rag_result.get('answer', '')}\n"
+                f"Evidence count: {len(rag_result.get('evidence', []))}"
+            )
+        if research_result.get("summary"):
+            extra_blocks.append(
+                f"[Research Agent Result]\n{research_result.get('summary', '')}"
+            )
+        if artifacts:
+            extra_blocks.append(
+                f"[Artifacts]\n" +
+                "\n".join(a.get("title", a.get("id", "")) for a in artifacts[:5])
+            )
+        if tool_result.get("status"):
+            extra_blocks.append(
+                f"[Tool Result]\n"
+                f"Tool: {tool_result.get('tool_name', '')}\n"
+                f"Status: {tool_result.get('status', '')}"
+            )
+        if errors:
+            extra_blocks.append(
+                f"[Errors]\n" + "\n".join(e.get("error", str(e)) for e in errors[:3])
+            )
+        if extra_blocks:
+            system_instruction += "\n".join(extra_blocks) + "\n\n"
+
+        system_instruction += (
+            "[Instructions]\n"
+            "1. 优先使用 Structured GSSC Context 中的 Memory、Profile、Evidence、Feed、Conversation 信息。\n"
+            "2. 如果 Memory 或 Evidence 中没有相关信息，不要编造。\n"
+            "3. 如果用户问「我之前说过什么」「我的偏好是什么」「我们聊过什么」，必须优先从 GSSC Context 的 Memory 和 Conversation 部分回答。\n"
+            "4. 如果证据不足，要明确说「当前上下文里没有足够记录」。\n"
+            "5. 如果只是问候或闲聊，要像正常助手一样回答。\n"
+            "6. 如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
+            "7. 输出简洁、结构化、可执行。中文为主。\n"
+            "\n"
+            "[Output Rules — 必须严格遵守]\n"
+            "• 你必须输出用户可直接阅读的自然语言，可以使用 Markdown 标题、列表、加粗来组织内容。\n"
+            "• 严禁输出 JSON。严禁输出 Python dict。严禁输出 JavaScript object。\n"
+            "• 严禁在你的回答中出现 status、final_output、artifacts、memory_updates、skill_drafts、evidence 这些内部字段名。\n"
+            "• 如果你需要引用研究成果物，请直接用 Markdown 段落描述，不要把内部 payload 原样贴给用户。\n"
+            "• 你的回答就是用户最终看到的全部内容，没有二次解析步骤。"
+        )
+        return system_instruction
+
+    def _build_legacy_prompt(
+        self,
+        state: AgentRuntimeState,
+        draft_answer: str,
+        route_plan: dict[str, Any],
+    ) -> str:
+        """Fallback prompt when gssc_context is empty."""
         payload = {
             "user_input": state.get("user_input", ""),
             "intent": route_plan.get("intent", "chat"),
@@ -1185,19 +1332,83 @@ class RuntimeNodes:
             "skill_drafts_count": len(state.get("skill_drafts", [])),
             "errors": state.get("errors", []),
         }
+        # Build a plain-text summary of the runtime data (NOT JSON) so the
+        # LLM does not mimic JSON in its response.
+        context_summary = str(payload.get("context_summary", "") or "")
+        feed_title = str((payload.get("feed_card") or {}).get("title", ""))
+        research_summary = str((payload.get("research") or {}).get("summary", ""))
+        rag_answer = str((payload.get("rag") or {}).get("answer", ""))
+        artifact_titles = [str(a.get("title", "")) for a in (payload.get("artifacts") or [])[:3] if a.get("title")]
+        tool_status = str((payload.get("tool_result") or {}).get("status", ""))
+        runtime_context = (
+            f"意图: {payload.get('intent', 'chat')} | 风险: {payload.get('risk_level', 'L0')}\n"
+            + (f"会话摘要: {context_summary}\n" if context_summary else "")
+            + (f"关联信息流: {feed_title}\n" if feed_title else "")
+            + (f"研究摘要: {research_summary[:300]}\n" if research_summary else "")
+            + (f"RAG 回答: {rag_answer[:300]}\n" if rag_answer else "")
+            + (f"工具状态: {tool_status}\n" if tool_status else "")
+            + (f"已有成果物: {', '.join(artifact_titles)}\n" if artifact_titles else "")
+            + (f"错误: {len(payload.get('errors', []))} 条\n" if payload.get("errors") else "")
+        )
         return (
-            "你是信息差 Agent OS 的最终回复节点。请直接回答用户，不要输出 JSON，不要输出 Markdown 代码块，不要暴露 chain-of-thought。\n"
+            "你是信息差 Agent OS 的最终回复节点。请基于下面的运行上下文直接用自然语言回答用户。\n\n"
+            f"运行上下文：\n{runtime_context}\n"
+            f"用户输入：{payload.get('user_input', '')}\n\n"
             "你可以用自然中文说明你正在或已经做了什么，但只能给用户可读的简短执行摘要，不能泄露私密推理。\n"
             "如果只是问候或闲聊，要像正常助手一样回答，不要说 Agent Run 完成。\n"
             "如果没有真实执行研究、生成 Artifact 或外部工具动作，必须诚实说明，不要假装已经完成。\n"
             "如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
             "回答要贴合用户原话，优先给结论，然后给下一步可做什么。中文为主。\n"
-            f"运行数据：{json.dumps(payload, ensure_ascii=False, default=str)}"
+            "\n"
+            "[Output Rules — 必须严格遵守]\n"
+            "• 你必须输出用户可直接阅读的自然语言，可以使用 Markdown 标题、列表、加粗来组织内容。\n"
+            "• 严禁输出 JSON。严禁输出 Python dict。严禁输出 JavaScript object。\n"
+            "• 严禁在你的回答中出现 status、final_output、artifacts、memory_updates、skill_drafts、evidence 这些内部字段名。\n"
+            "• 你的回答就是用户最终看到的全部内容，没有二次解析步骤。"
         )
 
+    def _looks_like_internal_json(self, text: str) -> bool:
+        """Detect whether the LLM output is an internal JSON payload."""
+        stripped = text.lstrip()
+        if not stripped.startswith("{"):
+            return False
+        internal_keys = [
+            '"status"', '"final_output"', '"artifacts"',
+            '"memory_updates"', '"skill_drafts"', '"evidence"',
+            '"memory_writes"', '"agent_outputs"',
+        ]
+        head = stripped[:600]
+        return any(k in head for k in internal_keys)
+
+    def _extract_text_from_json_output(self, text: str) -> str:
+        """Extract user-visible text from an LLM that output internal JSON."""
+        import json as _json
+        try:
+            data = _json.loads(text)
+            if not isinstance(data, dict):
+                return ""
+        except (_json.JSONDecodeError, TypeError):
+            return ""
+        for key in ("final_output", "answer", "content", "message", "text", "summary"):
+            val = data.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        # Last resort: if there's a markdown_report, use it
+        report = data.get("markdown_report")
+        if isinstance(report, str) and report.strip():
+            return report
+        return ""
+
     def _is_generic_draft_answer(self, value: str) -> bool:
-        normalized = value.strip().rstrip(".\u3002").lower()
-        return normalized in {"", "agent completed", "agent run completed", "agent runtime completed"}
+        stripped = value.strip()
+        normalized = stripped.rstrip(".\u3002").lower()
+        if normalized in {"", "agent completed", "agent run completed", "agent runtime completed"}:
+            return True
+        # If the draft answer looks like JSON, treat it as generic so the LLM
+        # generates a proper Markdown response instead of echoing the JSON.
+        if self._looks_like_internal_json(stripped):
+            return True
+        return False
 
     def _fallback_final_answer(self, state: AgentRuntimeState, draft_answer: str) -> str:
         user_input = str(state.get("user_input") or "").strip()
@@ -1300,6 +1511,54 @@ class RuntimeNodes:
         if tool_call:
             parts.append(f"工具调用：{tool_call.get('tool_name', '')} → {tool_call.get('status', '')}")
         return "；".join(parts) if parts else ""
+
+    def _format_memories_for_context(self, memories: list[dict[str, Any]]) -> str:
+        """Format memory dicts into readable text blocks for ContextBuilder."""
+        if not memories:
+            return ""
+        semantic = [m for m in memories if m.get("memory_type") == "semantic"]
+        episodic = [m for m in memories if m.get("memory_type") == "episodic"]
+        working = [m for m in memories if m.get("memory_type") == "working"]
+        lines: list[str] = []
+        if semantic:
+            lines.append("## Semantic Memory (长期偏好/用户设定)")
+            for m in semantic:
+                lines.append(f"- {m.get('content', '')}")
+        if episodic:
+            lines.append("## Episodic Memory (历史任务/经验)")
+            for m in episodic:
+                lines.append(f"- {m.get('content', '')}")
+        if working:
+            lines.append("## Working Memory (当前任务临时状态)")
+            for m in working:
+                lines.append(f"- {m.get('content', '')}")
+        return "\n".join(lines)
+
+    def _format_profile_for_context(self, profile: Any) -> str:
+        """Format user profile into readable text for ContextBuilder."""
+        parts: list[str] = []
+        segment = getattr(profile, "segment", "") or ""
+        if segment:
+            parts.append(f"segment: {segment}")
+        goals = getattr(profile, "goals", "") or ""
+        if goals:
+            parts.append(f"goals: {goals}")
+        interests = getattr(profile, "explicit_interests", "") or ""
+        if interests:
+            parts.append(f"interests: {interests}")
+        return "\n".join(parts) if parts else ""
+
+    def _format_rag_evidence_for_context(self, evidence: list[dict[str, Any]]) -> str:
+        """Format RAG evidence list into readable text for ContextBuilder."""
+        if not evidence:
+            return ""
+        lines: list[str] = ["## RAG Evidence (from user documents)"]
+        for i, item in enumerate(evidence[:5], 1):
+            source = item.get("source_name", "") or item.get("document_id", "")
+            content = item.get("content", "")[:500]
+            score = item.get("score", 0.0)
+            lines.append(f"[{i}] score={score:.2f} | source={source}\n{content}")
+        return "\n".join(lines)
 
     def _load_feed_card_context(self, user_id: int, feed_card_id: Any) -> dict[str, Any]:
         if not feed_card_id:

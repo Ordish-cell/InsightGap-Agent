@@ -83,6 +83,58 @@ function messageKey(message: UiMessage) {
   return message.local_id || message.message_id || `${message.role}-${message.id || message.created_at}`
 }
 
+function getUserVisibleMessageContent(message: { content?: unknown }): string {
+  const content = (message as Record<string, unknown>).content
+
+  if (typeof content === 'string') {
+    const trimmed = content.trim()
+    // Detect JSON blobs that look like internal payloads
+    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[{') && trimmed.endsWith('}]'))) {
+      try {
+        const parsed = JSON.parse(trimmed)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          // This is an internal payload dict — extract the user-facing field
+          const extracted =
+            (parsed as Record<string, unknown>).final_output ||
+            (parsed as Record<string, unknown>).answer ||
+            (parsed as Record<string, unknown>).content ||
+            (parsed as Record<string, unknown>).message ||
+            (parsed as Record<string, unknown>).text
+          if (typeof extracted === 'string' && extracted.trim()) return extracted
+          // Fall through: looks like internal JSON with no user text → suppress
+          if ((parsed as Record<string, unknown>).status && ((parsed as Record<string, unknown>).artifacts || (parsed as Record<string, unknown>).route)) {
+            return ''
+          }
+        }
+      } catch {
+        // Not valid JSON — return as-is
+      }
+    }
+    return content
+  }
+
+  if (content && typeof content === 'object') {
+    const obj = content as Record<string, unknown>
+    const extracted =
+      obj.final_output || obj.answer || obj.content || obj.message || obj.text
+    if (typeof extracted === 'string' && extracted.trim()) return extracted
+    return ''
+  }
+
+  return String(content ?? '')
+}
+
+function looksLikeInternalJson(text: string): boolean {
+  const s = text.trimStart()
+  if (!s.startsWith('{')) return false
+  const head = s.slice(0, 600)
+  return [
+    '"status"', '"final_output"', '"artifacts"',
+    '"memory_updates"', '"skill_drafts"', '"evidence"',
+    '"memory_writes"', '"agent_outputs"',
+  ].some(k => head.includes(k))
+}
+
 function responseMessages(response: AgentRun, fallbackUser: UiMessage, fallbackAssistant: UiMessage) {
   const answer = agent.extractRunAnswer(response)
   const runId = response.run_id || response.id || fallbackAssistant.run_id || null
@@ -322,10 +374,12 @@ function AgentMessageItem({
   onApprove: (approvalId: number) => void
   onReject: (approvalId: number) => void
 }) {
+  const visibleContent = getUserVisibleMessageContent(message)
+
   if (message.role === 'user') {
     return (
       <article className="chat-message user">
-        <div className="message-bubble">{message.content}</div>
+        <div className="message-bubble">{visibleContent || message.content}</div>
       </article>
     )
   }
@@ -339,7 +393,7 @@ function AgentMessageItem({
           <AgentThoughtStream message={message} locale={locale} onApprove={onApprove} onReject={onReject} />
         )}
         <div className="message-bubble answer-content">
-          {message.content || (message.status === 'thinking' ? text(locale, zh.processing, 'Processing...') : text(locale, zh.noAnswer, 'No answer to display.'))}
+          {visibleContent || (message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running' ? text(locale, zh.processing, 'Processing...') : text(locale, zh.noAnswer, 'No answer to display.'))}
         </div>
       </div>
     </article>
@@ -526,9 +580,25 @@ export function AgentChatPanel({
               items.map((item) => {
                 if (item.message_id === userMessage.message_id || item.message_id === localUser.message_id) return userMessage
                 if (item.role === 'assistant' && (item.message_id === assistantMessage.message_id || item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)) {
-                  const streamedContent = item.content
-                  const fallbackContent = assistantMessage.content || ''
-                  const finalContent = (streamedContent && streamedContent.trim()) ? streamedContent : fallbackContent
+                  const streamedContent = String(item.content || '')
+                  const fallbackContent = String(assistantMessage.content || '')
+                  // If streamed content was JSON, replace it with the clean answer
+                  if (looksLikeInternalJson(streamedContent)) {
+                    return {
+                      ...assistantMessage,
+                      content: fallbackContent || getUserVisibleMessageContent(response),
+                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    }
+                  }
+                  // Prevent short final answer from overwriting longer streamed content
+                  if (streamedContent.trim() && fallbackContent.trim() && fallbackContent.trim().length < streamedContent.trim().length * 0.5) {
+                    return {
+                      ...assistantMessage,
+                      content: streamedContent,
+                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    }
+                  }
+                  const finalContent = streamedContent.trim() ? streamedContent : fallbackContent
                   return {
                     ...assistantMessage,
                     content: finalContent,
@@ -545,25 +615,46 @@ export function AgentChatPanel({
           }
 
           if (parsed.event_type === 'answer_delta') {
-            const delta = String(payload.text || '')
-            setMessages((items) =>
-              items.map((item) =>
-                item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
-                  ? {
+            const rawText = payload.text
+            let delta = ''
+            if (typeof rawText === 'string') {
+              delta = rawText
+            } else if (rawText !== undefined && rawText !== null) {
+              delta = String(rawText)
+            }
+            if (delta) {
+              setMessages((items) =>
+                items.map((item) => {
+                  if (item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)) {
+                    const candidateContent = `${item.content || ''}${delta}`
+                    // Suppress streaming if the content starts to look like internal JSON
+                    if (looksLikeInternalJson(candidateContent)) {
+                      return { ...item, status: 'streaming' }
+                    }
+                    return {
                       ...item,
                       run_id: liveRunId || item.run_id,
                       status: 'streaming',
-                      content: `${item.content || ''}${delta}`,
+                      content: candidateContent,
                       trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
                     }
-                  : item
+                  }
+                  return item
+                })
               )
-            )
+            }
             return
           }
 
           if (parsed.event_type === 'answer_completed') {
-            const completedAnswer = String(payload.answer || '')
+            const rawAnswer = payload.answer
+            let completedAnswer = ''
+            if (typeof rawAnswer === 'string') {
+              completedAnswer = rawAnswer
+            } else if (rawAnswer && typeof rawAnswer === 'object') {
+              const obj = rawAnswer as Record<string, unknown>
+              completedAnswer = String(obj.final_output || obj.answer || obj.content || '')
+            }
             setMessages((items) =>
               items.map((item) =>
                 item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)

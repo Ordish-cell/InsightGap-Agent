@@ -4,6 +4,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from src.web_app.agent.runtime.checkpoint import record_event
+from src.web_app.agent.runtime.visibility import should_show_visible_thought_to_user
 
 
 def build_visible_thought_step(step: str | dict[str, Any], state: dict[str, Any]) -> str:
@@ -82,7 +83,7 @@ def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[st
         thread_id=state.get("thread_id", ""),
     )
     stream_queue = state.get("_stream_queue")
-    if stream_queue:
+    if stream_queue and should_show_visible_thought_to_user(state, key):
         base_payload = {name: entry[name] for name in ("id", "status", "visibility", "source", "created_at")}
         sentences = _split_sentences(text)
         if not sentences:
@@ -96,6 +97,8 @@ def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[st
                         "thread_id": state.get("thread_id", ""),
                         "event_type": "visible_thought_delta",
                         "node_name": key,
+                        "visibility": "user",
+                        "display_channel": "thinking",
                         "payload": {**base_payload, "text": sentence, "index": index, "status": "streaming"},
                         "created_at": entry["created_at"],
                     },
@@ -109,6 +112,8 @@ def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[st
                     "thread_id": state.get("thread_id", ""),
                     "event_type": "visible_thought_delta",
                     "node_name": key,
+                    "visibility": "user",
+                    "display_channel": "thinking",
                     "payload": {**base_payload, "text": "", "full_text": text, "status": status},
                     "created_at": entry["created_at"],
                 },

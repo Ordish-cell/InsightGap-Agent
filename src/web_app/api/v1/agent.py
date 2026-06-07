@@ -13,6 +13,7 @@ from src.web_app.services.agent_service import (
     delete_conversation,
     get_conversation,
     get_run as get_run_data,
+    hard_delete_conversation,
     list_conversations,
     list_events,
     list_steps,
@@ -92,6 +93,14 @@ def delete_agent_conversation(conversation_id: str, user_id: int = Depends(get_c
 def clear_agent_conversation(conversation_id: str, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     try:
         return ok(clear_conversation(db, user_id, conversation_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/conversations/{conversation_id}/hard")
+def hard_delete_agent_conversation(conversation_id: str, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    try:
+        return ok(hard_delete_conversation(db, user_id, conversation_id))
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 

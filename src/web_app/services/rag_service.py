@@ -26,6 +26,46 @@ class RAGService:
         results = QdrantVectorStore().search(user_id=user_id, query_vector=vector, top_k=top_k, min_score=min_score, document_ids=document_ids)
         return {"query": query, "results": results}
 
+    def search_evidence(
+        self,
+        user_id: int,
+        query: str,
+        limit: int = 5,
+        score_threshold: float = 0.3,
+        document_ids: list[int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Lightweight RAG evidence retrieval — no LLM call.
+
+        Used by context_builder to inject evidence into GSSC Gather phase.
+        Returns a list of evidence dicts suitable for ContextBuilder packets.
+        Qdrant unavailability is a non-blocking warning.
+        """
+        if not settings.qdrant_url:
+            return []
+        import logging
+        _logger = logging.getLogger("rag_service")
+        try:
+            search_result = self.search(user_id, query, top_k=limit, min_score=score_threshold, document_ids=document_ids)
+        except Exception as exc:
+            _logger.warning("RAG search_evidence failed (non-blocking): %s", exc)
+            return []
+        results = search_result.get("results", [])
+        if not results:
+            return []
+        return [
+            {
+                "id": item.get("chunk_id", ""),
+                "content": item.get("content", "")[:800],
+                "score": item.get("score", 0.0),
+                "document_id": item.get("document_id", ""),
+                "chunk_id": item.get("chunk_id", ""),
+                "source_name": item.get("source_title", ""),
+                "source_url": item.get("source_url", ""),
+                "metadata": item.get("metadata", {}),
+            }
+            for item in results
+        ]
+
     def ask(self, user_id: int, question: str, top_k: int = 5, min_score: float = 0.2, document_ids: list[int] | None = None, answer_mode: str = "auto") -> dict[str, Any]:
         search_result = self.search(user_id, question, top_k, min_score, document_ids)
         results = search_result.get("results", [])

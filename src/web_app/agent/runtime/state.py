@@ -86,8 +86,9 @@ class AgentRuntimeState(TypedDict, total=False):
     _stream_queue: Any
 
     # ── Streaming guard flags ───────────────────────────────────────
-    # Set by _generate_final_answer_with_llm after streaming completes;
+    # Set by _generate_final_answer_with_llm during streaming;
     # read by agent_service to skip the fallback _stream_answer_deltas.
+    _answer_started_emitted: bool
     _answer_delta_emitted: bool
     _answer_completed_emitted: bool
 

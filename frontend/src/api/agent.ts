@@ -13,6 +13,7 @@ export const updateConversation = (conversationId: string, payload: Record<strin
 export const archiveConversation = (conversationId: string) => apiRequest<AgentConversation>(`/agent/conversations/${conversationId}/archive`, { method: 'POST' })
 export const deleteConversation = (conversationId: string) => apiRequest<AgentConversation>(`/agent/conversations/${conversationId}`, { method: 'DELETE' })
 export const clearConversation = (conversationId: string) => apiRequest<{ conversation: AgentConversation; cleared_messages: number }>(`/agent/conversations/${conversationId}/clear`, { method: 'POST' })
+export const hardDeleteConversation = (conversationId: string) => apiRequest<{ conversation_id: string; deleted_records: number }>(`/agent/conversations/${conversationId}/hard`, { method: 'DELETE' })
 export const approveRunApproval = (approvalId: number | string, payload: Record<string, unknown> = {}) => apiRequest<unknown>(`/agent/approvals/${approvalId}/approve`, { method: 'POST', body: payload })
 export const rejectRunApproval = (approvalId: number | string, payload: Record<string, unknown> = {}) => apiRequest<unknown>(`/agent/approvals/${approvalId}/reject`, { method: 'POST', body: payload })
 export const getSteps = async (runId: number | string) => {

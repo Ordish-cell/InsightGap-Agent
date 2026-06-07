@@ -6,6 +6,7 @@ Supervisor graph uses for conditional routing.
 
 from typing import Any
 
+from src.web_app.agent.runtime.intent_schema import normalize_agent_name
 from src.web_app.agent.runtime.state import AgentIntent, AgentRuntimeState, RiskLevel, RoutePlan
 
 # ── Keyword sets for intent detection ──────────────────────────────
@@ -217,8 +218,11 @@ def _merge_route(rule_route: list[str], hints: Any) -> list[str]:
     merged: list[str] = []
     if isinstance(hints, list):
         for item in hints:
-            if item in executable and item not in merged:
-                merged.append(item)
+            if not isinstance(item, str):
+                continue
+            normalized = normalize_agent_name(item)
+            if normalized in executable and normalized not in merged:
+                merged.append(normalized)
     for item in rule_route:
         if item in executable and item not in merged:
             merged.append(item)

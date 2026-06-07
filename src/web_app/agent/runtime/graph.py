@@ -10,6 +10,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from src.web_app.agent.runtime.fallback import run_fallback
+from src.web_app.agent.runtime.intent_schema import normalize_agent_name
 from src.web_app.agent.runtime.nodes import RuntimeNodes
 from src.web_app.agent.runtime.state import AgentRuntimeState, append_output
 
@@ -158,6 +159,7 @@ class AgentRuntime:
 
     def _map_route_to_node(self, route_item: str) -> str:
         """Map a route_plan route item to a registered graph node name."""
+        normalized = normalize_agent_name(route_item)
         mapping = {
             "context_builder": "context_builder",
             "skill_matcher": "skill_matcher",
@@ -170,4 +172,4 @@ class AgentRuntime:
             "evaluator": "evaluator",
             "final_response": "final_response",
         }
-        return mapping.get(route_item, "final_response")
+        return mapping.get(normalized, mapping.get(route_item, "final_response"))
