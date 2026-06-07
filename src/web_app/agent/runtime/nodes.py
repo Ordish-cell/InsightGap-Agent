@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 from typing import Any
 
@@ -20,6 +21,7 @@ from src.web_app.agent.runtime.visible_thoughts import emit_visible_thought, vis
 from src.web_app.mcp.tool_router import infer_tool
 from src.web_app.context.builder import ContextBuilder
 from src.web_app.core.constants import L3_EXTERNAL_WRITE, L4_HIGH_RISK
+from src.web_app.db.repositories.agent_repository import AgentChatMessageRepository, AgentStepRepository
 from src.web_app.db.repositories.approval_repository import ApprovalRepository
 from src.web_app.db.repositories.artifact_repository import ArtifactRepository
 from src.web_app.db.repositories.feed_repository import FeedRepository
@@ -36,6 +38,8 @@ from src.web_app.services.user_growth_service import user_growth_service
 
 EXTERNAL_WRITE_TERMS = ("发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "email", "send", "post", "submit")
 HIGH_RISK_TERMS = ("删除", "支付", "付款", "转账", "delete", "payment")
+
+logger = logging.getLogger(__name__)
 
 
 class RuntimeNodes:
@@ -145,10 +149,57 @@ class RuntimeNodes:
         route = state.get("route", "chat")
         user_input = state.get("user_input", "")
         profile = ProfileRepository(self.db).get_or_create_default(state["user_id"])
-        memories = memory_service.search_memory(state["user_id"], user_input, min_importance=0.2, db=self.db)[:5]
+        memories = memory_service.search_memory(
+            state["user_id"], user_input, min_importance=0.2, db=self.db, limit=5,
+        )
+        memory_search_backend = getattr(memory_service, "_last_search_backend", "unknown")
+        memory_qdrant_hits = getattr(memory_service, "_last_qdrant_hits", 0)
         page_context = self.payload.get("page_context") or state.get("page_context") or {}
         feed_card_id = self.payload.get("feed_card_id") or page_context.get("selected_feed_card_id") or page_context.get("feed_card_id")
         feed_card_context = self._load_feed_card_context(state["user_id"], feed_card_id)
+
+        # ── Load conversation history from agent_chat_messages ────────
+        conversation_history_text = ""
+        conversation_history_debug: dict[str, Any] = {}
+        try:
+            conversation_id = state.get("conversation_id")
+            if conversation_id and state.get("user_id"):
+                message_repo = AgentChatMessageRepository(self.db)
+                recent_messages = message_repo.list_recent_by_conversation(
+                    user_id=state["user_id"],
+                    conversation_id=conversation_id,
+                    limit=12,
+                )
+                conversation_history_text = self._format_recent_chat_messages_for_context(recent_messages)
+                conversation_history_debug = {
+                    "state_user_id": state["user_id"],
+                    "state_conversation_id": conversation_id,
+                    "recent_chat_messages_count": len(recent_messages),
+                    "recent_chat_message_preview": [
+                        f"{m.role}: {(m.content or '')[:80]}"
+                        for m in recent_messages[:5]
+                    ],
+                    "has_conversation_history_text": bool(conversation_history_text),
+                }
+            else:
+                conversation_history_debug = {
+                    "conversation_history_empty_reason": "missing_user_id_or_conversation_id",
+                    "state_user_id": state.get("user_id"),
+                    "state_conversation_id": None,
+                }
+        except Exception as exc:
+            logger.exception(
+                "context_builder.load_conversation_history_failed",
+                extra={
+                    "user_id": state.get("user_id"),
+                    "conversation_id": state.get("conversation_id"),
+                    "error": str(exc),
+                },
+            )
+            conversation_history_debug = {
+                "conversation_history_empty_reason": "repository_error",
+                "error": str(exc),
+            }
 
         # Generate conversation summary from recent agent steps
         conversation_summary = self._build_conversation_summary(state["run_id"])
@@ -188,6 +239,7 @@ class RuntimeNodes:
             "evidence": evidence_text,
             "feed_card": feed_card_context,
             "page_context": page_context,
+            "conversation_history": conversation_history_text,
             "conversation_summary": conversation_summary,
             "checkpoint_summary": checkpoint_summary,
             "dynamic_preferences": dynamic_prefs.get("preference_summary", ""),
@@ -203,6 +255,7 @@ class RuntimeNodes:
             "memory_items": memories,
             "feed_card": feed_card_context,
             "page_context": page_context,
+            "conversation_history": conversation_history_text,
             "conversation_summary": conversation_summary,
             "checkpoint_summary": checkpoint_summary,
             "profile": {"segment": profile.segment, "goals": profile.goals, "interests": profile.explicit_interests},
@@ -214,7 +267,13 @@ class RuntimeNodes:
                     {"route": route, "feed_card_id": feed_card_id},
                     {"memory_count": len(memories), "feed_card_loaded": bool(feed_card_context),
                      "rag_evidence_count": len(rag_evidence),
-                     "gssc_debug": gssc_debug, "context": context_text})
+                     "gssc_debug": gssc_debug, "context": context_text,
+                     "recent_chat_messages_count": conversation_history_debug.get("recent_chat_messages_count", 0),
+                     "has_conversation_history_text": conversation_history_debug.get("has_conversation_history_text", False),
+                     "has_conversation_history_section": "Conversation History" in context_text,
+                     "memory_search_backend": memory_search_backend,
+                     "memory_qdrant_hits": memory_qdrant_hits,
+                     **conversation_history_debug})
         append_status_step(
             state,
             key="context_builder",
@@ -1018,6 +1077,7 @@ class RuntimeNodes:
                      "has_memory_section": "Relevant Memory" in gssc_context or "[Relevant Memory]" in gssc_context,
                      "has_rag_evidence_section": "Evidence" in gssc_context or "[Evidence]" in gssc_context,
                      "has_profile_section": "User Profile" in gssc_context or "[User Profile]" in gssc_context,
+                     "has_conversation_history_section": "Conversation History" in gssc_context or "[Conversation History]" in gssc_context,
                      "gssc_selected_sources": gssc_debug.get("selected_sources", []),
                      "gssc_dropped_sources": gssc_debug.get("dropped_sources", []),
                      })
@@ -1336,22 +1396,30 @@ class RuntimeNodes:
             "2. 如果 Memory 或 Evidence 中没有相关信息，不要编造。\n"
             "3. 如果用户问「我之前说过什么」「我的偏好是什么」「我们聊过什么」，必须优先从 GSSC Context 的 Memory 和 Conversation 部分回答。\n"
         )
-        # The "insufficient evidence" instruction only applies to research/rag
-        # intents. For memory_write / chat / preference updates, the user input
-        # itself is the primary evidence.
-        if intent in ("research", "rag", "feed_research", "mixed"):
-            system_instruction += "4. 如果证据不足，要明确说「当前上下文里没有足够记录」。\n"
+        # ── Conversation recall rules (P0) ─────────────────────────
         system_instruction += (
-            "5. 如果只是问候或闲聊，要像正常助手一样回答；如果是记忆写入类请求，直接确认已保存即可。\n"
-            "6. 如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
-            "7. 输出简洁、结构化、可执行。中文为主。\n"
+            "4. 如果用户询问「我问过你什么 / 我刚才问过什么 / 我之前问过什么 / 是否问过某主题 / 刚才聊了什么」，必须优先查看 [Conversation History]。\n"
+            "5. 判断用户是否问过某主题时，只依据 [Conversation History] 中的 User 消息，不要依据 Assistant 的旧回答（Assistant 旧回答可能是错误的，不可作为事实依据）。\n"
+            "6. 如果 [Conversation History] 中存在相关 User 消息，请直接列出这些用户问题。不要回答「没有记录」，除非 [Conversation History] 为空或确实没有相关 User 消息。\n"
+            "7. 当前会话历史判断优先级高于 Memory、RAG Evidence、Feed Card 和 Dynamic Preferences。\n"
+        )
+        # The "insufficient evidence" instruction only applies to research/rag
+        # intents. For memory_write / chat / preference updates / conversation_recall,
+        # the user input itself is the primary evidence.
+        if intent in ("research", "rag", "feed_research", "mixed"):
+            system_instruction += "8. 如果证据不足，要明确说「当前上下文里没有足够记录」。\n"
+        system_instruction += (
+            f"{(9 if intent in ('research', 'rag', 'feed_research', 'mixed') else 8)}. 如果只是问候或闲聊，要像正常助手一样回答；如果是记忆写入类请求，直接确认已保存即可。\n"
+            f"{(10 if intent in ('research', 'rag', 'feed_research', 'mixed') else 9)}. 如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
+            f"{(11 if intent in ('research', 'rag', 'feed_research', 'mixed') else 10)}. 输出简洁、结构化、可执行。中文为主。\n"
             "\n"
             "[Output Rules — 必须严格遵守]\n"
-            "• 你必须输出用户可直接阅读的自然语言，可以使用 Markdown 标题、列表、加粗来组织内容。\n"
+            "• 你必须输出用户可直接阅读的自然语言，可以使用 Markdown 标题、列表、加粗来组织内容。不要使用分割线 ---。\n"
             "• 严禁输出 JSON。严禁输出 Python dict。严禁输出 JavaScript object。\n"
             "• 严禁在你的回答中出现 status、final_output、artifacts、memory_updates、skill_drafts、evidence 这些内部字段名。\n"
             "• 如果你需要引用研究成果物，请直接用 Markdown 段落描述，不要把内部 payload 原样贴给用户。\n"
-            "• 你的回答就是用户最终看到的全部内容，没有二次解析步骤。"
+            "• 你的回答就是用户最终看到的全部内容，没有二次解析步骤。\n"
+            "• 当你给出多个选项或「需要我帮你」列表时，请使用标准 Markdown 无序列表，每个选项一行（如 - ✅ 选项一）。不要把多个选项写在同一行。"
         )
         return system_instruction
 
@@ -1407,7 +1475,7 @@ class RuntimeNodes:
             "回答要贴合用户原话，优先给结论，然后给下一步可做什么。中文为主。\n"
             "\n"
             "[Output Rules — 必须严格遵守]\n"
-            "• 你必须输出用户可直接阅读的自然语言，可以使用 Markdown 标题、列表、加粗来组织内容。\n"
+            "• 你必须输出用户可直接阅读的自然语言，可以使用 Markdown 标题、列表、加粗来组织内容。不要使用分割线 ---。\n"
             "• 严禁输出 JSON。严禁输出 Python dict。严禁输出 JavaScript object。\n"
             "• 严禁在你的回答中出现 status、final_output、artifacts、memory_updates、skill_drafts、evidence 这些内部字段名。\n"
             "• 你的回答就是用户最终看到的全部内容，没有二次解析步骤。"
@@ -1517,27 +1585,48 @@ class RuntimeNodes:
             data["reasoning_summary"] = data["reason_summary"]
         return data
 
+    def _format_recent_chat_messages_for_context(self, messages: list[Any]) -> str:
+        """Format recent AgentChatMessage rows into [Conversation History] text."""
+        if not messages:
+            return ""
+        lines: list[str] = []
+        for msg in messages:
+            role = getattr(msg, "role", "") or ""
+            content = (getattr(msg, "content", "") or "").strip()
+            if not content:
+                continue
+            if role == "user":
+                label = "User"
+            elif role == "assistant":
+                label = "Assistant"
+            else:
+                label = role.capitalize() or "Message"
+            max_len = 1200 if role == "assistant" else 600
+            if len(content) > max_len:
+                content = content[:max_len] + "..."
+            lines.append(f"{label}: {content}")
+        return "\n\n".join(lines)
+
     def _build_conversation_summary(self, run_id: int) -> str:
-        """Build a short conversation summary from recent agent steps of this run."""
+        """Build a short summary from recent agent steps of this run."""
         try:
-            from src.web_app.db.repositories.agent_repository import AgentRunRepository
-            repo = AgentRunRepository(self.db)
-            steps = repo.list_steps(run_id)[-6:]  # last 6 steps
+            repo = AgentStepRepository(self.db)
+            steps = repo.list_by_run(run_id)[-6:]
         except Exception:
             steps = []
         if not steps:
             return ""
-        step_texts = []
+        step_texts: list[str] = []
         for step in steps:
             node = getattr(step, "node_name", "") or ""
-            status = getattr(step, "status", "") or ""
+            status_val = getattr(step, "status", "") or ""
             output = getattr(step, "output", {}) or {}
             if isinstance(output, dict):
                 route = output.get("route", "")
                 if route:
-                    step_texts.append(f"{node}(→{route}/{status})")
+                    step_texts.append(f"{node}(→{route}/{status_val})")
                 else:
-                    step_texts.append(f"{node}({status})")
+                    step_texts.append(f"{node}({status_val})")
             else:
                 step_texts.append(node)
         return f"Agent Run {run_id} 已完成步骤：{' → '.join(step_texts)}。" if step_texts else ""
@@ -1566,25 +1655,36 @@ class RuntimeNodes:
         return "；".join(parts) if parts else ""
 
     def _format_memories_for_context(self, memories: list[dict[str, Any]]) -> str:
-        """Format memory dicts into readable text blocks for ContextBuilder."""
+        """Format memory dicts into readable Markdown text for ContextBuilder."""
         if not memories:
             return ""
         semantic = [m for m in memories if m.get("memory_type") == "semantic"]
         episodic = [m for m in memories if m.get("memory_type") == "episodic"]
         working = [m for m in memories if m.get("memory_type") == "working"]
         lines: list[str] = []
+
+        def _meta_suffix(m: dict[str, Any]) -> str:
+            parts = []
+            score = m.get("_qdrant_score")
+            if score:
+                parts.append(f"score={score:.2f}")
+            imp = m.get("importance")
+            if imp:
+                parts.append(f"importance={imp:.2f}")
+            return f" ({', '.join(parts)})" if parts else ""
+
         if semantic:
             lines.append("## Semantic Memory (长期偏好/用户设定)")
             for m in semantic:
-                lines.append(f"- {m.get('content', '')}")
+                lines.append(f"- {m.get('content', '')}{_meta_suffix(m)}")
         if episodic:
             lines.append("## Episodic Memory (历史任务/经验)")
             for m in episodic:
-                lines.append(f"- {m.get('content', '')}")
+                lines.append(f"- {m.get('content', '')}{_meta_suffix(m)}")
         if working:
             lines.append("## Working Memory (当前任务临时状态)")
             for m in working:
-                lines.append(f"- {m.get('content', '')}")
+                lines.append(f"- {m.get('content', '')}{_meta_suffix(m)}")
         return "\n".join(lines)
 
     def _format_profile_for_context(self, profile: Any) -> str:

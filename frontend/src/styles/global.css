@@ -2837,6 +2837,11 @@ body:has(.simple-login-page) {
 
 .answer-content {
   width: 100%;
+  /* Override parent .message-bubble defaults for Markdown rendering:
+     - no pre-wrap (preserves extra blank lines that blow up spacing)
+     - tighter line-height (MarkdownRenderer handles its own) */
+  white-space: normal;
+  line-height: 1.55;
 }
 
 .agent-thought-stream {
@@ -3138,3 +3143,195 @@ body:has(.simple-login-page) {
   background: #c02633;
   box-shadow: 0 2px 8px rgb(220 53 69 / 32%);
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+   Markdown Renderer — medium-compact chat spacing
+   Uses :where() to keep specificity low so nothing fights.
+   ═══════════════════════════════════════════════════════════════════ */
+
+.md-chat {
+  max-width: 820px;
+  font-size: 15px;
+  line-height: 1.62;
+  color: var(--ink);
+  word-break: break-word;
+}
+
+.md-chat > *:first-child { margin-top: 0 !important; }
+.md-chat > *:last-child  { margin-bottom: 0 !important; }
+
+/* ── Headings ──────────────────────────────────────────────────── */
+
+.md-chat :where(.md-h1) {
+  margin: 1rem 0 0.45rem;
+  font-size: 1.25rem;
+  line-height: 1.35;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.md-chat :where(.md-h2) {
+  margin: 0.9rem 0 0.4rem;
+  font-size: 1.1rem;
+  line-height: 1.38;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+}
+
+.md-chat :where(.md-h3) {
+  margin: 0.85rem 0 0.35rem;
+  font-size: 1rem;
+  line-height: 1.42;
+  font-weight: 650;
+}
+
+.md-chat :where(.md-h4) {
+  margin: 0.7rem 0 0.3rem;
+  font-size: 0.96rem;
+  line-height: 1.4;
+  font-weight: 650;
+}
+
+/* ── Paragraphs ─────────────────────────────────────────────────── */
+
+.md-chat :where(.md-p) {
+  margin: 0.5rem 0;
+  line-height: 1.62;
+}
+
+/* ── Lists ──────────────────────────────────────────────────────── */
+
+.md-chat :where(.md-ul),
+.md-chat :where(.md-ol) {
+  margin: 0.45rem 0 0.65rem;
+  padding-left: 1.25rem;
+}
+
+.md-chat :where(.md-ul) { list-style-type: disc; }
+.md-chat :where(.md-ol) { list-style-type: decimal; }
+
+.md-chat :where(.md-li) {
+  margin: 0.22rem 0;
+  line-height: 1.6;
+  padding-left: 0.08rem;
+}
+
+.md-chat :where(.md-li .md-p) { margin: 0.18rem 0; }
+
+/* ── Blockquote ─────────────────────────────────────────────────── */
+
+.md-chat :where(.md-blockquote) {
+  margin: 0.7rem 0;
+  padding: 0.45rem 0.8rem;
+  border-left: 3px solid #e5e7eb;
+  color: #525252;
+  background: #fafafa;
+  border-radius: 0 0.5rem 0.5rem 0;
+}
+
+.md-chat :where(.md-blockquote .md-p) { margin: 0.15rem 0; }
+
+/* ── Links ──────────────────────────────────────────────────────── */
+
+.md-chat :where(.md-a) {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ── Tables ─────────────────────────────────────────────────────── */
+
+.md-chat :where(.md-table-wrap) {
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.75rem;
+}
+
+.md-chat :where(.md-table) {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.92rem;
+}
+
+.md-chat :where(.md-th),
+.md-chat :where(.md-td) {
+  border-bottom: 1px solid #e5e7eb;
+  padding: 0.45rem 0.6rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.md-chat :where(.md-th) {
+  background: #fafafa;
+  font-weight: 650;
+}
+
+.md-chat :where(tr:last-child .md-td) { border-bottom: 0; }
+
+/* ── Code ───────────────────────────────────────────────────────── */
+
+.md-chat :where(.md-code) {
+  border-radius: 0.35rem;
+  background: #f4f4f5;
+  padding: 0.08rem 0.28rem;
+  font-size: 0.9em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    'Liberation Mono', 'Courier New', monospace;
+}
+
+.md-chat :where(.md-pre) {
+  margin: 0.75rem 0;
+  padding: 0.8rem 0.9rem;
+  overflow-x: auto;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.75rem;
+  background: #fafafa;
+  line-height: 1.5;
+}
+
+.md-chat :where(.md-pre code) {
+  padding: 0;
+  background: transparent;
+  border-radius: 0;
+  font-size: 0.88rem;
+}
+
+/* ── Line breaks (remark-breaks) ────────────────────────────────── */
+
+.md-chat :where(.md-br) {
+  display: block;
+  content: '';
+  margin-top: 0.14rem;
+}
+
+/* ── Misc ───────────────────────────────────────────────────────── */
+
+.md-chat :where(.md-strong) { font-weight: 650; }
+.md-chat :where(.md-em)     { color: #4b5563; }
+
+.md-chat :where(hr) { display: none; }
+
+/* ── Dark mode ──────────────────────────────────────────────────── */
+
+.dark .md-chat { color: #e5e7eb; }
+
+.dark .md-chat :where(.md-blockquote) {
+  border-left-color: #3f3f46;
+  background: #18181b;
+  color: #d4d4d8;
+}
+
+.dark .md-chat :where(.md-code) { background: #27272a; }
+
+.dark .md-chat :where(.md-pre) {
+  border-color: #3f3f46;
+  background: #18181b;
+}
+
+.dark .md-chat :where(.md-table-wrap) { border-color: #3f3f46; }
+
+.dark .md-chat :where(.md-th),
+.dark .md-chat :where(.md-td) { border-bottom-color: #3f3f46; }
+
+.dark .md-chat :where(.md-th) { background: #18181b; }

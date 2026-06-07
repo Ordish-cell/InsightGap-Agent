@@ -1,3 +1,4 @@
+import logging
 import re
 from datetime import UTC, datetime
 from typing import Any
@@ -7,10 +8,38 @@ from sqlalchemy.orm import Session
 from src.web_app.db.repositories.memory_repository import MemoryRepository
 from src.web_app.memory.extractor import memory_extractor
 
+logger = logging.getLogger(__name__)
+
 
 class MemoryService:
     def __init__(self):
         self._items: list[dict[str, Any]] = []
+        self._qdrant_store = None
+        self._qdrant_init_attempted = False
+        self._last_search_backend = "not_searched"
+        self._last_qdrant_hits = 0
+
+    def _get_qdrant_store(self):
+        """Lazy-init QdrantMemoryStore. Returns None if Qdrant is unavailable."""
+        if self._qdrant_store is not None:
+            return self._qdrant_store
+        if self._qdrant_init_attempted:
+            return None
+        self._qdrant_init_attempted = True
+        try:
+            from src.web_app.core.config import settings
+            from src.web_app.memory.qdrant_memory_store import QdrantMemoryStore
+            if not settings.qdrant_url:
+                logger.info("memory.qdrant_skipped: QDRANT_URL not configured")
+                return None
+            store = QdrantMemoryStore()
+            store.ensure_collection()
+            self._qdrant_store = store
+            logger.info("memory.qdrant_store_ready", extra={"collection": store.collection})
+            return store
+        except Exception:
+            logger.warning("memory.qdrant_init_failed", exc_info=True)
+            return None
 
     def add_memory(
         self,
@@ -18,6 +47,7 @@ class MemoryService:
         content: str,
         memory_type: str = "working",
         importance: float = 0.0,
+        source_type: str = "",
         metadata: dict[str, Any] | None = None,
         db: Session | None = None,
     ) -> dict[str, Any]:
@@ -27,8 +57,36 @@ class MemoryService:
                 content=content,
                 memory_type=memory_type,
                 importance=importance,
+                source_type=source_type,
                 metadata_json=metadata or {},
             )
+            # ── Fire-and-forget Qdrant upsert ─────────────────────────
+            store = self._get_qdrant_store()
+            if store is not None:
+                try:
+                    point_id = store.upsert_memory(
+                        memory_id=item.id,
+                        user_id=user_id,
+                        content=content,
+                        memory_type=memory_type,
+                        importance=importance,
+                        source_type=source_type,
+                        metadata=metadata,
+                    )
+                    # Mark as indexed in PG metadata (best-effort)
+                    try:
+                        MemoryRepository(db).update(
+                            item,
+                            qdrant_point_id=point_id,
+                            metadata_json={
+                                **(item.metadata_json or {}),
+                                "qdrant_indexed": True,
+                            },
+                        )
+                    except Exception:
+                        pass  # metadata update is non-critical
+                except Exception:
+                    logger.warning("memory.qdrant_upsert_failed", exc_info=True)
             return self._to_dict(item)
         item = {
             "id": len(self._items) + 1,
@@ -47,6 +105,7 @@ class MemoryService:
         content: str,
         memory_type: str = "semantic",
         importance: float = 0.0,
+        source_type: str = "",
         metadata: dict[str, Any] | None = None,
         db: Session | None = None,
     ) -> dict[str, Any] | None:
@@ -54,7 +113,7 @@ class MemoryService:
             existing = self._find_similar(user_id, content, memory_type, db)
             if existing:
                 return self._update_existing(existing, importance, metadata, db)
-        return self.add_memory(user_id, content, memory_type, importance, metadata, db)
+        return self.add_memory(user_id, content, memory_type, importance, source_type, metadata, db)
 
     def _find_similar(self, user_id: int, content: str, memory_type: str, db: Session) -> Any:
         existing = MemoryRepository(db).search_by_type(user_id, memory_type=memory_type, min_importance=0.3)
@@ -120,11 +179,94 @@ class MemoryService:
         memory_type: str | None = None,
         min_importance: float = 0.0,
         db: Session | None = None,
+        *,
+        memory_types: list[str] | None = None,
+        limit: int = 8,
     ) -> list[dict[str, Any]]:
-        if db:
-            return [self._to_dict(item) for item in MemoryRepository(db).search(user_id, query, memory_type, min_importance)]
-        query_lower = query.lower()
-        return [item for item in self._items if item["user_id"] == user_id and query_lower in item["content"].lower()]
+        """Search long-term memory with Qdrant → ILIKE → recent-important fallback."""
+        if not db:
+            query_lower = query.lower()
+            return [item for item in self._items if item["user_id"] == user_id and query_lower in item["content"].lower()]
+
+        # Determine which memory types to search
+        types_for_search: list[str] | None = None
+        if memory_types:
+            types_for_search = memory_types
+        elif memory_type:
+            types_for_search = [memory_type]
+
+        results: list[dict[str, Any]] = []
+        repo = MemoryRepository(db)
+
+        # ── Tier 1: Qdrant semantic search ────────────────────────────
+        if query:
+            store = self._get_qdrant_store()
+            if store is not None:
+                try:
+                    qdrant_hits = store.search_memory(
+                        user_id=user_id,
+                        query=query,
+                        memory_types=types_for_search,
+                        limit=limit,
+                        score_threshold=0.25,
+                    )
+                    self._last_search_backend = "qdrant"
+                    self._last_qdrant_hits = len(qdrant_hits)
+
+                    if qdrant_hits:
+                        memory_ids = [int(h["memory_id"]) for h in qdrant_hits]
+                        memories = repo.get_by_ids(user_id=user_id, ids=memory_ids)
+                        # Filter by min_importance and memory_type
+                        if min_importance > 0:
+                            memories = [m for m in memories if m.importance >= min_importance]
+                        if types_for_search:
+                            memories = [m for m in memories if m.memory_type in types_for_search]
+                        # Sort: 75 % Qdrant score + 25 % importance
+                        score_map = {int(h["memory_id"]): h["score"] for h in qdrant_hits}
+                        memories.sort(
+                            key=lambda m: (
+                                0.75 * score_map.get(m.id, 0)
+                                + 0.25 * float(m.importance or 0)
+                            ),
+                            reverse=True,
+                        )
+                        results = []
+                        for m in memories[:limit]:
+                            d = self._to_dict(m)
+                            d["_qdrant_score"] = score_map.get(m.id, 0)
+                            results.append(d)
+                        return results
+                except Exception:
+                    logger.warning("memory.qdrant_search_failed", exc_info=True)
+                    self._last_search_backend = "qdrant_search_failed"
+                    self._last_qdrant_hits = 0
+
+        # ── Tier 2: PostgreSQL ILIKE fallback ──────────────────────────
+        pg_memories = repo.search(
+            user_id, query=query if query else "",
+            memory_type=memory_type,
+            min_importance=min_importance,
+        )
+        if pg_memories:
+            self._last_search_backend = "postgres_like"
+            self._last_qdrant_hits = 0
+            return [self._to_dict(m) for m in pg_memories[:limit]]
+
+        # ── Tier 3: recent important semantic memories ─────────────────
+        fallback_memories = repo.list_recent_important(
+            user_id=user_id,
+            memory_type="semantic",
+            min_importance=0.7,
+            limit=limit,
+        )
+        if fallback_memories:
+            self._last_search_backend = "recent_important_fallback"
+            self._last_qdrant_hits = 0
+            return [self._to_dict(m) for m in fallback_memories]
+
+        self._last_search_backend = "no_results"
+        self._last_qdrant_hits = 0
+        return []
 
     def get_semantic_memories(self, user_id: int, db: Session, min_importance: float = 0.3) -> list[dict[str, Any]]:
         return [self._to_dict(item) for item in MemoryRepository(db).search(user_id, memory_type="semantic", min_importance=min_importance)]

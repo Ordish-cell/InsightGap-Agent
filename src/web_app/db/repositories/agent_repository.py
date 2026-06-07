@@ -161,6 +161,25 @@ class AgentChatMessageRepository(BaseRepository[AgentChatMessage]):
         )
         return list(self.db.execute(stmt).scalars())
 
+    def list_recent_by_conversation(self, user_id: int, conversation_id: str, limit: int = 12) -> list[AgentChatMessage]:
+        """Return the most recent messages for a conversation in chronological order.
+
+        Used by context_builder to inject [Conversation History] so the LLM can
+        answer "what did I just ask?" / "did I mention X?" questions from the
+        same conversation.
+        """
+        stmt = (
+            select(AgentChatMessage)
+            .where(
+                AgentChatMessage.user_id == user_id,
+                AgentChatMessage.conversation_id == conversation_id,
+            )
+            .order_by(AgentChatMessage.created_at.desc(), AgentChatMessage.id.desc())
+            .limit(limit)
+        )
+        rows = list(self.db.execute(stmt).scalars())
+        return list(reversed(rows))
+
     def clear_conversation(self, user_id: int, conversation_id: str) -> int:
         rows = self.list_by_conversation(user_id, conversation_id)
         count = len(rows)

@@ -3,6 +3,7 @@ import { FormEvent, useEffect, useRef, useState } from 'react'
 import * as agent from '../../api/agent'
 import type { AgentChatMessage, AgentEvent, AgentRun, AgentRunStep, UnknownRecord } from '../../api/types'
 import { JsonBlock } from '../common/JsonBlock'
+import { MarkdownRenderer } from '../common/MarkdownRenderer'
 import { StatusPill } from '../common/StatusPill'
 import { AgentThoughtStream } from './AgentThoughtStream'
 
@@ -393,7 +394,13 @@ function AgentMessageItem({
           <AgentThoughtStream message={message} locale={locale} onApprove={onApprove} onReject={onReject} />
         )}
         <div className="message-bubble answer-content">
-          {visibleContent || (message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running' ? text(locale, zh.processing, 'Processing...') : text(locale, zh.noAnswer, 'No answer to display.'))}
+          {visibleContent ? (
+            <MarkdownRenderer content={visibleContent} />
+          ) : (
+            message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running'
+              ? text(locale, zh.processing, 'Processing...')
+              : text(locale, zh.noAnswer, 'No answer to display.')
+          )}
         </div>
       </div>
     </article>

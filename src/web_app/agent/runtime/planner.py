@@ -75,6 +75,19 @@ _SKILL_TERMS = [
     "create skill", "reusable", "workflow", "流程",
 ]
 
+# ── Conversation recall patterns ─────────────────────────────────
+# These are questions about the CURRENT conversation history, not research/rag.
+# They should route as chat + conversation_recall intent and never trigger
+# "Evidence is insufficient" or external research agents.
+_CONVERSATION_RECALL_PATTERNS = [
+    "我问过你什么", "我刚才问过什么", "我之前问过什么",
+    "我问过你", "是否问过", "有没有问过", "我问过.*相关",
+    "刚才聊了什么", "我们刚才聊了什么", "上一条我问了什么",
+    "刚刚问了什么", "之前问了什么", "上一轮",
+    "之前聊过", "刚才说过", "我说过什么",
+    "你还记得我问过", "你还记得我", "我提到过",
+]
+
 # ── Public entry point ──────────────────────────────────────────────
 
 
@@ -110,6 +123,11 @@ def plan_route(
     is_tool = any(term in text for term in _TOOL_TERMS) or any(term in text for term in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "打开网页", "删除", "支付", "付款", "转账"])
     is_memory = any(term in text for term in _MEMORY_TERMS)
     is_skill = any(term in text for term in _SKILL_TERMS)
+    # Conversation recall: "what did I just ask?" — must NOT trigger research/rag
+    import re as _re
+    is_conversation_recall = any(
+        _re.search(pattern, text) for pattern in _CONVERSATION_RECALL_PATTERNS
+    )
     # Explicit memory write request — highest priority, overrides research/rag/artifact
     is_memory_write = any(pattern in text for pattern in _MEMORY_WRITE_PATTERNS)
 
@@ -146,6 +164,15 @@ def plan_route(
             if any(text.startswith(p) for p in _STRONG_MEMORY_WRITE_PREFIXES):
                 is_tool = False
             reasons.append("memory_write_priority")
+
+    # ── Conversation recall: override research/rag/artifact ──────
+    # "Did I ask about X?" is about current conversation history, NOT external research.
+    if is_conversation_recall and not forced:
+        intent = "chat"
+        is_research = False
+        is_rag = False
+        is_artifact = False
+        reasons.append("conversation_recall_detected")
 
     # Determine primary intent
     if intent == "chat":

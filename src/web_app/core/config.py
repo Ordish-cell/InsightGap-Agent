@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     qdrant_vector_size: int = 384
     qdrant_distance: str = "cosine"
     qdrant_timeout: int = 30
+    memory_qdrant_collection: str = "memory_vectors"
     neo4j_uri: str = ""
     neo4j_username: str = ""
     neo4j_password: str = ""

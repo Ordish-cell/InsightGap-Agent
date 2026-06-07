@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "postgres-agent-os": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "@bytebase/dbhub@latest",
+        "--transport",
+        "stdio",
+        "--dsn",
+        "postgres://postgres:123456@localhost:5432/agent_os?sslmode=disable"
+      ]
+    }
+  }
+}
