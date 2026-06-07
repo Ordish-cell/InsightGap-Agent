@@ -1,11 +1,21 @@
 import { FormEvent, useEffect, useRef, useState } from 'react'
 
+import type { AgentChatMessage, AgentEvent, AgentRun, AgentRunStep, ChatAttachment, UnknownRecord } from '../../api/types'
 import * as agent from '../../api/agent'
-import type { AgentChatMessage, AgentEvent, AgentRun, AgentRunStep, UnknownRecord } from '../../api/types'
+import { fetchDocumentBlobUrl, toApiUrl, uploadChatAttachment } from '../../api/documents'
 import { JsonBlock } from '../common/JsonBlock'
 import { MarkdownRenderer } from '../common/MarkdownRenderer'
 import { StatusPill } from '../common/StatusPill'
 import { AgentThoughtStream } from './AgentThoughtStream'
+
+type LocalChatAttachment = ChatAttachment & {
+  localId: string
+  file?: File
+  uploadProgress: number
+  uploadStatus: 'queued' | 'uploading' | 'uploaded' | 'failed'
+  localPreviewUrl?: string
+  error?: string
+}
 
 type AgentChatPanelProps = {
   source?: string
@@ -362,6 +372,58 @@ function AgentRunTraceBlock({
   )
 }
 
+function AuthenticatedImage({
+  documentId,
+  alt,
+  className,
+  fallbackText,
+}: {
+  documentId: number
+  alt: string
+  className?: string
+  fallbackText?: string
+}) {
+  const [blobUrl, setBlobUrl] = useState<string | null>(null)
+  const [error, setError] = useState(false)
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setError(false)
+
+    fetchDocumentBlobUrl(documentId)
+      .then((url) => {
+        if (!cancelled) {
+          setBlobUrl(url)
+          setLoading(false)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setError(true)
+          setLoading(false)
+        }
+      })
+
+    return () => {
+      cancelled = true
+      if (blobUrl) URL.revokeObjectURL(blobUrl)
+    }
+  }, [documentId])
+
+  if (loading) {
+    return <div className={`${className || ''} authenticated-image-placeholder`}>⏳</div>
+  }
+  if (error) {
+    return <div className={`${className || ''} authenticated-image-error`}>{fallbackText || alt || '图片加载失败'}</div>
+  }
+  if (blobUrl) {
+    return <img src={blobUrl} alt={alt} className={className} />
+  }
+  return null
+}
+
 function AgentMessageItem({
   message,
   locale,
@@ -377,10 +439,48 @@ function AgentMessageItem({
 }) {
   const visibleContent = getUserVisibleMessageContent(message)
 
+  const messageAttachments: ChatAttachment[] =
+    message.attachments ||
+    ((message.metadata as UnknownRecord)?.attachments as ChatAttachment[]) ||
+    []
+
   if (message.role === 'user') {
     return (
       <article className="chat-message user">
-        <div className="message-bubble">{visibleContent || message.content}</div>
+        <div className="message-bubble">
+          {(visibleContent || message.content) || null}
+          {messageAttachments.length > 0 ? (
+            <div className="message-attachments">
+              {messageAttachments.map((item) => (
+                <a
+                  key={item.document_id}
+                  className={
+                    item.kind === 'image'
+                      ? 'message-attachment image'
+                      : 'message-attachment file'
+                  }
+                  href={toApiUrl(item.preview_url)}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {item.kind === 'image' ? (
+                    <AuthenticatedImage
+                      documentId={item.document_id}
+                      alt={item.filename}
+                      className="message-attachment-image"
+                      fallbackText={item.filename}
+                    />
+                  ) : (
+                    <div className="message-attachment-file">
+                      <span className="message-attachment-file-icon">📄</span>
+                      <span className="message-attachment-file-name">{item.filename}</span>
+                    </div>
+                  )}
+                </a>
+              ))}
+            </div>
+          ) : null}
+        </div>
       </article>
     )
   }
@@ -424,8 +524,161 @@ export function AgentChatPanel({
   const [running, setRunning] = useState(false)
   const [error, setError] = useState('')
 
+  const [attachments, setAttachments] = useState<LocalChatAttachment[]>([])
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const [dragActive, setDragActive] = useState(false)
+  const lastPasteAtRef = useRef(0)
+  const [isComposing, setIsComposing] = useState(false)
+
   const hasConversation = messages.length > 0 || running || Boolean(activeConversationId) || Boolean(error)
   const selectedFeedTitle = String(pageContext.selected_feed_card_title || '')
+
+  // ── attachment helpers ──
+  const buildScreenshotFilename = (mimeType: string) => {
+    const now = new Date()
+    const pad = (value: number) => String(value).padStart(2, '0')
+    const ext = mimeType === 'image/jpeg' ? 'jpg' : mimeType === 'image/webp' ? 'webp' : 'png'
+    return [
+      'screenshot',
+      now.getFullYear(),
+      pad(now.getMonth() + 1),
+      pad(now.getDate()),
+      `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`,
+    ].join('-') + `.${ext}`
+  }
+
+  const removeAttachment = (localId: string) => {
+    setAttachments((prev) => {
+      const target = prev.find((item) => item.localId === localId)
+      if (target?.localPreviewUrl) {
+        URL.revokeObjectURL(target.localPreviewUrl)
+      }
+      return prev.filter((item) => item.localId !== localId)
+    })
+  }
+
+  const handleFilesSelected = async (files: File[]) => {
+    for (const file of files) {
+      const localId = crypto.randomUUID()
+      const isImage = file.type.startsWith('image/')
+      const localPreviewUrl = isImage ? URL.createObjectURL(file) : undefined
+
+      const initialAttachment: LocalChatAttachment = {
+        localId,
+        file,
+        document_id: -1,
+        filename: file.name,
+        file_type: file.name.split('.').pop() || '',
+        mime_type: file.type,
+        kind: isImage ? 'image' : 'document',
+        size: file.size,
+        preview_url: localPreviewUrl,
+        localPreviewUrl,
+        uploadProgress: 0,
+        uploadStatus: 'uploading',
+        status: 'uploading',
+      }
+
+      setAttachments((prev) => [...prev, initialAttachment])
+
+      uploadChatAttachment(file, (progress) => {
+        setAttachments((prev) =>
+          prev.map((item) =>
+            item.localId === localId ? { ...item, uploadProgress: progress } : item,
+          ),
+        )
+      })
+        .then((uploaded) => {
+          setAttachments((prev) =>
+            prev.map((item) =>
+              item.localId === localId
+                ? {
+                    ...item,
+                    ...uploaded,
+                    localId,
+                    file: item.file,
+                    localPreviewUrl: item.localPreviewUrl,
+                    uploadProgress: 100,
+                    uploadStatus: 'uploaded',
+                    status: 'uploaded',
+                  }
+                : item,
+            ),
+          )
+        })
+        .catch((error: unknown) => {
+          setAttachments((prev) =>
+            prev.map((item) =>
+              item.localId === localId
+                ? {
+                    ...item,
+                    uploadStatus: 'failed',
+                    status: 'failed',
+                    error: error instanceof Error ? error.message : '上传失败',
+                  }
+                : item,
+            ),
+          )
+        })
+    }
+  }
+
+  const handlePaste = (event: React.ClipboardEvent<HTMLFormElement | HTMLTextAreaElement>) => {
+    const now = Date.now()
+    if (now - lastPasteAtRef.current < 100) return
+
+    const clipboardItems = Array.from(event.clipboardData?.items || [])
+    const imageFiles: File[] = []
+
+    for (const item of clipboardItems) {
+      if (!item.type.startsWith('image/')) continue
+      const blob = item.getAsFile()
+      if (!blob) continue
+
+      const file = new File([blob], buildScreenshotFilename(item.type), {
+        type: item.type || 'image/png',
+        lastModified: now,
+      })
+      imageFiles.push(file)
+    }
+
+    if (imageFiles.length > 0) {
+      lastPasteAtRef.current = now
+      event.preventDefault()
+      void handleFilesSelected(imageFiles)
+    }
+  }
+
+  const handleComposerKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== 'Enter') return
+
+    if (event.shiftKey) {
+      // Let Shift+Enter insert newline (default behavior)
+      return
+    }
+
+    // Don't send while IME is composing
+    if (isComposing || (event.nativeEvent as KeyboardEvent & { isComposing?: boolean }).isComposing) {
+      return
+    }
+
+    if (!canSend) {
+      event.preventDefault()
+      return
+    }
+
+    event.preventDefault()
+    event.currentTarget.form?.requestSubmit()
+  }
+
+  // cleanup object URLs on unmount
+  useEffect(() => {
+    return () => {
+      attachments.forEach((item) => {
+        if (item.localPreviewUrl) URL.revokeObjectURL(item.localPreviewUrl)
+      })
+    }
+  }, [])
 
   useEffect(() => {
     const pendingConversationId = sessionStorage.getItem('agentOpenConversationId')
@@ -506,22 +759,44 @@ export function AgentChatPanel({
   async function submit(event: FormEvent) {
     event.preventDefault()
     const input = userInput.trim()
-    if (!input || running) return
+    const uploadedAttachments = attachments.filter(
+      (item) => item.uploadStatus === 'uploaded' && item.document_id > 0,
+    )
+    const hasUploading = attachments.some((item) => item.uploadStatus === 'uploading')
+    if ((!input && uploadedAttachments.length === 0) || running || hasUploading) return
 
     streamRef.current?.close()
     setUserInput('')
+    setAttachments([])
     setError('')
     setRunning(true)
+
+    const attachmentIds = uploadedAttachments.map((item) => item.document_id)
+    const attachmentSnapshot: ChatAttachment[] = uploadedAttachments.map((item) => ({
+      document_id: item.document_id,
+      filename: item.filename,
+      file_type: item.file_type,
+      mime_type: item.mime_type,
+      kind: item.kind,
+      size: item.size,
+      preview_url: item.preview_url,
+      status: item.status,
+      ingest_status: item.ingest_status,
+    }))
+
+    const effectiveInput = input || (uploadedAttachments.length > 0 ? '请分析用户上传的文件。' : '')
 
     const now = Date.now()
     const localConversationId = activeConversationId
     const localUser: UiMessage = {
       message_id: `local-user-${now}`,
       role: 'user',
-      content: input,
+      content: effectiveInput,
       conversation_id: localConversationId,
       status: 'completed',
       local_id: `local-user-${now}`,
+      attachments: attachmentSnapshot,
+      metadata: { attachments: attachmentSnapshot },
     }
     const localAssistant: UiMessage = {
       message_id: `local-assistant-${now}`,
@@ -539,14 +814,15 @@ export function AgentChatPanel({
 
     streamRef.current = agent.createRunLiveStream(
       {
-        user_input: input,
-        input,
+        user_input: effectiveInput,
+        input: effectiveInput,
         conversation_id: activeConversationId || undefined,
         source,
         page_context: pageContext,
         auto_skill: true,
         use_existing_skills: true,
         create_skill_draft_if_reusable: true,
+        attachment_ids: attachmentIds,
       },
       {
         onMessage: (message) => {
@@ -735,20 +1011,148 @@ export function AgentChatPanel({
     )
   }
 
+  const uploadedAttachmentsForSend = attachments.filter(
+    (item) => item.uploadStatus === 'uploaded' && item.document_id > 0,
+  )
+  const hasUploading = attachments.some((item) => item.uploadStatus === 'uploading')
+  const hasText = userInput.trim().length > 0
+  const hasUploadedForSend = uploadedAttachmentsForSend.length > 0
+  const hasFailedOnly =
+    attachments.length > 0 && uploadedAttachmentsForSend.length === 0 && !hasText
+
+  const canSend =
+    !running && !hasUploading && (hasText || hasUploadedForSend) && !hasFailedOnly
+
   const composer = (
-    <form className={hasConversation ? 'codex-composer docked' : 'codex-composer centered'} onSubmit={submit}>
+    <form
+      className={hasConversation ? 'codex-composer docked' : 'codex-composer centered'}
+      onSubmit={submit}
+      onPaste={handlePaste}
+      onDragOver={(event) => {
+        event.preventDefault()
+        setDragActive(true)
+      }}
+      onDragLeave={() => setDragActive(false)}
+      onDrop={(event) => {
+        event.preventDefault()
+        setDragActive(false)
+        const files = Array.from(event.dataTransfer.files || [])
+        void handleFilesSelected(files)
+      }}
+    >
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        hidden
+        accept="image/*,.pdf,.docx,.txt,.md,.csv,.xlsx,.json,.html,.htm"
+        onChange={(event) => {
+          const files = Array.from(event.target.files || [])
+          void handleFilesSelected(files)
+          event.target.value = ''
+        }}
+      />
+
       {selectedFeedTitle ? <div className="selected-context-pill">{text(locale, `${zh.using}${selectedFeedTitle}`, `Using: ${selectedFeedTitle}`)}</div> : null}
-      <textarea value={userInput} onChange={(event) => setUserInput(event.target.value)} placeholder={placeholder} />
+
+      {attachments.length > 0 ? (
+        <div className="composer-attachment-strip">
+          {attachments.map((item) => (
+            <div
+              key={item.localId}
+              className={
+                item.kind === 'image'
+                  ? 'composer-attachment-card image'
+                  : 'composer-attachment-card file'
+              }
+            >
+              {item.kind === 'image' ? (
+                item.localPreviewUrl ? (
+                  <img
+                    src={item.localPreviewUrl}
+                    alt={item.filename}
+                    className="composer-attachment-thumb"
+                  />
+                ) : item.document_id > 0 ? (
+                  <AuthenticatedImage
+                    documentId={item.document_id}
+                    alt={item.filename}
+                    className="composer-attachment-thumb"
+                    fallbackText={item.filename}
+                  />
+                ) : (
+                  <div className="composer-attachment-file-icon">🖼</div>
+                )
+              ) : (
+                <div className="composer-attachment-file-icon">📄</div>
+              )}
+
+              <div className="composer-attachment-info">
+                <div className="composer-attachment-name">{item.filename}</div>
+                <div className="composer-attachment-sub">
+                  {item.uploadStatus === 'uploading'
+                    ? `${item.uploadProgress}%`
+                    : item.uploadStatus === 'failed'
+                      ? item.error || '上传失败'
+                      : '已上传'}
+                </div>
+
+                {item.uploadStatus === 'uploading' || item.uploadStatus === 'uploaded' ? (
+                  <div className="composer-attachment-progress">
+                    <div
+                      className="composer-attachment-progress-bar"
+                      style={{ width: `${item.uploadProgress}%` }}
+                    />
+                  </div>
+                ) : item.uploadStatus === 'failed' ? (
+                  <div className="composer-attachment-error">{item.error || '上传失败'}</div>
+                ) : null}
+              </div>
+
+              <button
+                type="button"
+                className="composer-attachment-remove"
+                onClick={() => removeAttachment(item.localId)}
+                aria-label="Remove attachment"
+              >
+                ×
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {dragActive ? <div className="composer-drop-hint">松开以上传文件</div> : null}
+
+      <textarea
+        value={userInput}
+        onChange={(event) => setUserInput(event.target.value)}
+        onPaste={handlePaste}
+        onCompositionStart={() => setIsComposing(true)}
+        onCompositionEnd={() => setIsComposing(false)}
+        onKeyDown={handleComposerKeyDown}
+        placeholder={placeholder}
+      />
+
       <div className="composer-footer">
         <div className="composer-tools">
-          <button type="button" aria-label={text(locale, zh.tools, 'Agent tools')}>
+          <button
+            type="button"
+            aria-label="Upload files"
+            onClick={() => fileInputRef.current?.click()}
+          >
             +
           </button>
           <span>{text(locale, zh.research, 'Research')}</span>
           <span>{text(locale, zh.artifact, 'Artifact')}</span>
           <span>{text(locale, zh.skillDraft, 'Skill')}</span>
         </div>
-        <button className={userInput.trim() ? 'send-button active' : 'send-button'} type="submit" disabled={!userInput.trim() || running} aria-label={text(locale, zh.send, 'Send')}>
+        <button
+          className={canSend ? 'send-button active' : 'send-button'}
+          type="submit"
+          disabled={!canSend}
+          aria-label={text(locale, zh.send, 'Send')}
+        >
           ↑
         </button>
       </div>

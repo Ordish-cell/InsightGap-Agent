@@ -24,4 +24,5 @@ class AgentRunRequest(BaseModel):
     write_memory: bool = True
     create_skill_draft: bool = True
     top_k: int = Field(default=5, ge=1, le=20)
+    attachment_ids: list[int] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)

@@ -1362,6 +1362,19 @@ class RuntimeNodes:
         # Append specialized agent results only when they carry new information
         # not already covered by GSSC (rag_agent runs AFTER context_builder).
         extra_blocks: list[str] = []
+        attachment_context = (
+            (state.get("context") or {}).get("page_context", {}).get("attachment_context", "")
+            or (state.get("page_context") or {}).get("attachment_context", "")
+        )
+        if attachment_context:
+            extra_blocks.append(
+                "[用户上传附件上下文]\n"
+                "以下内容来自用户在当前对话中上传的图片或文件。\n"
+                "这些内容应作为回答当前问题的主要依据。\n"
+                "如果这里包含图片理解结果，请直接基于图片理解结果回答。\n"
+                "不要仅因为外部搜索证据不足就拒绝回答。\n\n"
+                f"{attachment_context}"
+            )
         if rag_result.get("answer"):
             extra_blocks.append(
                 f"[RAG Agent Result]\n{rag_result.get('answer', '')}\n"

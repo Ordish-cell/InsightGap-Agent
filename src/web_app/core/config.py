@@ -132,6 +132,12 @@ class Settings(BaseSettings):
     agent_langgraph_status_enabled: bool = True
     agent_langgraph_status_max_steps: int = 12
     agent_chat_real_messages_enabled: bool = True
+    # Qwen model tier configuration
+    qwen_fast_model: str = "qwen3.6-flash"
+    qwen_balanced_model: str = "qwen3.6-plus"
+    qwen_advanced_model: str = "qwen3.6-max-preview"
+    qwen_vision_model: str = "qwen3.6-plus"
+    max_chat_upload_bytes: int = 20 * 1024 * 1024
 
     model_config = SettingsConfigDict(
         env_file=".env",

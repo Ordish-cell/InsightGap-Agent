@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from src.web_app.db.session import get_db
@@ -86,3 +87,20 @@ def rag_stats(user_id: int = Depends(get_current_user_id), db: Session = Depends
         return ok(rag_service.stats(db, user_id))
     except Exception as exc:
         return fail("RAG_STATS_FAILED", str(exc))
+
+
+@router.post("/documents/chat-upload")
+def chat_upload(file: UploadFile, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    try:
+        return ok(document_service.upload_chat_attachment(db, user_id, file))
+    except ValueError as exc:
+        return fail("CHAT_UPLOAD_FAILED", str(exc))
+
+
+@router.get("/documents/{document_id}/file")
+def get_document_file(document_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    try:
+        document = document_service.get_chat_attachment(db, user_id, document_id)
+    except ValueError as exc:
+        return fail("DOCUMENT_NOT_FOUND", str(exc))
+    return FileResponse(document.file_path, media_type=document.metadata_json.get("mime_type", "application/octet-stream") if document.metadata_json else "application/octet-stream", filename=document.filename)

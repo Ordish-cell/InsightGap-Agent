@@ -17,6 +17,9 @@ from src.web_app.db.repositories.agent_repository import (
     AgentRunRepository,
     AgentStepRepository,
 )
+from src.web_app.services.document_service import document_service
+from src.web_app.rag.vector_store import QdrantVectorStore
+from src.web_app.rag.embeddings import embed_text
 
 
 GENERIC_COMPLETED_ANSWERS = {
@@ -26,6 +29,201 @@ GENERIC_COMPLETED_ANSWERS = {
     "agent run completed",
     "agent runtime completed",
 }
+
+
+def load_chat_attachments(db: Session, user_id: int, attachment_ids: list[int]) -> list[dict[str, Any]]:
+    if not attachment_ids:
+        return []
+    from src.web_app.db.repositories.document_repository import DocumentRepository
+
+    repo = DocumentRepository(db)
+    attachments: list[dict[str, Any]] = []
+    for doc_id in attachment_ids:
+        doc = repo.get_by_id_for_user(user_id, doc_id)
+        if not doc:
+            raise ValueError(f"Attachment document not found: {doc_id}")
+        meta = doc.metadata_json or {}
+        attachments.append({
+            "document_id": doc.id,
+            "filename": doc.filename,
+            "file_type": doc.file_type,
+            "mime_type": meta.get("mime_type", ""),
+            "kind": meta.get("kind", "document"),
+            "size": meta.get("size", 0),
+            "preview_url": f"/api/v1/documents/{doc.id}/file",
+            "ingest_status": meta.get("ingest_status", "pending"),
+            "status": doc.status,
+            "file_path": doc.file_path,
+            "source_type": doc.source_type,
+        })
+    return attachments
+
+
+def _attachment_snapshot(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "document_id": a["document_id"],
+            "filename": a["filename"],
+            "file_type": a["file_type"],
+            "mime_type": a.get("mime_type", ""),
+            "kind": a.get("kind", "document"),
+            "size": a.get("size", 0),
+            "preview_url": a.get("preview_url", ""),
+            "ingest_status": a.get("ingest_status", "pending"),
+            "status": a.get("status", ""),
+        }
+        for a in attachments
+    ]
+
+
+IMAGE_DIRECT_KEYWORDS = [
+    "分析图片", "分析这张图", "分析这个图", "分析这个图片", "分析一下图片",
+    "分析一下这张图", "看图", "看一下图", "看一下这张图", "看看这张图",
+    "这张图", "这个图", "这个图片", "图片里", "图里", "图中",
+    "截图里", "截图中", "识别图片", "识别这张图", "图片内容", "图像内容",
+    "描述图片", "描述这张图", "解释图片", "解释这张图",
+    "帮我看看", "帮我分析",
+    "what is in this image", "analyze this image", "describe this image",
+    "what's in this image", "look at this image",
+]
+
+DOCUMENT_CONTEXT_KEYWORDS = [
+    "文件", "文档", "pdf", "PDF", "报告", "表格", "excel", "Excel",
+    "结合", "对比", "比较", "总结文件", "总结文档",
+]
+
+
+def _has_document_attachments(attachments: list[dict[str, Any]]) -> bool:
+    return any(item.get("kind") == "document" for item in attachments)
+
+
+def _is_direct_image_question(user_input: str, attachments: list[dict[str, Any]]) -> bool:
+    has_image = any(item.get("kind") == "image" for item in attachments)
+    if not has_image:
+        return False
+
+    text = (user_input or "").strip()
+    lowered = text.lower()
+
+    # If user explicitly mentions documents, don't short-circuit
+    if _has_document_attachments(attachments) and any(kw in lowered for kw in DOCUMENT_CONTEXT_KEYWORDS):
+        return False
+
+    if not text:
+        return True
+
+    if any(keyword in lowered for keyword in IMAGE_DIRECT_KEYWORDS):
+        return True
+
+    # Short user input with images → likely asking about the image itself
+    if len(text) <= 30:
+        return True
+
+    return False
+
+
+def _clean_direct_image_answer(text: str) -> str:
+    skip_prefixes = (
+        "[Image Understanding]",
+        "Image:",
+        "Description:",
+        "Visible text",
+        "OCR:",
+        "Relevant details",
+    )
+    lines = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            lines.append("")
+            continue
+        if any(stripped.startswith(prefix) for prefix in skip_prefixes):
+            continue
+        lines.append(line)
+    cleaned = "\n".join(lines).strip()
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+    return cleaned or text
+
+
+async def _build_attachment_context(attachments: list[dict[str, Any]], user_input: str, db: Session, user_id: int) -> str:
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    if not attachments:
+        return ""
+
+    image_attachments = [a for a in attachments if a.get("kind") == "image"]
+    document_attachments = [a for a in attachments if a.get("kind") == "document"]
+    _logger.info("attachment context: image_count=%s doc_count=%s", len(image_attachments), len(document_attachments))
+
+    parts: list[str] = []
+
+    if image_attachments:
+        try:
+            from src.web_app.services.qwen_multimodal_service import qwen_multimodal_service
+            from src.web_app.core.config import settings as app_settings
+
+            prompt = user_input.strip() if user_input.strip() else "请分析用户上传的图片。"
+            images = [
+                {"file_path": a["file_path"], "mime_type": a.get("mime_type", "image/png"), "filename": a["filename"]}
+                for a in image_attachments
+                if a.get("file_path")
+            ]
+            if images:
+                vision_model = getattr(app_settings, "qwen_vision_model", "qwen3.6-plus")
+                _logger.info("calling qwen vision model=%s image_count=%s", vision_model, len(images))
+                image_context = await qwen_multimodal_service.analyze_images(prompt, images)
+                _logger.info("image context received length=%s", len(image_context))
+                parts.append(image_context)
+            else:
+                _logger.warning("image attachments had no valid file_path, skipping vision analysis")
+        except Exception as exc:
+            _logger.exception("Image analysis failed during attachment context build")
+            parts.append(
+                "[Image Understanding Warning]\n"
+                "图片理解失败，模型没有成功读取用户上传的图片。\n"
+                f"错误信息：{exc}\n"
+            )
+
+    if document_attachments:
+        doc_ids = [a["document_id"] for a in document_attachments]
+        for a in document_attachments:
+            if a.get("ingest_status") != "completed":
+                try:
+                    result = document_service.ingest_chat_document(db, user_id, a["document_id"])
+                    a["ingest_status"] = result.get("status", "failed")
+                except Exception:
+                    a["ingest_status"] = "failed"
+        try:
+            query_vector = embed_text(user_input)
+            results = QdrantVectorStore().search(
+                user_id=user_id,
+                query_vector=query_vector,
+                top_k=min(10, len(doc_ids) * 3),
+                min_score=0.1,
+                document_ids=doc_ids,
+            )
+            if results:
+                doc_lines: list[str] = ["[Attached Document Context]"]
+                doc_results: dict[str, list[dict[str, Any]]] = {}
+                for r in results:
+                    did = str(r.get("document_id", ""))
+                    doc_results.setdefault(did, []).append(r)
+                for did, chunks in doc_results.items():
+                    for a in document_attachments:
+                        if str(a["document_id"]) == did:
+                            doc_lines.append(f"\nDocument: {a['filename']}")
+                            break
+                    for i, chunk in enumerate(chunks[:5], 1):
+                        content = chunk.get("content", chunk.get("content_preview", ""))
+                        doc_lines.append(f"Chunk {i}:\n{content[:2000]}")
+                parts.append("\n".join(doc_lines))
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Document RAG retrieval failed during attachment context build")
+
+    return "\n\n".join(parts)
 
 
 async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], stream_queue: asyncio.Queue | None = None) -> dict[str, Any]:
@@ -55,6 +253,15 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         user_input=user_input,
         graph_state={"source": payload.get("source", "agent_page"), "page_context": page_context, "thread_id": thread_id, "conversation_id": conversation_id},
     )
+    # Load and process attachments
+    attachment_ids: list[int] = [int(aid) for aid in (payload.get("attachment_ids") or []) if aid]
+    import logging
+    _agent_logger = logging.getLogger(__name__)
+    _agent_logger.info("agent attachment_ids=%s", attachment_ids)
+    attachments_data = load_chat_attachments(db, user_id, attachment_ids) if attachment_ids else []
+    _agent_logger.info("loaded chat attachments count=%s kinds=%s", len(attachments_data), [a.get("kind") for a in attachments_data])
+    attachment_snapshot = _attachment_snapshot(attachments_data)
+
     user_message = message_repo.create(
         message_id=str(uuid4()),
         conversation_id=conversation_id,
@@ -64,7 +271,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         role="user",
         content=user_input,
         status="completed",
-        metadata_json={"source": payload.get("source", "agent_page"), "page_context": page_context},
+        metadata_json={"source": payload.get("source", "agent_page"), "page_context": page_context, "attachments": attachment_snapshot},
     )
     assistant_message = message_repo.create(
         message_id=str(uuid4()),
@@ -92,8 +299,136 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         run_id=run.id,
         thread_id=thread_id,
     )
+
+    # ── Direct image analysis fast path ──
+    is_direct_image = _is_direct_image_question(user_input, attachments_data)
+    _agent_logger.info("direct image route check: is_direct=%s image_count=%s has_doc=%s input_len=%s",
+                       is_direct_image,
+                       sum(1 for a in attachments_data if a.get("kind") == "image"),
+                       _has_document_attachments(attachments_data),
+                       len(user_input.strip()))
+
+    if is_direct_image:
+        _agent_logger.info("direct image route matched conversation_id=%s image_count=%s",
+                           conversation_id,
+                           sum(1 for a in attachments_data if a.get("kind") == "image"))
+        image_attachments = [a for a in attachments_data if a.get("kind") == "image"]
+        effective_prompt = user_input.strip() or "请分析用户上传的图片。"
+
+        from src.web_app.services.qwen_multimodal_service import qwen_multimodal_service
+        from src.web_app.core.config import settings as app_settings
+
+        vision_model = getattr(app_settings, "qwen_vision_model", "qwen3.6-plus")
+        _agent_logger.info("direct image answer model=%s", vision_model)
+
+        images = [
+            {"file_path": a["file_path"], "mime_type": a.get("mime_type", "image/png"), "filename": a["filename"]}
+            for a in image_attachments if a.get("file_path")
+        ]
+
+        try:
+            answer = await qwen_multimodal_service.answer_image_question(
+                prompt=effective_prompt,
+                images=images,
+                model=vision_model,
+            )
+            _agent_logger.info("direct image answer length=%s", len(answer or ""))
+        except AttributeError:
+            _agent_logger.warning("answer_image_question not available, falling back to analyze_images")
+            try:
+                raw = await qwen_multimodal_service.analyze_images(
+                    prompt=effective_prompt,
+                    images=images,
+                    model=vision_model,
+                )
+                answer = _clean_direct_image_answer(raw)
+                _agent_logger.info("direct image answer (cleaned fallback) length=%s", len(answer or ""))
+            except Exception as fallback_exc:
+                _agent_logger.exception("direct image understanding failed (fallback)")
+                answer = f"我没能成功读取这张图片。错误信息：{fallback_exc}"
+        except Exception as exc:
+            _agent_logger.exception("direct image understanding failed")
+            answer = f"我没能成功读取这张图片。可能是图片过大、格式不受支持，或视觉模型调用失败。\n\n错误信息：{exc}"
+
+        elapsed_ms = max(0, int((datetime.now() - started_at).total_seconds() * 1000))
+
+        # Persist assistant message
+        message_repo.update(
+            assistant_message,
+            content=answer,
+            status="completed",
+            elapsed_ms=elapsed_ms,
+            metadata_json={
+                "run_id": run.id,
+                "direct_image_answer": True,
+                "model": vision_model,
+                "attachments": attachment_snapshot,
+                "visible_thoughts": [],
+            },
+        )
+
+        # Update run
+        run_repo.update(
+            run,
+            status="completed",
+            result_summary=answer,
+            final_answer=answer,
+            final_response={"answer": answer, "direct_image_answer": True},
+            langgraphstatus_json={
+                "run_id": run.id,
+                "thread_id": thread_id,
+                "conversation_id": conversation_id,
+                "status": "completed",
+                "phase": "completed",
+                "elapsed_ms": elapsed_ms,
+                "steps": [],
+                "visible_thoughts": [],
+            },
+            elapsed_ms=elapsed_ms,
+            completed_at=datetime.now(),
+        )
+
+        # Touch conversation
+        conversation_repo.touch(
+            conversation,
+            preview=answer,
+            last_run_id=run.id,
+            selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
+            selected_feed_card_title=selected_feed_card_title or None,
+        )
+
+        # Emit SSE events
+        await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer)
+        record_event(db, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)
+        record_event(db, run.id, "run_completed", {"status": "completed", "answer": answer}, user_id=user_id, thread_id=thread_id)
+        _queue_stream_event(stream_queue, "final_response_created", {"answer": answer, "answer_len": len(answer)}, run_id=run.id, thread_id=thread_id)
+
+        state_for_response = {
+            "conversation_id": conversation_id,
+            "thread_id": thread_id,
+            "status": "completed",
+            "answer": answer,
+            "final_answer": answer,
+            "final_payload": {"answer": answer, "direct_image_answer": True},
+            "visible_thoughts": [],
+            "langgraphstatus": {"status": "completed", "steps": [], "elapsed_ms": elapsed_ms},
+        }
+        response = _run_response(run.id, state_for_response, conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=elapsed_ms)
+        _queue_stream_event(stream_queue, "run_completed", {"status": "completed", "answer": answer, "response": response}, run_id=run.id, thread_id=thread_id)
+        return response
+
     try:
-        state = await AgentRuntime(db, payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue, "_answer_started_emitted": False, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
+        # Build attachment context and inject into payload
+        attachment_context = await _build_attachment_context(attachments_data, user_input, db, user_id)
+        _agent_logger.info("final attachment_context length=%s has_context=%s", len(attachment_context or ""), bool(attachment_context))
+        enriched_payload = dict(payload)
+        if attachment_context:
+            enriched_payload["attachment_context"] = attachment_context
+            page_context = dict(page_context)
+            page_context["attachment_context"] = attachment_context
+            enriched_payload["page_context"] = page_context
+
+        state = await AgentRuntime(db, enriched_payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue, "_answer_started_emitted": False, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
     except Exception as exc:
         state = {
             "user_id": user_id,
@@ -604,6 +939,7 @@ def _conversation_response(item, messages: list[Any] | None = None) -> dict[str,
 def _message_response(item) -> dict[str, Any]:
     if not item:
         return {}
+    meta = item.metadata_json or {}
     return {
         "id": item.id,
         "message_id": item.message_id,
@@ -617,7 +953,8 @@ def _message_response(item) -> dict[str, Any]:
         "langgraphstatus": item.langgraphstatus_json or {},
         "steps": item.steps_json or [],
         "error_message": item.error_message,
-        "metadata": item.metadata_json or {},
+        "metadata": meta,
+        "attachments": meta.get("attachments", []),
         "created_at": item.created_at.isoformat() if item.created_at else "",
         "updated_at": item.updated_at.isoformat() if item.updated_at else "",
     }

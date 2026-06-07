@@ -167,7 +167,25 @@ export interface AgentChatMessage {
   metadata?: UnknownRecord
   created_at?: string
   updated_at?: string
+  attachments?: ChatAttachment[]
   [key: string]: unknown
+}
+
+export type ChatAttachmentKind = 'image' | 'document' | 'audio' | 'video' | 'file'
+
+export type ChatAttachmentStatus = 'queued' | 'uploading' | 'uploaded' | 'failed'
+
+export interface ChatAttachment {
+  document_id: number
+  filename: string
+  file_type: string
+  mime_type?: string
+  kind: ChatAttachmentKind
+  size?: number
+  preview_url?: string
+  status?: string
+  ingest_status?: string
+  error?: string
 }
 
 export interface AgentRunStep {
