@@ -10,6 +10,9 @@ export const homeCards = async () => {
 }
 export const getCard = async (cardId: number | string) => normalizeFeedCard(await apiRequest<FeedCard>(`/feed/cards/${cardId}`))
 export const feedback = (cardId: number | string, payload: Record<string, unknown>) => apiRequest<unknown>(`/feed/cards/${cardId}/feedback`, { method: 'POST', body: payload })
-export const startResearch = (cardId: number | string) => apiRequest<unknown>(`/feed/cards/${cardId}/research`, { method: 'POST', body: {} })
+export const startResearch = async (cardId: number | string): Promise<{ id: string }> => {
+  const result = await apiRequest<{ id?: string }>(`/feed/cards/${cardId}/research`, { method: 'POST', body: {} })
+  return { id: String(result?.id || '') }
+}
 export const sources = () => apiRequest<unknown>('/feed/sources')
 export const stats = () => apiRequest<unknown>('/feed/stats')

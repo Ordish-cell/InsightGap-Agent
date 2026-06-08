@@ -38,6 +38,24 @@ class Settings(BaseSettings):
     embedding_provider: str = "openai"
     embedding_model: str = ""
     open_deep_research_mode: str = "adapter"
+    # ── Open Deep Research (upstream) ──────────────────────────────
+    enable_open_deep_research: bool = True
+    odr_search_api: str = "tavily"
+    odr_allow_clarification: bool = False
+    odr_max_concurrent_research_units: int = 2
+    odr_max_researcher_iterations: int = 2
+    odr_max_react_tool_calls: int = 4
+    odr_timeout_seconds: int = 600
+    odr_research_model: str = "openai:qwen-plus"
+    odr_summarization_model: str = "openai:qwen-plus"
+    odr_compression_model: str = "openai:qwen-plus"
+    odr_final_report_model: str = "openai:qwen-plus"
+    odr_research_model_max_tokens: int = 10000
+    odr_summarization_model_max_tokens: int = 8192
+    odr_compression_model_max_tokens: int = 8192
+    odr_final_report_model_max_tokens: int = 10000
+    odr_max_content_length: int = 50000
+    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     artifact_storage_path: str = "uploads/artifacts"
     cors_origins_raw: str = Field("http://localhost:5173,http://127.0.0.1:5173", validation_alias="CORS_ORIGINS")
     feed_refresh_max_items: int = 50
@@ -91,18 +109,18 @@ class Settings(BaseSettings):
     aliyun_bailian_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     agent_llm_base_url: str = ""
     agent_llm_api_key: str = ""
-    agent_fast_model: str = "qwen3.6-flash"
+    agent_fast_model: str = "qwen3.6-max-preview"
     agent_balanced_model: str = "qwen3.6-max-preview"
     agent_strong_model: str = "qwen3.7-plus"
     agent_llm_model: str = "qwen3.6-plus"
-    agent_intent_model: str = "qwen3.6-flash"
-    agent_safety_model: str = "qwen3.6-flash"
+    agent_intent_model: str = "qwen3.6-max-preview"
+    agent_safety_model: str = "qwen3.6-max-preview"
     agent_planner_model: str = "qwen3.6-max-preview"
     agent_rag_model: str = "qwen3.6-max-preview"
     agent_research_model: str = "qwen3.7-plus"
     agent_artifact_model: str = "qwen3.6-plus"
-    agent_memory_model: str = "qwen3.6-flash"
-    agent_skill_model: str = "qwen3.6-flash"
+    agent_memory_model: str = "qwen3.6-max-preview"
+    agent_skill_model: str = "qwen3.6-max-preview"
     agent_final_model: str = "qwen3.6-plus"
     agent_embedding_provider: str = "aliyun"
     agent_embedding_model: str = "text-embedding-v4"
@@ -137,7 +155,7 @@ class Settings(BaseSettings):
     agent_langgraph_status_max_steps: int = 12
     agent_chat_real_messages_enabled: bool = True
     # Qwen model tier configuration
-    qwen_fast_model: str = "qwen3.6-flash"
+    qwen_fast_model: str = "qwen3.6-max-preview"
     qwen_balanced_model: str = "qwen3.6-plus"
     qwen_advanced_model: str = "qwen3.6-max-preview"
     qwen_vision_model: str = "qwen3.6-plus"

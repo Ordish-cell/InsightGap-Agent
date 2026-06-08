@@ -82,6 +82,20 @@ export interface FeedCard {
   [key: string]: unknown
 }
 
+export interface ResearchRunMetadata {
+  source?: string
+  engine?: string
+  used_fallback?: boolean | null
+  odr_enabled?: boolean
+  odr_error?: string | null
+  odr_error_type?: string | null
+  adapter?: string
+  depth?: string
+  feed_card_id?: number | null
+  card_snapshot?: UnknownRecord
+  [key: string]: unknown
+}
+
 export interface ResearchRun {
   id: string
   query?: string
@@ -93,10 +107,14 @@ export interface ResearchRun {
   risks?: UnknownRecord[]
   opportunities?: UnknownRecord[]
   suggested_actions?: UnknownRecord[]
+  sources?: UnknownRecord[]
   artifact_id?: number
   skill_draft_id?: number
   agent_run_id?: number
   feed_card_id?: number
+  error?: string
+  error_message?: string
+  metadata?: ResearchRunMetadata
   created_at?: string
   completed_at?: string
   [key: string]: unknown

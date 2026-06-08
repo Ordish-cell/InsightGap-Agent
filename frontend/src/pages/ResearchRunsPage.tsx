@@ -24,7 +24,7 @@ export function ResearchRunsPage() {
 
   async function submit(event: FormEvent) {
     event.preventDefault()
-    const run = await research.createRun({ query, depth: 'standard' })
+    const run = await research.createRun({ query, depth: 'standard', source: 'manual' })
     navigate(`/research/${run.id}`)
   }
 

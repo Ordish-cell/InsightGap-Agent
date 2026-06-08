@@ -31,11 +31,11 @@ def test_model_router_resolves_aliyun_models(monkeypatch):
     # Pin all model env vars to known values so the local .env file
     # (which may set AGENT_INTENT_MODEL=qwen-turbo etc.) does not
     # override the field defaults under test.
-    monkeypatch.setenv("AGENT_INTENT_MODEL", "qwen3.6-flash")
-    monkeypatch.setenv("AGENT_SAFETY_MODEL", "qwen3.6-flash")
-    monkeypatch.setenv("AGENT_MEMORY_MODEL", "qwen3.6-flash")
-    monkeypatch.setenv("AGENT_SKILL_MODEL", "qwen3.6-flash")
-    monkeypatch.setenv("AGENT_FAST_MODEL", "qwen3.6-flash")
+    monkeypatch.setenv("AGENT_INTENT_MODEL", "qwen3.6-max-preview")
+    monkeypatch.setenv("AGENT_SAFETY_MODEL", "qwen3.6-max-preview")
+    monkeypatch.setenv("AGENT_MEMORY_MODEL", "qwen3.6-max-preview")
+    monkeypatch.setenv("AGENT_SKILL_MODEL", "qwen3.6-max-preview")
+    monkeypatch.setenv("AGENT_FAST_MODEL", "qwen3.6-max-preview")
     monkeypatch.setenv("AGENT_PLANNER_MODEL", "qwen3.6-max-preview")
     monkeypatch.setenv("AGENT_RAG_MODEL", "qwen3.6-max-preview")
     monkeypatch.setenv("AGENT_BALANCED_MODEL", "qwen3.6-max-preview")
@@ -48,8 +48,8 @@ def test_model_router_resolves_aliyun_models(monkeypatch):
     monkeypatch.setenv("AGENT_EMBEDDING_MODEL", "text-embedding-v4")
     _clear_llm()
 
-    assert resolve_model_name("intent").model == "qwen3.6-flash"
-    assert resolve_model_name("safety").model == "qwen3.6-flash"
+    assert resolve_model_name("intent").model == "qwen3.6-max-preview"
+    assert resolve_model_name("safety").model == "qwen3.6-max-preview"
     assert resolve_model_name("planner").model == "qwen3.6-max-preview"
     assert resolve_model_name("research").model == "qwen3.7-plus"
     assert resolve_model_name("artifact").model == "qwen3.6-plus"

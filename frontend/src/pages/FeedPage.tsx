@@ -30,6 +30,7 @@ export function FeedPage() {
   const [stats, setStats] = useState<FeedStats | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const [researchingCardId, setResearchingCardId] = useState<number | null>(null)
 
   async function load() {
     setLoading(true)
@@ -50,8 +51,20 @@ export function FeedPage() {
   useEffect(() => { void load() }, [bucket, showAll])
 
   async function research(cardId: number) {
-    const result = await feed.startResearch(cardId) as { id?: string }
-    if (result?.id) navigate(`/research/${result.id}`)
+    if (researchingCardId) return
+    setResearchingCardId(cardId)
+    try {
+      const result = await feed.startResearch(cardId)
+      if (result?.id) {
+        navigate(`/research/${result.id}`)
+      } else {
+        throw new Error('研究任务创建成功但没有返回 run_id')
+      }
+    } catch (err) {
+      console.error('Deep research creation failed:', err)
+    } finally {
+      setResearchingCardId(null)
+    }
   }
 
   return (
@@ -73,7 +86,7 @@ export function FeedPage() {
             <article className="feed-item-card" key={card.id}>
               <div className="feed-item-top"><div className="row"><ScoreBadge score={card.final_score || 0} /><StatusPill value={card.exposure_bucket || card.relation_type} />{card.low_confidence ? <StatusPill value="低置信" /> : null}</div><span className="muted small">证据 {card.evidence?.length || 0} 条 · {sourceTypeLabel(card.source_type)} · {card.domain || '未标记域名'}</span></div>
               <div className="feed-item-body"><h2 title={card.original_title || card.title}>{card.title}</h2><p>{card.one_sentence_value || card.summary || '暂无摘要。'}</p><div className="info-two-col"><div className="soft-info-box"><strong>信息差</strong><span>{card.information_gap || '暂无信息差说明。'}</span></div><div className="soft-info-box muted-box"><strong>为什么与你有关</strong><span>{card.why_you || `当前归类为${relationLabel(card.exposure_bucket || card.relation_type)}，暂无更细画像原因。`}</span></div></div></div>
-              <div className="feed-item-actions"><Link className="button secondary" to={`/feed/${card.id}`}>详情</Link><button className="button" onClick={() => research(card.id)}>深度研究</button>{Object.entries(actionLabels).map(([action, label]) => <button className="button ghost" key={action} onClick={() => feed.feedback(card.id, { action })}>{label}</button>)}</div>
+              <div className="feed-item-actions"><Link className="button secondary" to={`/feed/${card.id}`}>详情</Link><button className="button" onClick={() => research(card.id)} disabled={researchingCardId === card.id}>{researchingCardId === card.id ? '研究中...' : '深度研究'}</button>{Object.entries(actionLabels).map(([action, label]) => <button className="button ghost" key={action} onClick={() => feed.feedback(card.id, { action })}>{label}</button>)}</div>
             </article>
           ))}
         </div>

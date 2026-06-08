@@ -55,6 +55,7 @@ export function HomePage() {
   const [feedError, setFeedError] = useState('')
   const [feedOpen, setFeedOpen] = useState(getInitialFeedOpen)
   const [selectedFeedCardId, setSelectedFeedCardId] = useState<number | null>(null)
+  const [researchingCardId, setResearchingCardId] = useState<number | null>(null)
 
   const homeFeeds = useMemo(() => pickHomeFeeds(cards), [cards])
   const selectedFeedCard = useMemo(
@@ -113,10 +114,20 @@ export function HomePage() {
   }, [feedOpen])
 
   async function startResearch(cardId: number) {
+    if (researchingCardId) return
+    setResearchingCardId(cardId)
     try {
-      const result = (await feed.startResearch(cardId)) as { id?: string }
-      if (result?.id) navigate(`/research/${result.id}`)
-    } catch { /* navigation will handle it */ }
+      const result = await feed.startResearch(cardId)
+      if (result?.id) {
+        navigate(`/research/${result.id}`)
+      } else {
+        throw new Error('研究任务创建成功但没有返回 run_id')
+      }
+    } catch (err) {
+      console.error('Deep research creation failed:', err)
+    } finally {
+      setResearchingCardId(null)
+    }
   }
 
   const isLoading = feedLoading
@@ -192,8 +203,8 @@ export function HomePage() {
                     <button className="light-mini-button" onClick={() => setSelectedFeedCardId(c.id as unknown as number)}>
                       带入对话
                     </button>
-                    <button className="dark-mini-button" onClick={() => startResearch(c.id as unknown as number)}>
-                      深度研究
+                    <button className="dark-mini-button" onClick={() => startResearch(c.id as unknown as number)} disabled={researchingCardId === (c.id as unknown as number)}>
+                      {researchingCardId === (c.id as unknown as number) ? '研究中...' : '深度研究'}
                     </button>
                     <Link className="light-mini-button" to={`/feed/${c.id}`}>
                       详情
