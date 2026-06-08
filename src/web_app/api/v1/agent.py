@@ -44,7 +44,15 @@ async def create_run_stream(payload: AgentRunRequest, user_id: int = Depends(get
             for chunk in to_sse([event]):
                 yield chunk
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/conversations")
@@ -127,7 +135,15 @@ def stream_run(run_id: int, user_id: int = Depends(get_current_user_id), db: Ses
         yield from to_sse([{"event": "status", "data": {"run_id": run_id, "status": get_run_data(db, user_id, run_id)["status"]}}])
         yield from to_sse(list_events(db, user_id, run_id))
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.get("/runs/{run_id}/events")
@@ -135,7 +151,15 @@ def run_events(run_id: int, user_id: int = Depends(get_current_user_id), db: Ses
     def events():
         yield from to_sse(list_events(db, user_id, run_id))
 
-    return StreamingResponse(events(), media_type="text/event-stream")
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/approvals/{approval_id}/approve")

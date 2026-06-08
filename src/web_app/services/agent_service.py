@@ -415,6 +415,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         }
         response = _run_response(run.id, state_for_response, conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=elapsed_ms)
         _queue_stream_event(stream_queue, "run_completed", {"status": "completed", "answer": answer, "response": response}, run_id=run.id, thread_id=thread_id)
+        await asyncio.sleep(0)  # yield so consumer drains queue before sentinel arrives
         return response
 
     try:
@@ -758,6 +759,7 @@ async def _stream_answer_deltas(db: Session, queue: asyncio.Queue | None, run_id
         return
     # Fallback: runtime did not stream (e.g. final_response skipped, or LLM disabled).
     _queue_stream_event(queue, "answer_started", {}, run_id=run_id, thread_id=thread_id, node_name="final_response")
+    await asyncio.sleep(0)  # yield so consumer sends answer_started before chunks arrive
     chunks = _chunk_answer_text(str(answer or ""))
     if not chunks:
         chunks = [answer]
@@ -766,9 +768,11 @@ async def _stream_answer_deltas(db: Session, queue: asyncio.Queue | None, run_id
         record_event(db, run_id, "answer_delta", payload, node_name="final_response", user_id=user_id, thread_id=thread_id)
         _queue_stream_event(queue, "answer_delta", payload, run_id=run_id, thread_id=thread_id, node_name="final_response")
         await asyncio.sleep(0)
+    await asyncio.sleep(0)  # yield so consumer sends last answer_delta before completed
     completed_payload = {"answer": answer}
     record_event(db, run_id, "answer_completed", completed_payload, node_name="final_response", user_id=user_id, thread_id=thread_id)
     _queue_stream_event(queue, "answer_completed", completed_payload, run_id=run_id, thread_id=thread_id, node_name="final_response")
+    await asyncio.sleep(0)  # yield so consumer sends answer_completed before caller queues more events
 
 
 def _chunk_answer_text(text: str, max_chunk: int = 200) -> list[str]:
