@@ -20,6 +20,7 @@ from src.web_app.db.repositories.agent_repository import (
 from src.web_app.services.document_service import document_service
 from src.web_app.rag.vector_store import QdrantVectorStore
 from src.web_app.rag.embeddings import embed_text
+from src.web_app.services.conversation_lock import conversation_lock_manager
 
 
 GENERIC_COMPLETED_ANSWERS = {
@@ -188,13 +189,50 @@ async def _build_attachment_context(attachments: list[dict[str, Any]], user_inpu
 
     if document_attachments:
         doc_ids = [a["document_id"] for a in document_attachments]
+        # ── Load real document status from DB (not attachment metadata snapshot) ──
+        from src.web_app.db.repositories.document_repository import DocumentRepository
+        doc_repo = DocumentRepository(db)
+        failed_docs: list[str] = []
+        pending_docs: list[str] = []
+        ready_doc_ids: list[int] = []
         for a in document_attachments:
-            if a.get("ingest_status") != "completed":
-                try:
-                    result = document_service.ingest_chat_document(db, user_id, a["document_id"])
-                    a["ingest_status"] = result.get("status", "failed")
-                except Exception:
-                    a["ingest_status"] = "failed"
+            did = a["document_id"]
+            try:
+                doc = doc_repo.get_by_id_for_user(user_id, did)
+            except Exception:
+                doc = None
+            if doc is None:
+                failed_docs.append(f"{a['filename']}: document not found in DB")
+                continue
+            db_status = doc.status
+            meta = doc.metadata_json or {}
+            ingest_status = meta.get("ingest_status") or db_status
+            if db_status == "failed" or ingest_status == "failed":
+                error_msg = meta.get("error") or meta.get("error_message") or "unknown error"
+                failed_docs.append(f"{a['filename']}: {error_msg}")
+                continue
+            if ingest_status in ("pending", "processing", "uploaded"):
+                pending_docs.append(a["filename"])
+                continue
+            if ingest_status in ("ingested", "completed", "ready"):
+                ready_doc_ids.append(did)
+                continue
+            # Unknown status — treat as pending
+            pending_docs.append(a["filename"])
+        if failed_docs and not ready_doc_ids:
+            parts.append(
+                "[Document Error]\n"
+                + "\n".join(f"文档摄入失败：{msg}" for msg in failed_docs)
+            )
+            return "\n\n".join(parts)
+        if pending_docs and not ready_doc_ids:
+            parts.append(
+                "[Document Status]\n"
+                + f"文档正在解析入库中，请稍后再问。待处理：{', '.join(pending_docs)}"
+            )
+            return "\n\n".join(parts)
+        if not ready_doc_ids:
+            return "\n\n".join(parts)
         try:
             query_vector = embed_text(user_input)
             results = QdrantVectorStore().search(
@@ -219,9 +257,30 @@ async def _build_attachment_context(attachments: list[dict[str, Any]], user_inpu
                         content = chunk.get("content", chunk.get("content_preview", ""))
                         doc_lines.append(f"Chunk {i}:\n{content[:2000]}")
                 parts.append("\n".join(doc_lines))
-        except Exception:
+            else:
+                # Document was ingested but no chunks matched — warn user
+                parts.append(
+                    "[Document Status]\n"
+                    + "文档已入库，但未检索到相关内容。可能的原因为文档内容与问题不匹配，或索引尚未生效。"
+                )
+        except Exception as exc:
             import logging
-            logging.getLogger(__name__).exception("Document RAG retrieval failed during attachment context build")
+            err_msg = str(exc)
+            _logger = logging.getLogger(__name__)
+            _logger.exception("Document RAG retrieval failed during attachment context build")
+            if "index" in err_msg.lower() and ("missing" in err_msg.lower() or "not found" in err_msg.lower()):
+                parts.append(
+                    "[Document Error]\n"
+                    "Qdrant 缺少 document_id 索引，请运行初始化脚本：\n"
+                    "python scripts/ensure_qdrant_indexes.py\n"
+                    f"详细错误：{err_msg[:300]}"
+                )
+            else:
+                parts.append(
+                    "[Document Warning]\n"
+                    f"文档检索失败：{err_msg[:300]}\n"
+                    "请稍后重试或联系管理员检查 Qdrant 服务状态。"
+                )
 
     return "\n\n".join(parts)
 
@@ -418,112 +477,164 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         await asyncio.sleep(0)  # yield so consumer drains queue before sentinel arrives
         return response
 
-    try:
-        # Build attachment context and inject into payload
-        attachment_context = await _build_attachment_context(attachments_data, user_input, db, user_id)
-        _agent_logger.info("final attachment_context length=%s has_context=%s", len(attachment_context or ""), bool(attachment_context))
-        enriched_payload = dict(payload)
-        if attachment_context:
-            enriched_payload["attachment_context"] = attachment_context
-            page_context = dict(page_context)
-            page_context["attachment_context"] = attachment_context
-            enriched_payload["page_context"] = page_context
+    # ── Pre-flight: check document attachments status before expensive Agent run ──
+    document_attachments_for_guard = [a for a in attachments_data if a.get("kind") == "document"]
+    if document_attachments_for_guard:
+        from src.web_app.db.repositories.document_repository import DocumentRepository as _DocRepo
+        _doc_repo = _DocRepo(db)
+        _failed_msgs: list[str] = []
+        _pending_msgs: list[str] = []
+        _has_ready = False
+        for a in document_attachments_for_guard:
+            did = a["document_id"]
+            doc = _doc_repo.get_by_id_for_user(user_id, did)
+            if doc is None:
+                _failed_msgs.append(f"{a['filename']}: document not found")
+                continue
+            db_status = doc.status
+            meta = doc.metadata_json or {}
+            ingest_status = meta.get("ingest_status") or db_status
+            if db_status == "failed" or ingest_status == "failed":
+                _err = meta.get("error") or meta.get("error_message") or "unknown error"
+                _failed_msgs.append(f"{a['filename']}: {_err}")
+            elif ingest_status in ("pending", "processing", "uploaded"):
+                _pending_msgs.append(a["filename"])
+            else:
+                _has_ready = True
+        if _failed_msgs and not _has_ready:
+            fast_fail_answer = "文档解析失败：" + "；".join(_failed_msgs)
+            message_repo.update(assistant_message, content=fast_fail_answer, status="completed", elapsed_ms=0)
+            await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, fast_fail_answer)
+            run_repo.update(run, status="completed", result_summary=fast_fail_answer, final_answer=fast_fail_answer,
+                           elapsed_ms=0, completed_at=datetime.now())
+            conversation_repo.touch(conversation, preview=fast_fail_answer, last_run_id=run.id)
+            _queue_stream_event(stream_queue, "run_completed", {"status": "completed", "answer": fast_fail_answer}, run_id=run.id, thread_id=thread_id)
+            return _run_response(run.id, {"status": "completed", "answer": fast_fail_answer, "final_output": fast_fail_answer},
+                                conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=0)
+        if _pending_msgs and not _has_ready:
+            pending_answer = f"文档正在解析入库中，请稍后再问。待处理：{', '.join(_pending_msgs)}"
+            message_repo.update(assistant_message, content=pending_answer, status="completed", elapsed_ms=0)
+            await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, pending_answer)
+            run_repo.update(run, status="completed", result_summary=pending_answer, final_answer=pending_answer,
+                           elapsed_ms=0, completed_at=datetime.now())
+            conversation_repo.touch(conversation, preview=pending_answer, last_run_id=run.id)
+            _queue_stream_event(stream_queue, "run_completed", {"status": "completed", "answer": pending_answer}, run_id=run.id, thread_id=thread_id)
+            return _run_response(run.id, {"status": "completed", "answer": pending_answer, "final_output": pending_answer},
+                                conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=0)
 
-        state = await AgentRuntime(db, enriched_payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue, "_answer_started_emitted": False, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
-    except Exception as exc:
-        state = {
-            "user_id": user_id,
-            "run_id": run.id,
-            "thread_id": thread_id,
-            "conversation_id": conversation_id,
-            "user_input": user_input,
-            "status": "failed",
-            "error": str(exc),
-            "errors": [str(exc)],
-            "final_output": "",
-            "langgraphstatus": {
+    # ── Per-conversation lock: same conversation serialises, different ones run concurrently ──
+    lock = await conversation_lock_manager.acquire(conversation_id)
+    await lock.acquire()
+    try:
+        try:
+            # Build attachment context and inject into payload
+            attachment_context = await _build_attachment_context(attachments_data, user_input, db, user_id)
+            _agent_logger.info("final attachment_context length=%s has_context=%s", len(attachment_context or ""), bool(attachment_context))
+            enriched_payload = dict(payload)
+            if attachment_context:
+                enriched_payload["attachment_context"] = attachment_context
+                page_context = dict(page_context)
+                page_context["attachment_context"] = attachment_context
+                enriched_payload["page_context"] = page_context
+
+            state = await AgentRuntime(db, enriched_payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue, "_answer_started_emitted": False, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
+        except Exception as exc:
+            state = {
+                "user_id": user_id,
                 "run_id": run.id,
                 "thread_id": thread_id,
                 "conversation_id": conversation_id,
+                "user_input": user_input,
                 "status": "failed",
-                "phase": "failed",
-                "summary": "Agent runtime failed before producing a final answer.",
-                "steps": [],
-            },
-        }
-    elapsed_ms = max(0, int((datetime.now() - started_at).total_seconds() * 1000))
-    answer = build_user_facing_answer(state)
-    state["answer"] = answer
-    state["final_answer"] = answer
-    state["final_output"] = answer
-    final_payload = dict(state.get("final_payload") or {})
-    final_payload["answer"] = answer
-    final_payload.setdefault("thinking_summary", visible_thought_texts(state))
-    final_payload.setdefault("visible_thoughts", state.get("visible_thoughts", []))
-    final_payload.setdefault("run_id", str(run.id))
-    final_payload.setdefault("thread_id", thread_id)
-    final_payload.setdefault("conversation_id", conversation_id)
-    state["final_payload"] = final_payload
-    langgraphstatus = dict(state.get("langgraphstatus") or {})
-    langgraphstatus.update(
-        {
-            "run_id": run.id,
-            "thread_id": thread_id,
-            "conversation_id": conversation_id,
-            "status": state.get("status", "completed"),
-            "phase": "completed" if state.get("status", "completed") == "completed" else state.get("status", "completed"),
-            "elapsed_ms": elapsed_ms,
-        }
-    )
-    langgraphstatus.setdefault("visible_thoughts", state.get("visible_thoughts", []))
-    state["langgraphstatus"] = langgraphstatus
-    steps = list(langgraphstatus.get("steps") or [])
-    completed_at = datetime.now() if state.get("status") in {"completed", "failed", "waiting_approval"} else None
-    run_repo.update(
-        run,
-        status=state.get("status", "completed"),
-        graph_state=_json_safe(_state_for_storage(state)),
-        result_summary=answer,
-        final_answer=answer,
-        final_response=_json_safe(final_payload),
-        langgraphstatus_json=_json_safe(langgraphstatus),
-        elapsed_ms=elapsed_ms,
-        error_message=state.get("error", ""),
-        completed_at=completed_at,
-    )
-    message_repo.update(
-        assistant_message,
-        content=answer,
-        status="failed" if state.get("status") == "failed" else "completed" if state.get("status") == "completed" else state.get("status", "completed"),
-        elapsed_ms=elapsed_ms,
-        langgraphstatus_json=_json_safe(langgraphstatus),
-        steps_json=_json_safe(steps),
-        error_message=state.get("error", ""),
-        metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", []))},
-    )
-    conversation_repo.touch(
-        conversation,
-        preview=answer,
-        last_run_id=run.id,
-        selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
-        selected_feed_card_title=selected_feed_card_title or None,
-    )
-    already_streamed = state.get("_answer_delta_emitted", False)
-    if state.get("approval_required") or state.get("status") == "waiting_approval":
-        await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
-        record_event(db, run.id, "approval_required", state.get("approval_payload") or {}, user_id=user_id, thread_id=thread_id)
-        _queue_stream_event(stream_queue, "approval_required", state.get("approval_payload") or {}, run_id=run.id, thread_id=thread_id)
-    elif state.get("status") == "failed":
-        record_event(db, run.id, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
-        _queue_stream_event(stream_queue, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, run_id=run.id, thread_id=thread_id)
-    else:
-        await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
-        record_event(db, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)
-        record_event(db, run.id, "run_completed", {"status": state.get("status"), "answer": answer}, user_id=user_id, thread_id=thread_id)
-        _queue_stream_event(stream_queue, "final_response_created", {"answer": answer, "answer_len": len(answer)}, run_id=run.id, thread_id=thread_id)
-    response = _run_response(run.id, state, conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=elapsed_ms)
-    _queue_stream_event(stream_queue, "run_completed", {"status": state.get("status"), "answer": answer, "response": response}, run_id=run.id, thread_id=thread_id)
-    return response
+                "error": str(exc),
+                "errors": [str(exc)],
+                "final_output": "",
+                "langgraphstatus": {
+                    "run_id": run.id,
+                    "thread_id": thread_id,
+                    "conversation_id": conversation_id,
+                    "status": "failed",
+                    "phase": "failed",
+                    "summary": "Agent runtime failed before producing a final answer.",
+                    "steps": [],
+                },
+            }
+        elapsed_ms = max(0, int((datetime.now() - started_at).total_seconds() * 1000))
+        answer = build_user_facing_answer(state)
+        state["answer"] = answer
+        state["final_answer"] = answer
+        state["final_output"] = answer
+        final_payload = dict(state.get("final_payload") or {})
+        final_payload["answer"] = answer
+        final_payload.setdefault("thinking_summary", visible_thought_texts(state))
+        final_payload.setdefault("visible_thoughts", state.get("visible_thoughts", []))
+        final_payload.setdefault("run_id", str(run.id))
+        final_payload.setdefault("thread_id", thread_id)
+        final_payload.setdefault("conversation_id", conversation_id)
+        state["final_payload"] = final_payload
+        langgraphstatus = dict(state.get("langgraphstatus") or {})
+        langgraphstatus.update(
+            {
+                "run_id": run.id,
+                "thread_id": thread_id,
+                "conversation_id": conversation_id,
+                "status": state.get("status", "completed"),
+                "phase": "completed" if state.get("status", "completed") == "completed" else state.get("status", "completed"),
+                "elapsed_ms": elapsed_ms,
+            }
+        )
+        langgraphstatus.setdefault("visible_thoughts", state.get("visible_thoughts", []))
+        state["langgraphstatus"] = langgraphstatus
+        steps = list(langgraphstatus.get("steps") or [])
+        completed_at = datetime.now() if state.get("status") in {"completed", "failed", "waiting_approval"} else None
+        run_repo.update(
+            run,
+            status=state.get("status", "completed"),
+            graph_state=_json_safe(_state_for_storage(state)),
+            result_summary=answer,
+            final_answer=answer,
+            final_response=_json_safe(final_payload),
+            langgraphstatus_json=_json_safe(langgraphstatus),
+            elapsed_ms=elapsed_ms,
+            error_message=state.get("error", ""),
+            completed_at=completed_at,
+        )
+        message_repo.update(
+            assistant_message,
+            content=answer,
+            status="failed" if state.get("status") == "failed" else "completed" if state.get("status") == "completed" else state.get("status", "completed"),
+            elapsed_ms=elapsed_ms,
+            langgraphstatus_json=_json_safe(langgraphstatus),
+            steps_json=_json_safe(steps),
+            error_message=state.get("error", ""),
+            metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", []))},
+        )
+        conversation_repo.touch(
+            conversation,
+            preview=answer,
+            last_run_id=run.id,
+            selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
+            selected_feed_card_title=selected_feed_card_title or None,
+        )
+        already_streamed = state.get("_answer_delta_emitted", False)
+        if state.get("approval_required") or state.get("status") == "waiting_approval":
+            await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
+            record_event(db, run.id, "approval_required", state.get("approval_payload") or {}, user_id=user_id, thread_id=thread_id)
+            _queue_stream_event(stream_queue, "approval_required", state.get("approval_payload") or {}, run_id=run.id, thread_id=thread_id)
+        elif state.get("status") == "failed":
+            record_event(db, run.id, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
+            _queue_stream_event(stream_queue, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, run_id=run.id, thread_id=thread_id)
+        else:
+            await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
+            record_event(db, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)
+            record_event(db, run.id, "run_completed", {"status": state.get("status"), "answer": answer}, user_id=user_id, thread_id=thread_id)
+            _queue_stream_event(stream_queue, "final_response_created", {"answer": answer, "answer_len": len(answer)}, run_id=run.id, thread_id=thread_id)
+        response = _run_response(run.id, state, conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=elapsed_ms)
+        _queue_stream_event(stream_queue, "run_completed", {"status": state.get("status"), "answer": answer, "response": response}, run_id=run.id, thread_id=thread_id)
+        return response
+    finally:
+        lock.release()
+        await conversation_lock_manager.release(conversation_id)
 
 
 def run_agent(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
@@ -664,10 +775,45 @@ def clear_conversation(db: Session, user_id: int, conversation_id: str) -> dict[
 
 def hard_delete_conversation(db: Session, user_id: int, conversation_id: str) -> dict[str, Any]:
     repo = AgentConversationRepository(db)
+    try:
+        doc_ids = repo.get_conversation_document_ids(user_id, conversation_id)
+    except Exception:
+        doc_ids = set()
     deleted = repo.hard_delete(user_id, conversation_id)
     if not deleted:
         raise ValueError("Agent conversation not found")
-    return {"conversation_id": conversation_id, "deleted_records": deleted}
+    # ── Clean up Qdrant vectors ───────────────────────────────────
+    deleted_qdrant_docs = 0
+    deleted_qdrant_memories = 0
+    if doc_ids:
+        try:
+            store = QdrantVectorStore()
+            for did in doc_ids:
+                store.delete_document(user_id, did)
+            deleted_qdrant_docs = len(doc_ids)
+        except Exception:
+            pass  # Qdrant may be unavailable; PG data is already gone
+    try:
+        from src.web_app.memory.qdrant_memory_store import QdrantMemoryStore
+        from src.web_app.core.config import settings
+        if settings.qdrant_url:
+            mem_store = QdrantMemoryStore()
+            mem_store.ensure_collection()
+            indexed = mem_store.list_indexed_memory_ids(user_id=user_id, memory_types=["working"])
+            for mid in indexed:
+                try:
+                    mem_store.delete_by_memory_id(mid)
+                    deleted_qdrant_memories += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {
+        "conversation_id": conversation_id,
+        "deleted_records": deleted,
+        "deleted_qdrant_documents": deleted_qdrant_docs,
+        "deleted_qdrant_memories": deleted_qdrant_memories,
+    }
 
 
 def extract_user_visible_answer(value: Any) -> str:

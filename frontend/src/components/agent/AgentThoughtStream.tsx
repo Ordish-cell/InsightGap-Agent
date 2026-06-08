@@ -120,7 +120,6 @@ export function AgentThoughtStream({ message, locale, onApprove, onReject }: Age
       {open ? (
         <div className="thought-paragraphs">
           {thoughts.map((item, index) => <p key={`${index}-${item}`}>{item}</p>)}
-          {running ? <p className="thought-pending">{text(locale, '正在思考...', 'Thinking...')}</p> : null}
         </div>
       ) : null}
       {approvalId && open ? (

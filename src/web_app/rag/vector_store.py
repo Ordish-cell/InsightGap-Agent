@@ -3,7 +3,7 @@ from typing import Any
 from uuid import uuid4
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import Distance, FieldCondition, Filter, MatchAny, MatchValue, PointStruct, VectorParams
+from qdrant_client.models import Distance, FieldCondition, Filter, MatchAny, MatchValue, PayloadSchemaType, PointStruct, VectorParams
 
 from src.web_app.core.config import settings
 
@@ -17,10 +17,32 @@ class QdrantVectorStore:
 
     def ensure_collection(self) -> None:
         names = [item.name for item in self.client.get_collections().collections]
-        if self.collection in names:
-            return
-        distance = Distance.COSINE if settings.qdrant_distance.lower() == "cosine" else Distance.COSINE
-        self.client.create_collection(self.collection, vectors_config=VectorParams(size=settings.qdrant_vector_size, distance=distance))
+        if self.collection not in names:
+            distance = Distance.COSINE if settings.qdrant_distance.lower() == "cosine" else Distance.COSINE
+            self.client.create_collection(self.collection, vectors_config=VectorParams(size=settings.qdrant_vector_size, distance=distance))
+        self.ensure_payload_indexes()
+
+    def ensure_payload_indexes(self) -> None:
+        """Create keyword payload indexes for fields used in filtering.
+
+        Idempotent — ignores errors from indexes that already exist.
+        Called after ensure_collection so both new and existing collections
+        get the indexes.
+        """
+        import logging
+        _logger = logging.getLogger(__name__)
+        for field in ("user_id", "document_id"):
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection,
+                    field_name=field,
+                    field_schema=PayloadSchemaType.KEYWORD,
+                )
+            except Exception as exc:
+                err_msg = str(exc).lower()
+                if "already exists" in err_msg or "already" in err_msg:
+                    continue
+                _logger.warning("Failed to create Qdrant payload index for %s: %s", field, exc)
 
     def upsert_chunks(self, user_id: int, document_id: int, chunks: list[dict[str, Any]], vectors: list[list[float]], document: Any) -> list[str]:
         self.ensure_collection()

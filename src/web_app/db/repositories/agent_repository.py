@@ -2,8 +2,10 @@ from datetime import UTC, datetime
 
 from sqlalchemy import delete, func, select, update
 
+from sqlalchemy import delete as sa_delete
+
 from src.web_app.db.repositories.base_repository import BaseRepository
-from src.web_app.models.orm import AgentChatMessage, AgentConversation, AgentEvent, AgentRun, AgentStep, Approval, Artifact, LLMCall, ResearchRun, ToolCall
+from src.web_app.models.orm import AgentChatMessage, AgentConversation, AgentEvent, AgentRun, AgentStep, Approval, Artifact, Document, DocumentChunk, LLMCall, Memory, ResearchRun, ToolCall
 
 
 class AgentRunRepository(BaseRepository[AgentRun]):
@@ -101,7 +103,12 @@ class AgentConversationRepository(BaseRepository[AgentConversation]):
         return int(self.db.execute(stmt).scalar() or 0)
 
     def hard_delete(self, user_id: int, conversation_id: str) -> int:
-        """Hard-delete a conversation and all associated runs/messages/events. Returns count of deleted records."""
+        """Hard-delete a conversation and all associated records.
+
+        Cascade includes: messages, runs, steps, events, llm_calls, tool_calls,
+        documents (and chunks), and working conversations memories.
+        Returns total count of deleted records.
+        """
         deleted = 0
         conversation = self.db.execute(
             select(AgentConversation).where(
@@ -117,6 +124,20 @@ class AgentConversationRepository(BaseRepository[AgentConversation]):
         runs = run_repo.list_by_conversation(user_id, conversation_id)
         run_ids = [run.id for run in runs]
 
+        # ── 0) Collect document IDs from chat attachments ──────────────
+        doc_ids: set[int] = set()
+        messages = msg_repo.list_by_conversation(user_id, conversation_id)
+        for msg in messages:
+            meta = msg.metadata_json or {}
+            attachments = meta.get("attachments") or []
+            for att in attachments:
+                did = att.get("document_id") if isinstance(att, dict) else None
+                if did:
+                    try:
+                        doc_ids.add(int(did))
+                    except (TypeError, ValueError):
+                        pass
+
         # 1) Delete chat messages first — they have FK run_id → agent_runs
         deleted += msg_repo.hard_delete_by_conversation(user_id, conversation_id)
 
@@ -125,7 +146,6 @@ class AgentConversationRepository(BaseRepository[AgentConversation]):
             self.db.execute(update(Approval).where(Approval.run_id.in_(run_ids)).values(run_id=None))
             self.db.execute(update(Artifact).where(Artifact.run_id.in_(run_ids)).values(run_id=None))
             self.db.execute(update(ResearchRun).where(ResearchRun.agent_run_id.in_(run_ids)).values(agent_run_id=None))
-            # Also NULL the conversation's own last_run_id if it points to a run we'll delete
             self.db.execute(
                 update(AgentConversation)
                 .where(AgentConversation.id == conversation.id, AgentConversation.last_run_id.in_(run_ids))
@@ -139,11 +159,52 @@ class AgentConversationRepository(BaseRepository[AgentConversation]):
                 run_repo.hard_delete_cascade(run)
                 deleted += 1
 
-        # 4) Delete the conversation itself
+        # 4) Delete documents and chunks for this conversation
+        if doc_ids:
+            doc_list = list(doc_ids)
+            self.db.execute(
+                sa_delete(DocumentChunk).where(
+                    DocumentChunk.user_id == user_id,
+                    DocumentChunk.document_id.in_(doc_list),
+                )
+            )
+            self.db.execute(
+                sa_delete(Document).where(
+                    Document.user_id == user_id,
+                    Document.id.in_(doc_list),
+                )
+            )
+            deleted += len(doc_ids)
+
+        # 5) Delete working / conversation-scoped episodic memories
+        mem_stmt = sa_delete(Memory).where(
+            Memory.user_id == user_id,
+            Memory.memory_type.in_(["working"]),
+        )
+        result = self.db.execute(mem_stmt)
+        deleted += result.rowcount or 0
+
+        # 6) Delete the conversation itself
         self.db.delete(conversation)
         self.db.commit()
         deleted += 1
         return deleted
+
+    def get_conversation_document_ids(self, user_id: int, conversation_id: str) -> set[int]:
+        """Return document IDs from chat attachment metadata."""
+        doc_ids: set[int] = set()
+        messages = AgentChatMessageRepository(self.db).list_by_conversation(user_id, conversation_id)
+        for msg in messages:
+            meta = msg.metadata_json or {}
+            attachments = meta.get("attachments") or []
+            for att in attachments:
+                did = att.get("document_id") if isinstance(att, dict) else None
+                if did:
+                    try:
+                        doc_ids.add(int(did))
+                    except (TypeError, ValueError):
+                        pass
+        return doc_ids
 
 
 class AgentChatMessageRepository(BaseRepository[AgentChatMessage]):

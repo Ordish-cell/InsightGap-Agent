@@ -23,6 +23,20 @@ _RAG_TERMS = [
     "rag", "RAG", "vector", "qdrant", "总结重点", "整理要点",
 ]
 
+# Document overview / Q&A patterns — these are NOT research, always route to rag.
+# Must be checked BEFORE _RESEARCH_TERMS to prevent misrouting.
+_DOCUMENT_QA_KEYWORDS = [
+    "文档里讲了啥", "文档里讲了什么", "文档讲了啥", "文档讲了什么",
+    "这文档", "这个文件", "这份材料", "这篇报告",
+    "这个文档", "这个附件", "附件里", "文件里",
+    "总结一下这个", "总结一下文件", "概括一下", "概括这篇",
+    "文档内容", "文件内容", "附件内容",
+    "讲什么", "是什么内容", "主要说什么", "主要内容",
+    "帮我看看这个文件", "帮我看看这个文档", "帮我读一下",
+    "summarize this document", "what is this document", "what is this file about",
+    "summarize the file",
+]
+
 _ARTIFACT_TERMS = [
     "生成文档", "方案", "网站", "页面", "代码", "图片提示词",
     "artifact", "生成一份", "写一份", "起草", "草稿", "文档",
@@ -99,6 +113,7 @@ def plan_route(
     forced_route: str | None = None,
     forced_intent: str | None = None,
     home_intent: dict[str, Any] | None = None,
+    has_document_attachments: bool = False,
 ) -> RoutePlan:
     """Produce a RoutePlan from user_input and optional context.
     Rule-based, deterministic. No LLM.
@@ -117,8 +132,19 @@ def plan_route(
         reasons.append(f"forced_route={forced}")
 
     # ── Detect intent ───────────────────────────────────────────
-    is_research = any(term in text for term in _RESEARCH_TERMS)
-    is_rag = any(term in text for term in _RAG_TERMS)
+    is_document_qa = has_document_attachments and any(
+        kw in text for kw in _DOCUMENT_QA_KEYWORDS
+    )
+    # If user uploaded documents and asks a short/ambiguous question,
+    # treat as document Q&A (rag) rather than research.
+    if has_document_attachments and not forced and not is_document_qa:
+        if len(user_input.strip()) <= 30 and not any(
+            term in text for term in _RESEARCH_TERMS
+        ):
+            is_document_qa = True
+            reasons.append("short_query_with_attachment")
+    is_research = any(term in text for term in _RESEARCH_TERMS) and not is_document_qa
+    is_rag = any(term in text for term in _RAG_TERMS) or is_document_qa
     is_artifact = any(term in text for term in _ARTIFACT_TERMS)
     is_tool = any(term in text for term in _TOOL_TERMS) or any(term in text for term in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "打开网页", "删除", "支付", "付款", "转账"])
     is_memory = any(term in text for term in _MEMORY_TERMS)
@@ -216,9 +242,15 @@ def plan_route(
     if intent == "tool" or str(intent).startswith("tool.") or is_tool:
         route.append("tool_agent")
         reasons.append("tool_agent_in_route")
+    # Document Q&A: force as rag, skip research/artifact/memory/skill
+    if is_document_qa and not forced:
+        intent = "document_qa"
+        reasons.append("document_qa_detected")
+        if "rag_agent" not in route:
+            route = ["rag_agent"]  # only rag, no research/artifact
 
     # Post-execution: memory/skill BEFORE evaluator (so evaluator can score them)
-    if intent not in ("chat",):
+    if intent not in ("chat", "document_qa"):
         route.append("memory_agent")
     if is_skill or intent == "skill":
         route.append("skill_agent")
@@ -263,6 +295,7 @@ def plan_route(
         "research": "research_report",
         "feed_research": "research_report",
         "rag": "answer_with_evidence",
+        "document_qa": "document_summary",
         "artifact": "document_or_code",
         "tool": "action_result",
         "skill": "skill_draft",

@@ -558,12 +558,19 @@ class RuntimeNodes:
             page_context = self.payload.get("page_context") or state.get("page_context") or {}
             feed_card_id = page_context.get("selected_feed_card_id") or page_context.get("feed_card_id")
 
+        # Detect document attachments for routing
+        _has_doc_attachments = bool(
+            (self.payload.get("attachment_ids") or [])
+            or (self.payload.get("attachment_context"))
+            or (state.get("context") or {}).get("rag_evidence")
+        )
         route_plan = plan_route(
             user_input=user_input,
             feed_card_id=feed_card_id,
             forced_route=self.payload.get("route"),
             forced_intent=self.payload.get("intent"),
             home_intent=state.get("home_intent"),
+            has_document_attachments=_has_doc_attachments,
         )
         state["route_plan"] = route_plan
         route_intent = route_plan.get("intent", "chat")
@@ -683,14 +690,49 @@ class RuntimeNodes:
             mark_completed(state, "rag_agent")
             return state
         try:
-            result = rag_service.ask(state["user_id"], state.get("user_input", ""),
-                                     top_k=int(self.payload.get("top_k", 5)))
+            route_plan = state.get("route_plan") or {}
+            intent = route_plan.get("intent", "rag")
+            user_input_str = state.get("user_input", "")
+            # Determine if this is a document overview query
+            from src.web_app.services.rag_service import is_document_overview_query
+            overview = is_document_overview_query(user_input_str)
+            # Get document IDs from context or payload
+            page_context = state.get("page_context") or {}
+            doc_ids_raw = (
+                self.payload.get("attachment_ids")
+                or page_context.get("attachment_ids")
+                or None
+            )
+            if intent in ("document_qa",) and overview and doc_ids_raw:
+                try:
+                    doc_ids = [int(d) for d in doc_ids_raw]
+                except (TypeError, ValueError):
+                    doc_ids = None
+                result = rag_service.ask_document(
+                    state["user_id"],
+                    user_input_str,
+                    document_ids=doc_ids,
+                    top_k=8,
+                    overview_mode=True,
+                )
+            else:
+                doc_ids_for_search = None
+                if doc_ids_raw:
+                    try:
+                        doc_ids_for_search = [int(d) for d in doc_ids_raw]
+                    except (TypeError, ValueError):
+                        pass
+                result = rag_service.ask(
+                    state["user_id"], user_input_str,
+                    top_k=int(self.payload.get("top_k", 5)),
+                    document_ids=doc_ids_for_search,
+                )
             state["rag"] = result
             state["rag_result"] = result
             append_output(state, "rag_agent", {"answer": result.get("answer", ""),
                           "evidence_count": len(result.get("evidence", []))})
             record_step(self.db, state["run_id"], "rag_agent", "rag_ask",
-                        {"query": state.get("user_input", "")},
+                        {"query": user_input_str, "intent": intent, "overview": overview},
                         {"answer_mode": result.get("answer_mode"),
                          "evidence_count": len(result.get("evidence", []))})
             append_status_step(
@@ -985,17 +1027,16 @@ class RuntimeNodes:
 
         answer_parts = []
         research = state.get("research_result") or state.get("research") or {}
-        if research.get("summary"):
+        if research.get("summary") and intent not in ("document_qa",):
             answer_parts.append(research["summary"])
         rag = state.get("rag_result") or state.get("rag") or {}
-        if rag.get("answer"):
-            answer_parts.append(rag["answer"])
+        rag_answer = rag.get("answer", "")
+        if rag_answer and rag_answer != "[document_qa_context]":
+            answer_parts.append(rag_answer)
         if state.get("final_output") and not answer_parts:
             answer_parts.append(state["final_output"])
 
         # ── Enrich visible thoughts BEFORE generating the final answer ──
-        # This ensures trace_visualizer does not delay answer streaming or run_completed.
-        # For simple chat intents, skip the enrichment LLM call entirely.
         if intent != "chat":
             emit_visible_thought(self.db, state, "final_response")
             await self._enrich_visible_thoughts_with_llm(state)
@@ -1004,6 +1045,10 @@ class RuntimeNodes:
         used_streaming_llm = False
         if state.get("status") == "waiting_approval":
             final_answer = state.get("final_output") or "Approval required（需要审批）：这个操作需要先通过审批。我还没有执行外部写入或不可逆动作。"
+        elif intent in ("document_qa",):
+            # Document Q&A: always use LLM to rewrite, never echo raw chunks
+            final_answer = await self._generate_final_answer_with_llm(state, draft_answer)
+            used_streaming_llm = True
         elif draft_answer.strip() and not self._is_generic_draft_answer(draft_answer):
             final_answer = draft_answer.strip()
         else:
@@ -1376,10 +1421,23 @@ class RuntimeNodes:
                 f"{attachment_context}"
             )
         if rag_result.get("answer"):
-            extra_blocks.append(
-                f"[RAG Agent Result]\n{rag_result.get('answer', '')}\n"
-                f"Evidence count: {len(rag_result.get('evidence', []))}"
-            )
+            rag_answer_text = rag_result.get("answer", "")
+            rag_ctx = rag_result.get("context") or {}
+            doc_block = rag_ctx.get("document_context_block", "")
+            if doc_block and rag_answer_text == "[document_qa_context]":
+                # Document Q&A mode: inject structured document context directly
+                extra_blocks.append(doc_block)
+            elif doc_block and rag_answer_text != "[document_qa_context]":
+                extra_blocks.append(doc_block)
+                extra_blocks.append(
+                    f"[RAG Agent Result]\n{rag_answer_text}\n"
+                    f"Evidence count: {len(rag_result.get('evidence', []))}"
+                )
+            else:
+                extra_blocks.append(
+                    f"[RAG Agent Result]\n{rag_answer_text}\n"
+                    f"Evidence count: {len(rag_result.get('evidence', []))}"
+                )
         if research_result.get("summary"):
             extra_blocks.append(
                 f"[Research Agent Result]\n{research_result.get('summary', '')}"
@@ -1403,36 +1461,53 @@ class RuntimeNodes:
             system_instruction += "\n".join(extra_blocks) + "\n\n"
 
         intent = route_plan.get("intent", "chat")
+        if intent in ("document_qa",) and ("rag" in str(route_plan.get("route", []))):
+            system_instruction += (
+                "[Document Q&A Instructions]\n"
+                "你正在回答用户关于当前上传文档的问题。\n"
+                "请根据以下上下文直接回答用户。\n"
+                "1. 使用自然中文，像正常助手一样回答，自然地组织为段落。\n"
+                "2. 严禁出现以下内部术语：evidence item、research question、information-gap opportunity、"
+                "RAG、chunk、知识库证据、Based on X evidence items、Evidence is insufficient、"
+                "当前知识库中没有找到足够证据、research question、limited to available context。\n"
+                "3. 如果用户问「文档里讲了啥/总结一下」，请输出：\n"
+                "   - 一句话总结\n   - 主要内容 3-5 条，用 Markdown 标题和无序列表\n"
+                "   - 如果解析内容有限，最后说明限制\n"
+                "4. 如果文档是项目计划/课程报告/实验报告，请主动识别文档类型。\n"
+                "5. 不要编造没有出现在文档中的内容。\n"
+                "6. 如果当前上下文确实没有文档内容（例如文档解析失败/为空），请用中文友好地告知用户。\n"
+                "7. 输出简洁、可读、像正常助手回答。\n"
+                "\n"
+            )
         system_instruction += (
             "[Instructions]\n"
             "1. 优先使用 Structured GSSC Context 中的 Memory、Profile、Evidence、Feed、Conversation 信息。\n"
             "2. 如果 Memory 或 Evidence 中没有相关信息，不要编造。\n"
             "3. 如果用户问「我之前说过什么」「我的偏好是什么」「我们聊过什么」，必须优先从 GSSC Context 的 Memory 和 Conversation 部分回答。\n"
         )
-        # ── Conversation recall rules (P0) ─────────────────────────
         system_instruction += (
             "4. 如果用户询问「我问过你什么 / 我刚才问过什么 / 我之前问过什么 / 是否问过某主题 / 刚才聊了什么」，必须优先查看 [Conversation History]。\n"
-            "5. 判断用户是否问过某主题时，只依据 [Conversation History] 中的 User 消息，不要依据 Assistant 的旧回答（Assistant 旧回答可能是错误的，不可作为事实依据）。\n"
-            "6. 如果 [Conversation History] 中存在相关 User 消息，请直接列出这些用户问题。不要回答「没有记录」，除非 [Conversation History] 为空或确实没有相关 User 消息。\n"
+            "5. 判断用户是否问过某主题时，只依据 [Conversation History] 中的 User 消息，不要依据 Assistant 的旧回答。\n"
+            "6. 如果 [Conversation History] 中存在相关 User 消息，请直接列出这些用户问题。\n"
             "7. 当前会话历史判断优先级高于 Memory、RAG Evidence、Feed Card 和 Dynamic Preferences。\n"
         )
-        # The "insufficient evidence" instruction only applies to research/rag
-        # intents. For memory_write / chat / preference updates / conversation_recall,
-        # the user input itself is the primary evidence.
-        if intent in ("research", "rag", "feed_research", "mixed"):
-            system_instruction += "8. 如果证据不足，要明确说「当前上下文里没有足够记录」。\n"
+        if intent in ("document_qa",):
+            system_instruction += "8. 你只能基于当前上传文档的内容回答。如果文档解析内容有限，请如实告知用户。\n"
+        elif intent in ("research", "rag", "feed_research", "mixed"):
+            system_instruction += "8. 如果证据不足，要明确说「当前相关材料中没有足够信息」。\n"
         system_instruction += (
-            f"{(9 if intent in ('research', 'rag', 'feed_research', 'mixed') else 8)}. 如果只是问候或闲聊，要像正常助手一样回答；如果是记忆写入类请求，直接确认已保存即可。\n"
-            f"{(10 if intent in ('research', 'rag', 'feed_research', 'mixed') else 9)}. 如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
-            f"{(11 if intent in ('research', 'rag', 'feed_research', 'mixed') else 10)}. 输出简洁、结构化、可执行。中文为主。\n"
+            f"{(9 if intent in ('research', 'rag', 'feed_research', 'mixed', 'document_qa') else 8)}. 如果只是问候或闲聊，要像正常助手一样回答；如果是记忆写入类请求，直接确认已保存即可。\n"
+            f"{(10 if intent in ('research', 'rag', 'feed_research', 'mixed', 'document_qa') else 9)}. 如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
+            f"{(11 if intent in ('research', 'rag', 'feed_research', 'mixed', 'document_qa') else 10)}. 输出简洁、结构化、可执行。中文为主。\n"
             "\n"
             "[Output Rules — 必须严格遵守]\n"
-            "• 你必须输出用户可直接阅读的自然语言，可以使用 Markdown 标题、列表、加粗来组织内容。不要使用分割线 ---。\n"
+            "• 你必须输出用户可直接阅读的自然语言，可以使用 Markdown 标题、无序列表、加粗来组织内容。不要使用分割线 ---。\n"
             "• 严禁输出 JSON。严禁输出 Python dict。严禁输出 JavaScript object。\n"
-            "• 严禁在你的回答中出现 status、final_output、artifacts、memory_updates、skill_drafts、evidence 这些内部字段名。\n"
-            "• 如果你需要引用研究成果物，请直接用 Markdown 段落描述，不要把内部 payload 原样贴给用户。\n"
+            "• 严禁在你的回答中出现以下英文内部术语：evidence item / items、research question、information-gap opportunity、chunk、knowledge base、limited to available context、Based on X evidence items。\n"
+            "• 严禁出现以下中文内部表达：基于当前知识库证据、证据显示、根据检索到的证据、当前知识库中没有找到足够证据、research question、information-gap。\n"
+            "• 如果你需要引用文档内容，请直接用自然中文描述，不要把内部 payload 原样贴给用户。\n"
             "• 你的回答就是用户最终看到的全部内容，没有二次解析步骤。\n"
-            "• 当你给出多个选项或「需要我帮你」列表时，请使用标准 Markdown 无序列表，每个选项一行（如 - ✅ 选项一）。不要把多个选项写在同一行。"
+            "• 当你给出多个选项或「需要我帮你」列表时，请使用标准 Markdown 无序列表，每个选项一行。"
         )
         return system_instruction
 

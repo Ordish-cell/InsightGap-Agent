@@ -30,7 +30,16 @@ def build_visible_thought_step(step: str | dict[str, Any], state: dict[str, Any]
     if key in {"research_agent", "research"}:
         return "我开始检索和整合相关信息，优先保留能直接帮助用户决策的内容。"
     if key in {"rag_agent", "rag"}:
+        route_plan = state.get("route_plan") or {}
+        intent = route_plan.get("intent", "")
+        if intent in ("document_qa",) and (state.get("context") or {}).get("rag_evidence"):
+            return "正在检索你上传的文档内容，并结合对话上下文整理回答。"
         return "我正在检索知识库里的相关内容，并把能支持回答的依据先筛出来。"
+
+    if key == "planner":
+        route_plan = state.get("route_plan") or {}
+        if route_plan.get("intent") in ("document_qa",):
+            return "正在识别你的文档问题类型，准备从文档中提取相关答案。"
     if key in {"tool_agent", "tool"}:
         if needs_approval or state.get("status") == "waiting_approval":
             return "我已经识别到可能涉及外部动作，会先停在审批环节，避免直接执行高风险操作。"

@@ -89,16 +89,32 @@ def _parse_pdf(file_path: Path, metadata: dict[str, Any]) -> tuple[str, dict[str
 def _parse_docx(file_path: Path) -> str:
     try:
         from docx import Document
+    except ImportError:
+        raise RuntimeError(
+            "DOCX parsing requires python-docx. Install it with: pip install python-docx"
+        ) from None
     except Exception as exc:
-        raise RuntimeError("python-docx is not available") from exc
-    return "\n".join(paragraph.text for paragraph in Document(str(file_path)).paragraphs)
+        raise RuntimeError(
+            f"Failed to initialize python-docx parser: {exc}"
+        ) from exc
+    try:
+        doc = Document(str(file_path))
+        return "\n".join(paragraph.text for paragraph in doc.paragraphs)
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse DOCX file: {exc}") from exc
 
 
 def _parse_xlsx(file_path: Path, metadata: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     try:
         import openpyxl
+    except ImportError:
+        raise RuntimeError(
+            "XLSX parsing requires openpyxl. Install it with: pip install openpyxl"
+        ) from None
     except Exception as exc:
-        raise RuntimeError("openpyxl is not available") from exc
+        raise RuntimeError(
+            f"Failed to initialize openpyxl parser: {exc}"
+        ) from exc
     workbook = openpyxl.load_workbook(str(file_path), data_only=True, read_only=True)
     metadata["parser"] = "openpyxl"
     metadata["sheet_names"] = workbook.sheetnames

@@ -8,6 +8,7 @@ from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
 from src.web_app.core.config import settings
+from src.web_app.core.errors import DocumentIngestError
 from src.web_app.db.repositories.document_repository import DocumentChunkRepository, DocumentRepository
 from src.web_app.models.orm import Document
 from src.web_app.rag.chunker import chunk_markdown
@@ -164,7 +165,7 @@ class DocumentService:
                 "stored_filename": stored_name,
                 "mime_type": file.content_type or "",
                 "kind": kind,
-                "ingest_status": "pending" if kind == "document" else "completed",
+                "ingest_status": "pending",
                 "chunk_count": 0,
                 "error": None,
             },
@@ -192,6 +193,63 @@ class DocumentService:
         metadata = dict(document.metadata_json or {})
         metadata["size"] = size
         repo.update(document, file_path=str(target), metadata_json=metadata)
+
+        # ── Sync ingest for documents (images skip) ──────────────────────
+        if kind == "document":
+            try:
+                ingest_result = self._ingest_document_internal(db, user_id, document)
+                if ingest_result.get("status") != "ingested":
+                    error_msg = str(ingest_result.get("error") or "Document ingestion returned non-ingested status")
+                    repo.mark_failed(document, error_msg)
+                    repo.update(document, metadata_json={
+                        **(document.metadata_json or {}),
+                        "ingest_status": "failed",
+                        "error": error_msg,
+                        "ingest_error_type": "IngestError",
+                    })
+                    raise DocumentIngestError(
+                        f"文档摄入失败：{error_msg}",
+                        document_id=document.id,
+                        http_status=500,
+                        detail=error_msg,
+                    )
+                metadata = dict(document.metadata_json or {})
+                metadata["ingest_status"] = "ingested"
+                metadata["chunk_count"] = ingest_result.get("chunk_count", 0)
+                metadata["token_count"] = ingest_result.get("token_count", 0)
+                repo.update(document, status="ingested", metadata_json=metadata)
+                return {
+                    "document_id": document.id,
+                    "filename": filename,
+                    "file_type": suffix.lstrip("."),
+                    "mime_type": file.content_type or "",
+                    "kind": kind,
+                    "size": size,
+                    "preview_url": f"/api/v1/documents/{document.id}/file",
+                    "status": "ready",
+                    "ingest_status": "ingested",
+                    "chunks_count": ingest_result.get("chunk_count", 0),
+                    "token_count": ingest_result.get("token_count", 0),
+                }
+            except DocumentIngestError:
+                raise
+            except Exception as exc:
+                logger.exception("Chat document sync ingest failed for document_id=%s", document.id)
+                repo.mark_failed(document, str(exc))
+                repo.update(document, metadata_json={
+                    **(document.metadata_json or {}),
+                    "ingest_status": "failed",
+                    "error": str(exc),
+                    "ingest_error_type": type(exc).__name__,
+                })
+                http_status = 400 if isinstance(exc, (ValueError, FileNotFoundError)) else 500
+                raise DocumentIngestError(
+                    str(exc),
+                    document_id=document.id,
+                    http_status=http_status,
+                    detail=str(exc),
+                ) from exc
+
         return {
             "document_id": document.id,
             "filename": filename,
@@ -200,9 +258,40 @@ class DocumentService:
             "kind": kind,
             "size": size,
             "preview_url": f"/api/v1/documents/{document.id}/file",
-            "status": "uploaded",
-            "ingest_status": metadata.get("ingest_status", "pending"),
+            "status": "ready",
+            "ingest_status": "completed",
+            "chunks_count": 0,
+            "token_count": 0,
         }
+
+    def _ingest_document_internal(self, db: Session, user_id: int, document: Document) -> dict[str, Any]:
+        """Sync parse + chunk + embed + upsert. Returns result dict, raises on error."""
+        chunk_repo = DocumentChunkRepository(db)
+        parsed = parse_document(document.file_path, document.filename, document.file_type)
+        chunks = chunk_markdown(parsed["markdown"] or parsed["text"])
+        if not chunks:
+            raise ValueError("No readable content chunks produced")
+        vectors = embed_texts([chunk["content"] for chunk in chunks])
+        point_ids = QdrantVectorStore().upsert_chunks(user_id, document.id, chunks, vectors, document)
+        chunk_repo.delete_by_document(user_id, document.id)
+        rows = []
+        for chunk, point_id in zip(chunks, point_ids, strict=True):
+            chunk_metadata = dict(chunk.get("metadata", {}))
+            chunk_metadata.update({"char_start": chunk["char_start"], "char_end": chunk["char_end"], "heading_path": chunk.get("heading_path", [])})
+            rows.append(
+                {
+                    "document_id": document.id,
+                    "user_id": user_id,
+                    "chunk_index": chunk["chunk_index"],
+                    "content": chunk["content"],
+                    "token_count": chunk["token_count"],
+                    "qdrant_point_id": point_id,
+                    "metadata_json": chunk_metadata,
+                }
+            )
+        saved_chunks = chunk_repo.bulk_create_chunks(rows)
+        token_count = sum(chunk.token_count for chunk in saved_chunks)
+        return {"status": "ingested", "chunk_count": len(saved_chunks), "token_count": token_count}
 
     def ingest_chat_document(self, db: Session, user_id: int, document_id: int) -> dict[str, Any]:
         doc_repo = DocumentRepository(db)

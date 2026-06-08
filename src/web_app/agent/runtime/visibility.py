@@ -28,6 +28,10 @@ _USER_VISIBLE_NODES: dict[str, set[str]] = {
         "rag_agent",
         "final_response",
     },
+    "document_qa": {
+        "rag_agent",
+        "final_response",
+    },
     "artifact": {
         "planner",
         "artifact_agent",

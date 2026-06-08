@@ -78,16 +78,27 @@ export function Sidebar() {
     const item = deleteTarget
     if (!item) return
     setDeleteTarget(null)
+    const openId = sessionStorage.getItem('agentOpenConversationId')
+    const isCurrentConversation = openId === item.conversation_id
+
+    // Optimistic: remove from list immediately
+    setConversations((prev) => prev.filter((c) => c.conversation_id !== item.conversation_id))
+
+    if (isCurrentConversation) {
+      sessionStorage.removeItem('agentOpenConversationId')
+      navigate('/', { replace: true })
+      // Small delay so navigation commits before the custom event fires
+      setTimeout(() => {
+        window.dispatchEvent(new CustomEvent('agent:new-conversation'))
+      }, 80)
+    }
+
     try {
       await agent.hardDeleteConversation(item.conversation_id)
-      const openId = sessionStorage.getItem('agentOpenConversationId')
-      if (openId === item.conversation_id) {
-        sessionStorage.removeItem('agentOpenConversationId')
-        window.dispatchEvent(new CustomEvent('agent:new-conversation'))
-      }
-      void loadConversations()
+      await loadConversations()
     } catch {
-      // silently fail, user can retry
+      // Refresh list on failure to undo optimistic removal
+      void loadConversations()
     }
   }
 

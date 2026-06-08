@@ -496,10 +496,8 @@ function AgentMessageItem({
         <div className="message-bubble answer-content">
           {visibleContent ? (
             <MarkdownRenderer content={visibleContent} />
-          ) : (
-            message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running'
-              ? text(locale, zh.processing, 'Processing...')
-              : text(locale, zh.noAnswer, 'No answer to display.')
+          ) : message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running' ? null : (
+            text(locale, zh.noAnswer, 'No answer to display.')
           )}
         </div>
       </div>
@@ -589,6 +587,7 @@ export function AgentChatPanel({
         )
       })
         .then((uploaded) => {
+          const isReady = uploaded.status === 'ready' && (uploaded.kind === 'image' || (uploaded.chunks_count ?? 0) > 0)
           setAttachments((prev) =>
             prev.map((item) =>
               item.localId === localId
@@ -599,8 +598,9 @@ export function AgentChatPanel({
                     file: item.file,
                     localPreviewUrl: item.localPreviewUrl,
                     uploadProgress: 100,
-                    uploadStatus: 'uploaded',
-                    status: 'uploaded',
+                    uploadStatus: isReady ? 'uploaded' : 'failed',
+                    status: isReady ? 'uploaded' : 'failed',
+                    error: isReady ? undefined : (item.kind === 'document' ? '文档解析失败，请检查文件格式或重试' : undefined),
                   }
                 : item,
             ),

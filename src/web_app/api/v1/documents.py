@@ -92,8 +92,18 @@ def rag_stats(user_id: int = Depends(get_current_user_id), db: Session = Depends
 @router.post("/documents/chat-upload")
 def chat_upload(file: UploadFile, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     try:
-        return ok(document_service.upload_chat_attachment(db, user_id, file))
+        result = document_service.upload_chat_attachment(db, user_id, file)
+        return ok(result)
     except ValueError as exc:
+        return fail("CHAT_UPLOAD_FAILED", str(exc))
+    except Exception as exc:
+        from src.web_app.core.errors import DocumentIngestError
+        if isinstance(exc, DocumentIngestError):
+            return fail(
+                "DOCUMENT_INGEST_FAILED",
+                str(exc),
+                details={"document_id": exc.document_id, "detail": exc.detail},
+            )
         return fail("CHAT_UPLOAD_FAILED", str(exc))
 
 
