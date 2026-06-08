@@ -71,6 +71,7 @@ class ArxivSource(FeedSource):
                     domain_hints=["ai", "research"],
                     provider="arxiv",
                     source_kind="search",
+                    search_query=query,
                 )
             )
         return items

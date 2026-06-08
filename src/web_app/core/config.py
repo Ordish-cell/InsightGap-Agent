@@ -121,8 +121,8 @@ class Settings(BaseSettings):
     feed_source_arxiv_enabled: bool = True
     feed_source_github_enabled: bool = True
     feed_source_duckduckgo_enabled: bool = True
-    feed_source_tavily_enabled: bool = False
-    feed_source_serpapi_enabled: bool = False
+    feed_source_tavily_enabled: bool = True
+    feed_source_serpapi_enabled: bool = True
     feed_source_manual_seed_enabled: bool = True
     feed_refresh_on_home_empty: bool = True
     feed_refresh_min_real_cards: int = 3

@@ -10,6 +10,106 @@ def _bucket_of(card: dict) -> str:
     return card.get("relation_type") or card.get("exposure_bucket") or card.get("search_bucket") or "far_domain"
 
 
+def _get_provider(card: dict) -> str:
+    """Extract provider from a card dict."""
+    return str(card.get("provider") or card.get("score", {}).get("provider", "")).lower()
+
+
+def enforce_provider_diversity(cards: list[dict]) -> list[dict]:
+    """Enforce provider diversity constraints on the mixed card list.
+
+    Rules:
+    - Total github cards <= 2
+    - far_domain provider != github
+    - adjacent_domain github <= 1
+    - Never remove the only card in a bucket — diversity trumps provider constraint.
+    """
+    # Count per-bucket github cards
+    bucket_cards: dict[str, list[int]] = {"explicit_related": [], "adjacent_domain": [], "far_domain": []}
+    github_total = 0
+    for i, card in enumerate(cards):
+        b = _bucket_of(card)
+        if b not in bucket_cards:
+            continue
+        bucket_cards[b].append(i)
+        if _get_provider(card) == "github":
+            github_total += 1
+
+    if github_total <= 2:
+        # Still check far_domain must not be github
+        to_drop: set[int] = set()
+        for b in ("far_domain",):
+            bucket_indices = [idx for idx in bucket_cards.get(b, [])]
+            github_in_bucket = [idx for idx in bucket_indices if _get_provider(cards[idx]) == "github"]
+            non_github_in_bucket = [idx for idx in bucket_indices if _get_provider(cards[idx]) != "github"]
+            for idx in github_in_bucket:
+                if len(non_github_in_bucket) + len(github_in_bucket) - len([x for x in github_in_bucket if x in to_drop or x == idx]) > 0:
+                    # There's at least one non-github card in this bucket, safe to drop github
+                    to_drop.add(idx)
+                    logger.warning("feed mixer provider diversity: dropping far_domain github card title=%s", (cards[idx].get("title") or "")[:80])
+                else:
+                    logger.warning("feed mixer provider diversity: keeping far_domain github card (only card in bucket) title=%s", (cards[idx].get("title") or "")[:80])
+        if to_drop:
+            cards = [c for i, c in enumerate(cards) if i not in to_drop]
+        return cards
+
+    # More than 2 github — need to drop excess
+    to_drop: set[int] = set()
+    # Priority for dropping: far_domain github > adjacent_domain github > explicit_related github
+    drop_order: list[tuple[int, int, str]] = []  # (priority, index, bucket)
+    bucket_priority = {"far_domain": 0, "adjacent_domain": 1, "explicit_related": 2}
+    for i, card in enumerate(cards):
+        if _get_provider(card) == "github":
+            b = _bucket_of(card)
+            drop_order.append((bucket_priority.get(b, 9), i, b))
+
+    drop_order.sort(key=lambda x: x[0])  # lowest priority first = drop far then adjacent then explicit
+
+    # Ensure each bucket keeps at least 1 card after drops
+    bucket_remaining = {b: len([idx for idx in bucket_cards[b] if idx not in to_drop]) for b in bucket_cards}
+
+    for _, idx, bkt in drop_order:
+        if github_total - len(to_drop) <= 2:
+            break
+        # Don't drop if it would empty the bucket
+        if bucket_remaining.get(bkt, 0) <= 1:
+            logger.warning("feed mixer provider diversity: keeping github card (last in bucket=%s) title=%s", bkt, (cards[idx].get("title") or "")[:80])
+            continue
+        to_drop.add(idx)
+        bucket_remaining[bkt] -= 1
+        logger.warning("feed mixer provider diversity: dropping github card bucket=%s title=%s", bkt, (cards[idx].get("title") or "")[:80])
+
+    # Also enforce far_domain != github
+    far_indices = bucket_cards.get("far_domain", [])
+    for idx in far_indices:
+        if idx in to_drop:
+            continue
+        if _get_provider(cards[idx]) == "github":
+            non_github_far = [j for j in far_indices if j not in to_drop and _get_provider(cards[j]) != "github"]
+            if non_github_far:
+                to_drop.add(idx)
+                logger.warning("feed mixer provider diversity: dropping far_domain github card title=%s", (cards[idx].get("title") or "")[:80])
+            else:
+                logger.warning("feed mixer provider diversity: cannot drop far_domain github (no non-github far) title=%s", (cards[idx].get("title") or "")[:80])
+
+    # Enforce adjacent_domain github <= 1
+    adj_indices = bucket_cards.get("adjacent_domain", [])
+    adj_github = [idx for idx in adj_indices if idx not in to_drop and _get_provider(cards[idx]) == "github"]
+    while len(adj_github) > 1:
+        idx = adj_github.pop()
+        if bucket_remaining.get("adjacent_domain", 0) <= 1:
+            break
+        to_drop.add(idx)
+        bucket_remaining["adjacent_domain"] -= 1
+        logger.warning("feed mixer provider diversity: dropping adjacent_domain github card title=%s", (cards[idx].get("title") or "")[:80])
+
+    if to_drop:
+        cards = [c for i, c in enumerate(cards) if i not in to_drop]
+        logger.warning("feed mixer provider diversity: dropped %d github cards, remaining=%d", len(to_drop), len(cards))
+
+    return cards
+
+
 def mix_cards(cards: list[dict], ratio_config: dict | None = None, limit: int = 20) -> tuple[list[dict], dict]:
     """Mix cards by bucket with hard targets. No cross-bucket fallback.
 
@@ -39,6 +139,20 @@ def mix_cards(cards: list[dict], ratio_config: dict | None = None, limit: int = 
         group = grouped[key]
         take = min(targets.get(key, 0), len(group))
         per_bucket[key] = group[:take]
+
+    # ── Enforce provider diversity BEFORE interleaving ──
+    # Flatten per_bucket into a list, enforce, then re-split
+    all_selected: list[dict] = []
+    for key in _BUCKET_ORDER:
+        all_selected.extend(per_bucket[key])
+    all_selected = enforce_provider_diversity(all_selected)
+
+    # Re-split after diversity enforcement
+    per_bucket = {"explicit_related": [], "adjacent_domain": [], "far_domain": []}
+    for card in all_selected:
+        b = _bucket_of(card)
+        if b in per_bucket:
+            per_bucket[b].append(card)
 
     # Interleave: pick one from each bucket in round-robin so same-domain/same-source cards
     # from the same bucket don't clump together and trigger _avoid_repetition drops.

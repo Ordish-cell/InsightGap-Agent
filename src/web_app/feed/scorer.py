@@ -56,13 +56,24 @@ def validate_bucket_semantics(title: str, summary: str, intended_bucket: str) ->
         return True, ""
 
     if intended_bucket == "far_domain":
+        # ── far_domain hard reject: agent/RAG/LangGraph/MCP terms ──
+        _far_forbidden_terms = [
+            "agentic retrieval", "agentic rag", "rag system", "langgraph", "langchain",
+            "mcp server", "model context protocol", "retrieval augmented generation",
+            "multi-agent framework", "llm agent", "agent framework", "tool use agent",
+            "agent runtime", "agent memory system", "agent 技术", "agent 领域",
+            "agent os", "与agent",
+        ]
+        text_lower = text
+        forbidden_hits = [kw for kw in _far_forbidden_terms if kw in text_lower]
+        if forbidden_hits:
+            return False, f"far_forbidden_terms(hits={','.join(forbidden_hits[:3])})"
+
         far_density = _count_keyword_density(text, _FAR_KEYWORDS)
-        # Only reject far_domain if it's clearly an agent/RAG/LangGraph/MCP paper
         _agent_rag_terms = {"agentic retrieval", "rag system", "langgraph", "langchain", "mcp server", "model context protocol", "retrieval augmented generation", "multi-agent framework"}
         hard_explicit = sum(1 for kw in _agent_rag_terms if kw in text)
         if hard_explicit >= 2:
             return False, f"far_has_agent_rag_terms(hits={hard_explicit})"
-        # Allow far_domain if it has at least one far-domain signal keyword
         if far_density > 0.0:
             return True, ""
         if explicit_density > 0.30:
@@ -115,6 +126,20 @@ class FeedScorer:
                 relation_type = search_bucket  # force keep — seeds are pre-written to match
         elif search_bucket in ("adjacent_domain", "far_domain"):
             is_valid, reason = validate_bucket_semantics(info_item.title or "", info_item.summary or "", search_bucket)
+            # far_domain additional check: reject GitHub provider unless tags show true far-domain theme
+            if is_valid and search_bucket == "far_domain" and source_kind_val == "search":
+                provider_val = (info_item.raw_metadata or {}).get("provider", "")
+                if provider_val == "github":
+                    # Check if tags/domain_hints are genuinely far-domain (product analytics, CI, edu, investment, PLG, etc.)
+                    far_allowed_tags = {"product analytics", "competitive intelligence", "education", "investment research",
+                                        "knowledge management", "product-led growth", "analytics", "market intelligence",
+                                        "adaptive learning", "alternative data", "behavioral analytics", "growth analytics",
+                                        "knowledge operations", "user feedback", "market signal", "industry intelligence"}
+                    meta_tags = set(t.lower() for t in (info_item.raw_metadata or {}).get("tags", []))
+                    if not (meta_tags & far_allowed_tags):
+                        is_valid = False
+                        reason = "far_github_provider_no_far_tags"
+                        logger.warning("far candidate rejected title=%s provider=%s reason=%s", (info_item.title or "")[:120], provider_val, reason)
             if is_valid:
                 relation_type = search_bucket
             else:

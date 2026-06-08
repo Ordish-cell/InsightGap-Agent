@@ -51,6 +51,7 @@ class RSSSource(FeedSource):
                     domain_hints=[],
                     provider="rss",
                     source_kind="search",
+                    search_query=source_url,
                 )
                 for entry in feed.entries
                 if entry.get("title")

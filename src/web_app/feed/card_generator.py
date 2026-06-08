@@ -64,6 +64,13 @@ _BENEFIT_TEMPLATES = {
         "「{title}」能让你在信息差 Agent OS 的规划中保持技术敏感度。",
         "「{title}」对理解用户需求和市场方向有帮助。",
     ],
+    # far_domain 专属 benefit —— 不写 Agent 技术
+    "far_domain": [
+        "「{title}」能帮你理解非技术领域的信号捕捉和反馈回路设计，这是 Feed 远域启发模块的核心能力。",
+        "「{title}」可以用于设计远域启发卡的评分与解释规则，把市场/用户信号转成可行动判断。",
+        "「{title}」在信号筛选和机会发现上的思路，可以迁移到 Feed 的非同温层信息采集流程中。",
+        "「{title}」展示的反馈回路机制，可以帮助你把信息差从技术资讯扩展为机会发现系统。",
+    ],
 }
 
 _GAP_TEMPLATES = {
@@ -98,6 +105,13 @@ _GAP_TEMPLATES = {
         "表面上「{title}」是一条普通的 AI 动态，但它连接了多个你关注的技术领域。",
         "大部分人看过「{title}」就忘，但如果你把它和 Agent OS 的路线图对照，会发现有价值的技术信号。",
     ],
+    # far_domain 专属 —— 不写 Agent 直接相关
+    "far_domain": [
+        "多数人把「{title}」当一条普通行业信息消费，但它展示的信号筛选和机会发现模式可以直接启发 Feed 远域模块的设计。",
+        "表面上「{title}」和你做的 Agent 系统没有直接关系，但它的反馈回路和信号捕捉机制值得远域启发模块借鉴。",
+        "这条信息本身不属于 Agent/RAG 圈，但展示了弱信号如何被产品化捕捉和放大。",
+        "远域启发点不在技术栈，而在信号筛选、反馈回路和机会发现流程——这正是「{title}」的价值所在。",
+    ],
 }
 
 _NEXT_ACTIONS = [
@@ -116,6 +130,13 @@ _VALUE_PREFIXES = {
     "startup": ["这条信息暗示了一个产品机会：", "它验证了市场对某类 AI 产品的需求：", "这个动态可能影响你的产品优先级：", "它揭示了一个值得关注的竞争信号："],
     "research": ["这项研究的结论值得关注：", "它揭示了一个可能改变技术路线的新发现：", "这个研究方向可能成为下一个能力突破点：", "它的实验结论对工程落地有直接启发："],
     "ai": ["这条信息标记了一个值得关注的趋势：", "它连接了多个你关注的技术方向：", "这个动态可能影响 AI 产品的下一阶段演进：", "它提供了一个跨领域的灵感信号："],
+    # far_domain 专属 —— 非 Agent 语言
+    "far_domain": [
+        "这条来自远域的信息展示了一种信号捕捉模式：",
+        "它来自非技术领域，但反馈机制值得借鉴：",
+        "这条信息标记了一个容易被技术圈忽略的机会信号：",
+        "它展示了如何把市场变化转成可行动的判断依据：",
+    ],
 }
 
 _WHY_RELEVANT_PREFIXES = {
@@ -125,6 +146,12 @@ _WHY_RELEVANT_PREFIXES = {
     "startup": ["你正在做的信息差 Agent OS 属于这个赛道，", "「{title}」能帮你判断产品定位是否准确，", "「{title}」可能影响你下一步的功能优先级决策，"],
     "research": ["你的 Deep Research 能力可以从「{title}」中获得方法升级，", "「{title}」和你的 Agent OS 研究模块高度相关，", "「{title}」的结论可能影响你的技术路线选择，"],
     "ai": ["「{title}」和你关注的多个技术方向都有交集，", "「{title}」能帮你保持对 AI 趋势的敏感度，", "「{title}」可能启发你的产品规划或技术选型，"],
+    # far_domain 专属 —— 不以 Agent 技术为核心
+    "far_domain": [
+        "它不是你当前技术栈的直接内容，但能启发 Feed 如何发现非同温层机会，",
+        "它能帮助你把信息差从技术资讯扩展为机会发现系统，",
+        "这条信息来自远域，价值不在于技术栈匹配，而在于信号捕捉和反馈回路设计，",
+    ],
 }
 
 
@@ -134,12 +161,14 @@ def generate_feed_card(info_item: Any, score: dict[str, Any], user_profile: Any)
     source_type = info_item.source_type or "web"
     interests = getattr(user_profile, "explicit_interests", None) or ["Agent", "RAG"]
     original_title = info_item.title
+    relation_type = score.get("relation_type", "far_domain")
+    source_kind = (info_item.raw_metadata or {}).get("source_kind", "")
 
-    chinese_title = _generate_chinese_title(original_title, source_type, tags, domain)
-    one_sentence_value = _generate_one_sentence_value(original_title, domain, tags, source_type)
-    why_relevant = _generate_why_relevant(original_title, domain, tags, interests, source_type)
-    benefit = _generate_benefit(domain, tags, original_title)
-    information_gap = _generate_information_gap(domain, tags, source_type, original_title)
+    chinese_title = _generate_chinese_title(original_title, source_type, tags, domain, relation_type, source_kind)
+    one_sentence_value = _generate_one_sentence_value(original_title, domain, tags, source_type, relation_type)
+    why_relevant = _generate_why_relevant(original_title, domain, tags, interests, source_type, relation_type)
+    benefit = _generate_benefit(domain, tags, original_title, relation_type)
+    information_gap = _generate_information_gap(domain, tags, source_type, original_title, relation_type)
     next_action = _generate_next_action(domain, source_type, original_title)
     summary = info_item.summary if info_item.summary and _contains_chinese(info_item.summary) else _generate_chinese_summary(original_title, info_item.summary, domain)
 
@@ -324,7 +353,7 @@ def _extract_entity_name(original_title: str) -> str:
     return shorten_title_words(clean, max_words=8, max_chars=60)
 
 
-def _generate_chinese_title(original_title: str, source_type: str, tags: list[str], domain: str) -> str:
+def _generate_chinese_title(original_title: str, source_type: str, tags: list[str], domain: str, relation_type: str = "", source_kind: str = "") -> str:
     clean = " ".join((original_title or "").split())
     if not clean:
         return "未命名信息差"
@@ -333,6 +362,10 @@ def _generate_chinese_title(original_title: str, source_type: str, tags: list[st
         return clean
     if _contains_chinese(clean):
         return clean[:61] + "…"
+
+    # far_domain: never use GitHub-style or Agent-style titles
+    if relation_type == "far_domain":
+        return _far_domain_title(clean, domain, tags, source_kind)
 
     if ":" in clean and source_type in ("arxiv", "paper"):
         return _arxiv_title(clean, domain, tags)
@@ -384,6 +417,26 @@ def _github_title(title: str, domain: str, tags: list[str]) -> str:
     return result
 
 
+def _far_domain_title(title: str, domain: str, tags: list[str], source_kind: str = "") -> str:
+    """Generate a far_domain title — NEVER mention Agent/GitHub/RAG/MCP directly."""
+    entity = _extract_entity_name(title)
+    topic = _build_cn_topic(title, tags, domain)
+    # For bucket_seed far_domain, use clean generic templates
+    templates = [
+        f"「{entity}」——远域信号捕捉模式",
+        f"从「{entity}」看非技术领域的反馈回路",
+        f"「{entity}」：弱信号如何被产品化捕捉",
+        f"远域启发：「{entity}」中的机会发现思路",
+        f"「{entity}」——信号筛选与行动判断",
+        f"来自{topic}领域的远域信号：「{entity}」",
+    ]
+    idx = hash(title) % len(templates)
+    result = templates[idx]
+    if len(result) > 64:
+        result = result[:61] + "…"
+    return result
+
+
 def _generic_cn_title(title: str, domain: str, tags: list[str], source_type: str) -> str:
     topic = _build_cn_topic(title, tags, domain)
     domain_cn = _DOMAIN_CN.get(domain, "AI")
@@ -403,8 +456,9 @@ def _generic_cn_title(title: str, domain: str, tags: list[str], source_type: str
     return result
 
 
-def _generate_one_sentence_value(title: str, domain: str, tags: list[str], source_type: str) -> str:
-    prefixes = _VALUE_PREFIXES.get(domain, _VALUE_PREFIXES["ai"])
+def _generate_one_sentence_value(title: str, domain: str, tags: list[str], source_type: str, relation_type: str = "") -> str:
+    template_key = "far_domain" if relation_type == "far_domain" else domain
+    prefixes = _VALUE_PREFIXES.get(template_key, _VALUE_PREFIXES["ai"])
     idx = hash(title + "value") % len(prefixes)
     keywords = _extract_keywords(title, tags)
     entity = _extract_entity_name(title)
@@ -419,28 +473,33 @@ def _generate_one_sentence_value(title: str, domain: str, tags: list[str], sourc
     return prefixes[idx] + suffix_templates[suffix_idx]
 
 
-def _generate_why_relevant(title: str, domain: str, tags: list[str], interests: list[str], source_type: str) -> str:
-    prefixes = _WHY_RELEVANT_PREFIXES.get(domain, _WHY_RELEVANT_PREFIXES["ai"])
+def _generate_why_relevant(title: str, domain: str, tags: list[str], interests: list[str], source_type: str, relation_type: str = "") -> str:
+    template_key = "far_domain" if relation_type == "far_domain" else domain
+    prefixes = _WHY_RELEVANT_PREFIXES.get(template_key, _WHY_RELEVANT_PREFIXES["ai"])
     idx = hash(title + "why") % len(prefixes)
     matched = [t for t in tags if t.lower() in " ".join(interests).lower()]
     entity = _extract_entity_name(title)
-    if matched:
+    if relation_type == "far_domain":
+        suffix = f"它和你当前的技术栈没有直接关系，但价值在于信号捕捉和机会发现的方法。"
+    elif matched:
         suffix = f"尤其涉及你关注的 {matched[0]}。"
     else:
         suffix = f"「{entity}」和你的信息差 Agent OS 技术路线有交集。"
     return prefixes[idx].format(title=entity) + suffix
 
 
-def _generate_benefit(domain: str, tags: list[str], title: str) -> str:
-    templates = _BENEFIT_TEMPLATES.get(domain, _BENEFIT_TEMPLATES["ai"])
+def _generate_benefit(domain: str, tags: list[str], title: str, relation_type: str = "") -> str:
+    template_key = "far_domain" if relation_type == "far_domain" else domain
+    templates = _BENEFIT_TEMPLATES.get(template_key, _BENEFIT_TEMPLATES["ai"])
     idx = hash(title + str(tags)) % len(templates)
     entity = _extract_entity_name(title)
     domain_cn = _DOMAIN_CN.get(domain, "AI")
     return templates[idx].format(title=entity, domain_cn=domain_cn)
 
 
-def _generate_information_gap(domain: str, tags: list[str], source_type: str, title: str) -> str:
-    templates = _GAP_TEMPLATES.get(domain, _GAP_TEMPLATES["ai"])
+def _generate_information_gap(domain: str, tags: list[str], source_type: str, title: str, relation_type: str = "") -> str:
+    template_key = "far_domain" if relation_type == "far_domain" else domain
+    templates = _GAP_TEMPLATES.get(template_key, _GAP_TEMPLATES["ai"])
     idx = hash(title + str(tags) + "gap") % len(templates)
     entity = _extract_entity_name(title)
     return templates[idx].format(title=entity)

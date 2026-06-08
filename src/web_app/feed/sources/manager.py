@@ -73,6 +73,8 @@ class SearchSourceManager:
 
         for bucket in BUCKET_ORDER:
             real_sources = self._build_real_sources(bucket)
+            bucket_providers_list = [s.name.replace("_source", "") for s in real_sources if s.enabled]
+            logger.info("bucket sources bucket=%s providers=%s", bucket, bucket_providers_list)
             bucket_items: list[RawFeedItem] = []
             real_count = 0
             bucket_providers: list[str] = []
@@ -168,11 +170,12 @@ class SearchSourceManager:
         if _rss_enabled():
             sources.append(RSSSource())
 
-        # GitHub — all buckets
-        gt = GITHUB_BUCKET_TOPICS.get(bucket, [])
-        gl = GITHUB_BUCKET_LANGUAGES.get(bucket, [])
-        if gt:
-            sources.append(GitHubSource(topics=gt[:3], languages=gl[:2]))
+        # GitHub — explicit + adjacent only, NEVER far_domain
+        if bucket != "far_domain":
+            gt = GITHUB_BUCKET_TOPICS.get(bucket, [])
+            gl = GITHUB_BUCKET_LANGUAGES.get(bucket, [])
+            if gt:
+                sources.append(GitHubSource(topics=gt[:3], languages=gl[:2]))
 
         # Arxiv — explicit + adjacent only
         if bucket != "far_domain":

@@ -258,6 +258,8 @@ def ensure_bucket_minimums(
             continue
 
         logger.warning("feed injecting bucket seeds bucket=%s needed=%d", bucket, needed)
+        if bucket == "far_domain":
+            logger.warning("far slot filled by bucket_seed because no valid real far result")
         seed_cards = _seed_cards_for_bucket(
             db, bucket, needed, info_repo, profile, feedback_stats,
             semantic_memories, scorer, existing_today,
@@ -830,6 +832,9 @@ def card_to_dict(card) -> dict:
         "summary": detail.get("summary", ""),
         "source_type": detail.get("source_type", ""),
         "source_name": detail.get("source_name", detail.get("source_type", "")),
+        "source_kind": detail.get("source_kind", ""),
+        "provider": detail.get("provider", ""),
+        "search_query": detail.get("search_query", ""),
         "source_url": _first_source_url(card),
         "published_at": detail.get("published_at"),
         "fetched_at": card.created_at.isoformat() if card.created_at else None,
@@ -886,6 +891,11 @@ def _process_items_into_cards(
         card["info_item_id"] = info_item.id
         card["source_url"] = info_item.source_url or ""
         card["content_hash"] = info_item.content_hash or ""
+        meta = info_item.raw_metadata or {}
+        card["source_kind"] = meta.get("source_kind", "")
+        card["provider"] = meta.get("provider", "")
+        card["search_query"] = meta.get("search_query", "")
+        card["search_bucket"] = meta.get("search_bucket", "")
         candidate_cards.append(card)
     return candidate_cards, created_info, updated_info
 
