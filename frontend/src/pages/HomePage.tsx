@@ -19,17 +19,39 @@ function relationOf(card: FeedCard) {
 
 function pickHomeFeeds(cards: FeedCard[]): PickedFeed[] {
   const picked: PickedFeed[] = []
+  const usedIds = new Set<number>()
+  const usedTitles = new Set<string>()
+  const usedUrls = new Set<string>()
+
+  function tryAdd(card: FeedCard, meta: { label: string; percent: string; className: string }): boolean {
+    if (usedIds.has(Number(card.id))) return false
+    const titleKey = (card.original_title || card.display_title || card.title || '').toLowerCase().slice(0, 80)
+    if (titleKey && usedTitles.has(titleKey)) return false
+    const sourceUrl = (card as Record<string, unknown>).source_url as string
+    if (sourceUrl && usedUrls.has(sourceUrl.toLowerCase())) return false
+    usedIds.add(Number(card.id))
+    if (titleKey) usedTitles.add(titleKey)
+    if (sourceUrl) usedUrls.add(sourceUrl.toLowerCase())
+    picked.push({ ...meta, card })
+    return true
+  }
+
+  // First pass: pick one per bucket
   for (const key of ['explicit_related', 'adjacent_domain', 'far_domain']) {
     const meta = relationMeta[key]
+    if (!meta) continue
     const match = cards.find((card) => relationOf(card) === key)
-    if (meta && match) picked.push({ ...meta, card: match })
+    if (match) tryAdd(match, meta)
   }
+
+  // Second pass: fill remaining slots from any bucket (no duplicates)
   for (const card of cards) {
     if (picked.length >= 3) break
-    if (picked.some((item) => item.card.id === card.id)) continue
-    const fallback = picked.length === 0 ? relationMeta.explicit_related : picked.length === 1 ? relationMeta.adjacent_domain : relationMeta.far_domain
-    if (fallback) picked.push({ ...fallback, card })
+    const rel = relationOf(card)
+    const meta = relationMeta[rel] || relationMeta.explicit_related
+    tryAdd(card, meta)
   }
+
   return picked.slice(0, 3)
 }
 
@@ -45,7 +67,6 @@ export function HomePage() {
   const navigate = useNavigate()
   const [cards, setCards] = useState<FeedCard[]>([])
   const [feedLoading, setFeedLoading] = useState(true)
-  const [feedError, setFeedError] = useState('')
   const [feedOpen, setFeedOpen] = useState(getInitialFeedOpen)
   const [selectedFeedCardId, setSelectedFeedCardId] = useState<number | null>(null)
 
@@ -57,11 +78,20 @@ export function HomePage() {
     feed.homeCards()
       .then((result) => {
         setCards(result.cards || [])
-        setFeedError(result.is_complete === false ? result.message || '真实 FeedCard 不足 3 条，请稍后刷新。' : '')
+        const refreshResult = result.refresh_result as Record<string, unknown> | undefined
+        if (refreshResult?.refreshed) {
+          const missing = refreshResult.missing_buckets as string[] | undefined
+          if (missing && missing.length > 0) {
+            console.warn('[feed] missing buckets after refresh:', missing.join(', '))
+          }
+          if (!refreshResult.is_complete) {
+            console.warn('[feed] batch incomplete, using available cards')
+          }
+        }
       })
       .catch((exc) => {
         setCards([])
-        setFeedError(exc instanceof Error ? exc.message : '首页信息差加载失败。')
+        console.warn('[feed] home cards load failed:', exc instanceof Error ? exc.message : String(exc))
       })
       .finally(() => setFeedLoading(false))
   }, [])
@@ -99,13 +129,11 @@ export function HomePage() {
                 <p className="feed-value-line">正在读取数据库并按配置尝试刷新真实来源。</p>
               </article>
             ) : null}
-            {!feedLoading && feedError ? (
-              <article className="floating-feed-card adjacent">
-                <h3>真实信息差暂时不足</h3>
-                <p className="feed-value-line">{feedError}</p>
-                <Link className="light-mini-button" to="/feed">
-                  去信息流查看
-                </Link>
+            {!feedLoading && !homeFeeds.length ? (
+              <article className="floating-feed-card explicit">
+                <h3>暂无信息差卡片</h3>
+                <p className="feed-value-line">请前往信息流页面手动刷新。</p>
+                <Link className="light-mini-button" to="/feed">去信息流查看</Link>
               </article>
             ) : null}
             {homeFeeds.map((item, index) => (
@@ -115,7 +143,7 @@ export function HomePage() {
                   <span className="mini-pill">{item.label}</span>
                   <span className="mini-pill score">分数：{Math.round((item.card.final_score || 0) * 100)}</span>
                 </div>
-                <h3>{item.card.display_title || item.card.title}</h3>
+                <h3 title={item.card.original_title || item.card.display_title || item.card.title}>{item.card.display_title || item.card.title}</h3>
                 <p className="feed-value-line">{item.card.one_sentence_value || item.card.summary || '这条信号可能带来新的判断角度。'}</p>
                 <div className="feed-relevance-line">
                   <strong>相关</strong>

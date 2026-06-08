@@ -46,6 +46,7 @@ class UserProfile(Base, TimestampMixin):
     preferred_outputs: Mapped[list[Any]] = mapped_column(JSON, default=json_default, nullable=False)
     risk_preference: Mapped[str] = mapped_column(String(32), default="normal", nullable=False)
     feed_ratio_config: Mapped[dict[str, float]] = mapped_column(JSON, default=feed_ratio_default, nullable=False)
+    last_feed_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     user: Mapped[User] = relationship(back_populates="profile")
 
@@ -93,7 +94,7 @@ class InfoItem(Base, TimestampMixin):
 
 class FeedCard(Base, TimestampMixin):
     __tablename__ = "feed_cards"
-    __table_args__ = (Index("ix_feed_cards_user_status", "user_id", "status"),)
+    __table_args__ = (Index("ix_feed_cards_user_status", "user_id", "status"), Index("ix_feed_cards_batch_id", "batch_id"))
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
@@ -109,6 +110,8 @@ class FeedCard(Base, TimestampMixin):
     final_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     exposure_bucket: Mapped[str] = mapped_column(String(32), default="explicit_related", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="new", nullable=False)
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class FeedFeedback(Base):

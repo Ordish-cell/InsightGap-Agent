@@ -128,6 +128,10 @@ class Settings(BaseSettings):
     feed_refresh_min_real_cards: int = 3
     feed_refresh_timeout_seconds: int = 45
     feed_refresh_dedup_enabled: bool = True
+    feed_refresh_total_limit: int = 5
+    feed_refresh_explicit_min: int = 2
+    feed_refresh_adjacent_min: int = 2
+    feed_refresh_far_min: int = 1
     agent_timeline_enabled: bool = True
     agent_langgraph_status_enabled: bool = True
     agent_langgraph_status_max_steps: int = 12

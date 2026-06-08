@@ -1,7 +1,75 @@
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from src.web_app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+# Words that indicate explicit agent/RAG content — should NOT appear in adjacent or far cards
+_EXPLICIT_KEYWORDS = {
+    "agentic retrieval", "agentic rag", "retrieval-augmented generation", "rag system",
+    "langgraph", "langchain", "multi-agent framework", "llm agent", "agent framework",
+    "mcp server", "model context protocol", "retrieval augmented generation",
+    "tool use agent", "tool calling agent", "agent memory system",
+}
+
+_ADJACENT_KEYWORDS = {
+    "workflow", "automation", "observability", "monitoring", "tracing",
+    "human-in-the-loop", "human in the loop", "approval", "productivity",
+    "coding assistant", "knowledge graph", "knowledge management",
+    "browser automation", "playwright", "prompt management", "context engineering",
+    "evaluation", "n8n", "temporal", "orchestration",
+}
+
+_FAR_KEYWORDS = {
+    "product analytics", "user feedback", "market intelligence", "market signal",
+    "startup", "enterprise", "education", "adaptive learning",
+    "investment", "competitive intelligence", "product discovery",
+    "product-led growth", "analytics", "knowledge ops", "alternative data",
+}
+
+
+def _count_keyword_density(text: str, keywords: set[str]) -> float:
+    """Return density of explicit keywords in text (0.0 to 1.0)."""
+    if not text:
+        return 0.0
+    text_lower = text.lower()
+    hits = sum(1 for kw in keywords if kw in text_lower)
+    return hits / max(1, len(text_lower.split()) // 10)
+
+
+def validate_bucket_semantics(title: str, summary: str, intended_bucket: str) -> tuple[bool, str]:
+    """Validate that content semantically matches its intended bucket. Returns (is_valid, reason)."""
+    text = f"{title or ''} {summary or ''}".lower()
+    if not text.strip():
+        return True, ""
+
+    explicit_density = _count_keyword_density(text, _EXPLICIT_KEYWORDS)
+
+    if intended_bucket == "adjacent_domain":
+        adjacent_density = _count_keyword_density(text, _ADJACENT_KEYWORDS)
+        if explicit_density > 0.30 and adjacent_density < 0.10:
+            return False, f"too_many_explicit_keywords(ed={explicit_density:.2f}_ad={adjacent_density:.2f})"
+        if explicit_density > 0.20 and adjacent_density < 0.05:
+            return False, f"explicit_dominant(ed={explicit_density:.2f}_ad={adjacent_density:.2f})"
+        return True, ""
+
+    if intended_bucket == "far_domain":
+        far_density = _count_keyword_density(text, _FAR_KEYWORDS)
+        # Only reject far_domain if it's clearly an agent/RAG/LangGraph/MCP paper
+        _agent_rag_terms = {"agentic retrieval", "rag system", "langgraph", "langchain", "mcp server", "model context protocol", "retrieval augmented generation", "multi-agent framework"}
+        hard_explicit = sum(1 for kw in _agent_rag_terms if kw in text)
+        if hard_explicit >= 2:
+            return False, f"far_has_agent_rag_terms(hits={hard_explicit})"
+        # Allow far_domain if it has at least one far-domain signal keyword
+        if far_density > 0.0:
+            return True, ""
+        if explicit_density > 0.30:
+            return False, f"far_no_signal_and_high_explicit(ed={explicit_density:.2f}_fd={far_density:.2f})"
+        return True, ""
+
+    return True, ""
 
 
 class FeedScorer:
@@ -34,7 +102,21 @@ class FeedScorer:
         )
         personal_relevance = _clamp(personal_relevance)
 
-        if profile_match >= 0.55:
+        search_bucket = (info_item.raw_metadata or {}).get("search_bucket", "")
+        if search_bucket in ("adjacent_domain", "far_domain"):
+            is_valid, reason = validate_bucket_semantics(info_item.title or "", info_item.summary or "", search_bucket)
+            if is_valid:
+                relation_type = search_bucket
+            else:
+                logger.info("feed bucket semantic reject bucket=%s title=%s reason=%s", search_bucket, (info_item.title or "")[:80], reason)
+                # Re-classify by text content
+                if profile_match >= 0.55:
+                    relation_type = "explicit_related"
+                elif profile_match >= 0.30:
+                    relation_type = "adjacent_domain"
+                else:
+                    relation_type = "far_domain"
+        elif profile_match >= 0.55:
             relation_type = "explicit_related"
         elif profile_match >= 0.30 or semantic_memory_match >= 0.30:
             relation_type = "adjacent_domain"

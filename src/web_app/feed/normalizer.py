@@ -33,12 +33,12 @@ def normalize_raw_item(raw: RawFeedItem) -> InfoItemCreate | None:
     source_type = raw.source_type or "unknown"
     tags = list(dict.fromkeys([*(raw.tags or []), *(raw.domain_hints or [])]))
     return InfoItemCreate(
-        title=title[:512],
-        summary=summary,
-        content=summary,
-        source_url=canonical_url or "",
+        title=title[:510],
+        summary=summary[:10000],
+        content=summary[:10000],
+        source_url=(canonical_url or "")[:1000],
         source_type=source_type,
-        author=raw.author or "",
+        author=(raw.author or "")[:240],
         published_at=raw.published_at,
         topics=tags,
         raw_metadata={
@@ -48,6 +48,7 @@ def normalize_raw_item(raw: RawFeedItem) -> InfoItemCreate | None:
             "tags": tags,
             "domain": infer_domain(tags, title + " " + summary),
             "source_credibility": SOURCE_CREDIBILITY.get(source_type, 0.40),
+            "search_bucket": raw.search_bucket,
         },
         content_hash=content_hash,
     )
@@ -59,7 +60,10 @@ def canonicalize_url(url: str | None) -> str:
     parts = urlsplit(url.strip())
     if not parts.scheme or not parts.netloc:
         return ""
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), "", ""))
+    # Strip utm_* query params and fragment
+    query_parts = parts.query.split("&")
+    clean_query = "&".join(p for p in query_parts if p and not p.startswith("utm_"))
+    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path.rstrip("/"), clean_query, ""))
 
 
 def stable_hash(value: str) -> str:

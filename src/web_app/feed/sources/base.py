@@ -15,6 +15,7 @@ class RawFeedItem:
     raw: dict[str, Any] = field(default_factory=dict)
     tags: list[str] = field(default_factory=list)
     domain_hints: list[str] = field(default_factory=list)
+    search_bucket: str = ""  # explicit_related, adjacent_domain, or far_domain
 
 
 class FeedSource:

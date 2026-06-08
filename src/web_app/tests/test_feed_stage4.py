@@ -102,7 +102,7 @@ def test_feed_score_formula_and_low_confidence():
 
 def test_feed_mixer_ratio_30_40_30():
     cards = [{"relation_type": relation, "final_score": 0.9 - i * 0.01, "domain": f"d{i}", "source_type": f"s{i}", "confidence": "high"} for i, relation in enumerate(["explicit_related"] * 5 + ["adjacent_domain"] * 5 + ["far_domain"] * 5)]
-    mixed = mix_cards(cards, {"explicit_related": 0.3, "adjacent_domain": 0.4, "far_domain": 0.3}, 10)
+    mixed, bucket_info = mix_cards(cards, {"explicit_related": 0.3, "adjacent_domain": 0.4, "far_domain": 0.3}, 10)
     assert len(mixed) == 10
 
 
