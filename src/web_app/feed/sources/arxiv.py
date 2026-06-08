@@ -69,6 +69,8 @@ class ArxivSource(FeedSource):
                     raw={"categories": categories},
                     tags=["paper", "arxiv", *categories],
                     domain_hints=["ai", "research"],
+                    provider="arxiv",
+                    source_kind="search",
                 )
             )
         return items

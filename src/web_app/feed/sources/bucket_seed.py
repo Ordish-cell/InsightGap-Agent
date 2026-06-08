@@ -3,6 +3,44 @@ import hashlib
 from src.web_app.feed.sources.base import FeedSource, RawFeedItem
 
 BUCKET_SEEDS: list[dict] = [
+    # Explicit domain seeds — used by full_seed_fallback when real search fails
+    {
+        "title": "LangGraph memory and tool routing patterns for Agent OS",
+        "summary": "LangGraph provides graph-based orchestration primitives for building stateful agent memory systems and tool routing patterns.",
+        "url": "https://github.com/langchain-ai/langgraph",
+        "source_type": "web",
+        "tags": ["agent", "langgraph", "memory", "tool routing"],
+        "domain_hints": ["agent", "langgraph", "devtools"],
+        "search_bucket": "explicit_related",
+    },
+    {
+        "title": "Dify workflow and agent application builder as Agent OS reference",
+        "summary": "Dify provides visual workflow orchestration, agent application templates, and RAG pipeline components useful for building an Agent OS.",
+        "url": "https://github.com/langgenius/dify",
+        "source_type": "web",
+        "tags": ["agent", "workflow", "llm app", "tool orchestration"],
+        "domain_hints": ["agent", "workflow", "devtools"],
+        "search_bucket": "explicit_related",
+    },
+    {
+        "title": "RAGAS evaluation patterns for RAG system quality",
+        "summary": "RAGAS provides standardized evaluation metrics for RAG systems, covering retrieval quality, answer faithfulness and relevance.",
+        "url": "https://github.com/explodinggradients/ragas",
+        "source_type": "web",
+        "tags": ["rag", "evaluation", "quality"],
+        "domain_hints": ["rag", "research", "devtools"],
+        "search_bucket": "explicit_related",
+    },
+    {
+        "title": "MCP server ecosystem as tool protocol reference",
+        "summary": "The Model Context Protocol standardizes how AI agents connect to tools and data, creating a reusable integration ecosystem.",
+        "url": "https://modelcontextprotocol.io/",
+        "source_type": "web",
+        "tags": ["mcp", "tool protocol", "agent tools"],
+        "domain_hints": ["mcp", "agent", "devtools"],
+        "search_bucket": "explicit_related",
+    },
+    # Adjacent domain seeds
     {
         "title": "LLM observability and tracing are becoming standard for AI products",
         "summary": "LLM tracing, evaluation dashboards and observability pipelines help teams debug multi-step AI workflows and catch quality regressions.",
@@ -138,5 +176,7 @@ class BucketSeedSource(FeedSource):
                 tags=seed.get("tags", []),
                 domain_hints=seed.get("domain_hints", []),
                 search_bucket=bucket,
+                source_kind="bucket_seed",
+                provider="bucket_seed",
             ))
         return items

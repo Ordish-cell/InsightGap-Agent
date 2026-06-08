@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+import logging
+
 from src.web_app.db.session import get_db
 from src.web_app.schemas.common import fail, ok
 from src.web_app.services.auth_service import get_current_user_id
@@ -10,10 +12,12 @@ from src.web_app.research.schemas import ResearchRequest
 from src.web_app.services.research_service import research_service
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 @router.post("/refresh")
 def refresh_feed(force: bool = Query(default=True), user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    logger.warning("manual feed refresh requested user=%s", user_id)
     try:
         result = maybe_refresh_for_user(db, user_id, force=force)
         return ok(result)

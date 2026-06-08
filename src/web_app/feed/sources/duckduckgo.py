@@ -13,24 +13,21 @@ DUCKDUCKGO_BUCKET_QUERIES: dict[str, list[str]] = {
         "RAG evaluation agent system",
     ],
     "adjacent_domain": [
-        "AI workflow automation n8n Temporal",
         "LLM observability tracing monitoring",
+        "AI workflow automation n8n Temporal",
         "human in the loop AI approval workflow",
+        "browser automation Playwright AI workflow",
         "developer productivity AI coding assistant",
+        "prompt management context engineering evaluation",
         "personal knowledge management AI knowledge graph",
-        "browser automation Playwright AI",
-        "context engineering prompt management",
-        "AI evaluation observability product",
     ],
     "far_domain": [
-        "AI product analytics user feedback loop",
-        "startup market intelligence signal detection",
-        "competitive intelligence product discovery",
-        "enterprise knowledge management workflow",
-        "education AI adaptive learning product",
-        "investment research alternative data AI",
-        "knowledge operations automation enterprise",
-        "product-led growth AI analytics",
+        "product analytics user feedback opportunity signals",
+        "competitive intelligence market signal monitoring",
+        "education AI adaptive learning feedback loop",
+        "investment research alternative data early market signals",
+        "enterprise knowledge operations continuous workflow",
+        "product-led growth behavioral analytics expansion opportunity",
     ],
 }
 
@@ -61,7 +58,13 @@ class DuckDuckGoSource(FeedSource):
                     if not row.get("title"):
                         continue
                     source_id = "duckduckgo:" + hashlib.sha256(row.get("href", "").encode()).hexdigest()
-                    items.append(RawFeedItem(source_id=source_id, source_type="web", title=row.get("title", ""), summary=row.get("body", ""), url=row.get("href"), raw=row, tags=["duckduckgo", "web_search"], domain_hints=[]))
+                    items.append(RawFeedItem(
+                        source_id=source_id, source_type="web",
+                        title=row.get("title", ""), summary=row.get("body", ""),
+                        url=row.get("href"), raw=row,
+                        tags=["duckduckgo", "web_search"], domain_hints=[],
+                        provider="duckduckgo", source_kind="search", search_query=q,
+                    ))
         except Exception:
             pass
         return items

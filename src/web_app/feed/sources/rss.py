@@ -11,7 +11,7 @@ class RSSSource(FeedSource):
     source_type = "blog"
 
     def __init__(self):
-        self.enabled = settings.feed_rss_enabled
+        self.enabled = settings.feed_rss_enabled and bool(settings.csv(settings.feed_rss_urls))
         self.max_items = settings.feed_rss_max_items
         self.urls = settings.csv(settings.feed_rss_urls)
 
@@ -49,6 +49,8 @@ class RSSSource(FeedSource):
                     raw={"source_name": source_name},
                     tags=["rss", "blog", source_name],
                     domain_hints=[],
+                    provider="rss",
+                    source_kind="search",
                 )
                 for entry in feed.entries
                 if entry.get("title")

@@ -13,53 +13,38 @@ const relationMeta: Record<string, { label: string; percent: string; className: 
   far_domain: { label: '远域启发', percent: '30%', className: 'far' },
 }
 
-function relationOf(card: FeedCard) {
-  return card.exposure_bucket || card.relation_type || ''
+function relationOf(card: FeedCard | null | undefined): string {
+  if (!card) return ''
+  return card?.exposure_bucket || card?.relation_type || ''
 }
 
-function pickHomeFeeds(cards: FeedCard[]): PickedFeed[] {
+function pickHomeFeeds(rawCards: FeedCard[]): PickedFeed[] {
+  // Defensive: filter out falsy cards
+  const safeCards = Array.isArray(rawCards) ? rawCards.filter(Boolean) : []
   const picked: PickedFeed[] = []
-  const usedIds = new Set<number>()
-  const usedTitles = new Set<string>()
-  const usedUrls = new Set<string>()
 
-  function tryAdd(card: FeedCard, meta: { label: string; percent: string; className: string }): boolean {
-    if (usedIds.has(Number(card.id))) return false
-    const titleKey = (card.original_title || card.display_title || card.title || '').toLowerCase().slice(0, 80)
-    if (titleKey && usedTitles.has(titleKey)) return false
-    const sourceUrl = (card as Record<string, unknown>).source_url as string
-    if (sourceUrl && usedUrls.has(sourceUrl.toLowerCase())) return false
-    usedIds.add(Number(card.id))
-    if (titleKey) usedTitles.add(titleKey)
-    if (sourceUrl) usedUrls.add(sourceUrl.toLowerCase())
-    picked.push({ ...meta, card })
-    return true
-  }
-
-  // First pass: pick one per bucket
   for (const key of ['explicit_related', 'adjacent_domain', 'far_domain']) {
     const meta = relationMeta[key]
     if (!meta) continue
-    const match = cards.find((card) => relationOf(card) === key)
-    if (match) tryAdd(match, meta)
+    const match = safeCards.find((card) => relationOf(card) === key)
+    if (match) picked.push({ ...meta, card: match })
   }
 
-  // Second pass: fill remaining slots from any bucket (no duplicates)
-  for (const card of cards) {
-    if (picked.length >= 3) break
-    const rel = relationOf(card)
-    const meta = relationMeta[rel] || relationMeta.explicit_related
-    tryAdd(card, meta)
+  if (picked.length < 3 && safeCards.length > 0) {
+    const found = picked.map((p) => relationOf(p?.card))
+    const missing = ['explicit_related', 'adjacent_domain', 'far_domain'].filter((k) => !found.includes(k))
+    console.warn(`[feed] home missing buckets: ${missing.join(', ')} (showing ${picked.length}/3)`)
   }
 
-  return picked.slice(0, 3)
+  return picked
 }
 
 function getInitialFeedOpen() {
-  const saved = localStorage.getItem('homeFeedOpen')
-  if (saved === 'false') return false
-  if (saved === 'true') return true
-  localStorage.setItem('homeFeedOpen', 'true')
+  try {
+    const saved = localStorage.getItem('homeFeedOpen')
+    if (saved === 'false') return false
+    if (saved === 'true') return true
+  } catch { /* localStorage not available */ }
   return true
 }
 
@@ -67,42 +52,76 @@ export function HomePage() {
   const navigate = useNavigate()
   const [cards, setCards] = useState<FeedCard[]>([])
   const [feedLoading, setFeedLoading] = useState(true)
+  const [feedError, setFeedError] = useState('')
   const [feedOpen, setFeedOpen] = useState(getInitialFeedOpen)
   const [selectedFeedCardId, setSelectedFeedCardId] = useState<number | null>(null)
 
   const homeFeeds = useMemo(() => pickHomeFeeds(cards), [cards])
-  const selectedFeedCard = useMemo(() => cards.find((card) => card.id === selectedFeedCardId), [cards, selectedFeedCardId])
+  const selectedFeedCard = useMemo(
+    () => cards.find((card) => card?.id === selectedFeedCardId),
+    [cards, selectedFeedCardId],
+  )
 
   useEffect(() => {
     setFeedLoading(true)
-    feed.homeCards()
-      .then((result) => {
-        setCards(result.cards || [])
-        const refreshResult = result.refresh_result as Record<string, unknown> | undefined
-        if (refreshResult?.refreshed) {
-          const missing = refreshResult.missing_buckets as string[] | undefined
-          if (missing && missing.length > 0) {
-            console.warn('[feed] missing buckets after refresh:', missing.join(', '))
+    setFeedError('')
+    try {
+      feed.homeCards()
+        .then((result) => {
+          const safeCards: FeedCard[] = Array.isArray(result?.cards) ? result.cards.filter(Boolean) : []
+          setCards(safeCards)
+
+          const refreshResult = result?.refresh_result as Record<string, unknown> | undefined
+          if (refreshResult?.refreshed) {
+            const missing = refreshResult.missing_buckets as string[] | undefined
+            if (missing && missing.length > 0) {
+              console.warn('[feed] missing buckets after refresh:', missing.join(', '))
+            }
+            if (!refreshResult.is_complete) {
+              console.warn('[feed] batch incomplete, using available cards')
+            }
+            const sourceSummary = refreshResult.source_summary as Record<string, { search_count: number; seed_count: number; providers: string[] }> | undefined
+            if (sourceSummary) {
+              for (const [bucket, info] of Object.entries(sourceSummary)) {
+                if (info?.seed_count > 0) {
+                  console.warn(`[feed] bucket ${bucket} used ${info.seed_count} seed(s) as fallback (real search: ${info.search_count})`)
+                }
+                if (info?.search_count === 0 && (info?.providers?.length ?? 0) > 0) {
+                  console.warn(`[feed] bucket ${bucket} has zero real search results, providers: ${info.providers.join(', ')}`)
+                }
+              }
+            }
           }
-          if (!refreshResult.is_complete) {
-            console.warn('[feed] batch incomplete, using available cards')
-          }
-        }
-      })
-      .catch((exc) => {
-        setCards([])
-        console.warn('[feed] home cards load failed:', exc instanceof Error ? exc.message : String(exc))
-      })
-      .finally(() => setFeedLoading(false))
+        })
+        .catch((exc) => {
+          setCards([])
+          setFeedError(exc instanceof Error ? exc.message : String(exc))
+          console.warn('[feed] home cards load failed:', exc instanceof Error ? exc.message : String(exc))
+        })
+        .finally(() => setFeedLoading(false))
+    } catch (exc) {
+      setCards([])
+      setFeedError(exc instanceof Error ? exc.message : String(exc))
+      setFeedLoading(false)
+    }
   }, [])
+
   useEffect(() => {
-    localStorage.setItem('homeFeedOpen', String(feedOpen))
+    try {
+      localStorage.setItem('homeFeedOpen', String(feedOpen))
+    } catch { /* ignore */ }
   }, [feedOpen])
 
   async function startResearch(cardId: number) {
-    const result = (await feed.startResearch(cardId)) as { id?: string }
-    if (result?.id) navigate(`/research/${result.id}`)
+    try {
+      const result = (await feed.startResearch(cardId)) as { id?: string }
+      if (result?.id) navigate(`/research/${result.id}`)
+    } catch { /* navigation will handle it */ }
   }
+
+  const isLoading = feedLoading
+  const hasCards = homeFeeds.length > 0
+  const hasError = !!feedError && !hasCards
 
   return (
     <section className="home-page">
@@ -123,53 +142,66 @@ export function HomePage() {
         </div>
         {feedOpen ? (
           <div className="floating-feed-grid">
-            {feedLoading ? (
+            {isLoading ? (
               <article className="floating-feed-card explicit">
                 <h3>正在加载真实信息差</h3>
                 <p className="feed-value-line">正在读取数据库并按配置尝试刷新真实来源。</p>
               </article>
             ) : null}
-            {!feedLoading && !homeFeeds.length ? (
+            {!isLoading && hasError ? (
               <article className="floating-feed-card explicit">
-                <h3>暂无信息差卡片</h3>
-                <p className="feed-value-line">请前往信息流页面手动刷新。</p>
+                <h3>加载失败</h3>
+                <p className="feed-value-line">{feedError || '未知错误'}</p>
                 <Link className="light-mini-button" to="/feed">去信息流查看</Link>
               </article>
             ) : null}
-            {homeFeeds.map((item, index) => (
-              <article className={`floating-feed-card ${item.className}`} style={{ animationDelay: `${index * 140}ms` }} key={`${item.label}-${item.card.id}`}>
-                <div className="floating-feed-card-top">
-                  <span className="mix-pill">{item.percent}</span>
-                  <span className="mini-pill">{item.label}</span>
-                  <span className="mini-pill score">分数：{Math.round((item.card.final_score || 0) * 100)}</span>
-                </div>
-                <h3 title={item.card.original_title || item.card.display_title || item.card.title}>{item.card.display_title || item.card.title}</h3>
-                <p className="feed-value-line">{item.card.one_sentence_value || item.card.summary || '这条信号可能带来新的判断角度。'}</p>
-                <div className="feed-relevance-line">
-                  <strong>相关</strong>
-                  <span>{item.card.why_relevant || item.card.why_you || '与你当前关注的方向有交集。'}</span>
-                </div>
-                <div className="feed-benefit-line">
-                  <strong>好处</strong>
-                  <span>{item.card.benefit || '可能对你的产品和技术决策有参考价值。'}</span>
-                </div>
-                <div className="mini-insight">
-                  <strong>信息差</strong>
-                  <span>{item.card.information_gap || '暂无明确信息差说明，可由后续研究补全。'}</span>
-                </div>
-                <div className="floating-feed-card-actions">
-                  <button className="light-mini-button" onClick={() => setSelectedFeedCardId(item.card.id)}>
-                    带入对话
-                  </button>
-                  <button className="dark-mini-button" onClick={() => startResearch(item.card.id)}>
-                    深度研究
-                  </button>
-                  <Link className="light-mini-button" to={`/feed/${item.card.id}`}>
-                    详情
-                  </Link>
-                </div>
+            {!isLoading && !hasError && !hasCards ? (
+              <article className="floating-feed-card explicit">
+                <h3>今日信息正在生成</h3>
+                <p className="feed-value-line">系统正在整理今日信息差，请稍后刷新或点击下方按钮重试。</p>
+                <Link className="light-mini-button" to="/feed">去信息流手动刷新</Link>
               </article>
-            ))}
+            ) : null}
+            {homeFeeds.map((item, index) => {
+              const c = item?.card
+              if (!c) return null
+              return (
+                <article className={`floating-feed-card ${item.className}`} style={{ animationDelay: `${index * 140}ms` }} key={`${item.label}-${c.id || index}`}>
+                  <div className="floating-feed-card-top">
+                    <span className="mix-pill">{item.percent}</span>
+                    <span className="mini-pill">{item.label}</span>
+                    <span className="mini-pill score">分数：{Math.round((c.final_score ?? 0) * 100)}</span>
+                  </div>
+                  <h3 title={c.original_title || c.display_title || c.title || ''}>
+                    {c.display_title || c.title || '未命名卡片'}
+                  </h3>
+                  <p className="feed-value-line">{c.one_sentence_value || c.summary || '这条信号可能带来新的判断角度。'}</p>
+                  <div className="feed-relevance-line">
+                    <strong>相关</strong>
+                    <span>{c.why_relevant || c.why_you || '与你当前关注的方向有交集。'}</span>
+                  </div>
+                  <div className="feed-benefit-line">
+                    <strong>好处</strong>
+                    <span>{c.benefit || '可能对你的产品和技术决策有参考价值。'}</span>
+                  </div>
+                  <div className="mini-insight">
+                    <strong>信息差</strong>
+                    <span>{c.information_gap || '暂无明确信息差说明，可由后续研究补全。'}</span>
+                  </div>
+                  <div className="floating-feed-card-actions">
+                    <button className="light-mini-button" onClick={() => setSelectedFeedCardId(c.id as unknown as number)}>
+                      带入对话
+                    </button>
+                    <button className="dark-mini-button" onClick={() => startResearch(c.id as unknown as number)}>
+                      深度研究
+                    </button>
+                    <Link className="light-mini-button" to={`/feed/${c.id}`}>
+                      详情
+                    </Link>
+                  </div>
+                </article>
+              )
+            })}
           </div>
         ) : null}
       </div>

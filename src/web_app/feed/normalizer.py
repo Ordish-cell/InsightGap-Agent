@@ -49,6 +49,9 @@ def normalize_raw_item(raw: RawFeedItem) -> InfoItemCreate | None:
             "domain": infer_domain(tags, title + " " + summary),
             "source_credibility": SOURCE_CREDIBILITY.get(source_type, 0.40),
             "search_bucket": raw.search_bucket,
+            "source_kind": raw.source_kind,
+            "provider": raw.provider,
+            "search_query": raw.search_query,
         },
         content_hash=content_hash,
     )

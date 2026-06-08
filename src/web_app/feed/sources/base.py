@@ -16,6 +16,9 @@ class RawFeedItem:
     tags: list[str] = field(default_factory=list)
     domain_hints: list[str] = field(default_factory=list)
     search_bucket: str = ""  # explicit_related, adjacent_domain, or far_domain
+    source_kind: str = "search"  # "search" | "bucket_seed" | "manual_seed"
+    provider: str = ""  # "duckduckgo" | "github" | "arxiv" | "tavily" | "serpapi" | "rss" | "bucket_seed" | "manual_seed"
+    search_query: str = ""  # the actual search query used
 
 
 class FeedSource:

@@ -47,6 +47,7 @@ class UserProfile(Base, TimestampMixin):
     risk_preference: Mapped[str] = mapped_column(String(32), default="normal", nullable=False)
     feed_ratio_config: Mapped[dict[str, float]] = mapped_column(JSON, default=feed_ratio_default, nullable=False)
     last_feed_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_feed_refresh_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     user: Mapped[User] = relationship(back_populates="profile")
 

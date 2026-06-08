@@ -43,23 +43,97 @@ class FeedRepository(BaseRepository[FeedCard]):
         ).scalar_one_or_none()
         return result
 
-    def existing_info_item_ids_today(self, user_id: int) -> set[int]:
+    def existing_info_item_ids_today(self, user_id: int, only_complete_batches: bool = False) -> set[int]:
+        """Return info_item_ids already used in today's feed cards.
+
+        If only_complete_batches=True, only considers cards from complete batches
+        (batches with >=5 cards across all 3 buckets). This prevents incomplete
+        batches from poisoning the dedup pool for subsequent retry attempts.
+        """
         today_start = datetime.combine(date.today(), datetime.min.time())
+        if not only_complete_batches:
+            rows = self.db.execute(
+                select(FeedCard.info_item_id).where(
+                    FeedCard.user_id == user_id,
+                    FeedCard.created_at >= today_start,
+                )
+            ).scalars().all()
+            return set(rows)
+
+        # Find complete batch IDs for today
+        # A complete batch has >=5 cards with explicit>=1, adjacent>=1, far>=1
+        batch_rows = self.db.execute(
+            select(FeedCard.batch_id, FeedCard.exposure_bucket, func.count(FeedCard.id)).where(
+                FeedCard.user_id == user_id,
+                FeedCard.created_at >= today_start,
+                FeedCard.batch_id.isnot(None),
+            ).group_by(FeedCard.batch_id, FeedCard.exposure_bucket)
+        ).all()
+
+        # Aggregate per-batch
+        batch_buckets: dict[str, dict[str, int]] = {}
+        for bid, bucket, cnt in batch_rows:
+            if bid not in batch_buckets:
+                batch_buckets[bid] = {}
+            batch_buckets[bid][bucket] = cnt
+
+        complete_batch_ids: set[str] = set()
+        for bid, buckets in batch_buckets.items():
+            total = sum(buckets.values())
+            if (total >= 5 and buckets.get("explicit_related", 0) >= 1
+                    and buckets.get("adjacent_domain", 0) >= 1
+                    and buckets.get("far_domain", 0) >= 1):
+                complete_batch_ids.add(bid)
+
+        if not complete_batch_ids:
+            return set()
+
         rows = self.db.execute(
             select(FeedCard.info_item_id).where(
                 FeedCard.user_id == user_id,
                 FeedCard.created_at >= today_start,
+                FeedCard.batch_id.in_(complete_batch_ids),
             )
         ).scalars().all()
         return set(rows)
 
     def bulk_create(self, rows: list[dict]) -> list[FeedCard]:
-        cards = [FeedCard(**row) for row in rows]
+        import logging
+        _logger = logging.getLogger(__name__)
+        cards = []
+        failed = 0
+        for i, row in enumerate(rows):
+            try:
+                cards.append(FeedCard(**row))
+            except Exception:
+                failed += 1
+                _logger.exception("feed bulk_create card construction failed row=%s keys=%s", i, list(row.keys())[:10])
+        if failed:
+            _logger.error("feed bulk_create construction failures: %s/%s cards could not be built", failed, len(rows))
         self.db.add_all(cards)
         self.db.commit()
         for card in cards:
             self.db.refresh(card)
+        if len(cards) != len(rows):
+            _logger.error("feed bulk_create mismatch input=%s constructed=%s", len(rows), len(cards))
         return cards
+
+    def bucket_counts_for_batch(self, user_id: int, batch_id: str) -> dict:
+        """Return {explicit_related: N, adjacent_domain: N, far_domain: N, total: N} for a batch."""
+        rows = self.db.execute(
+            select(FeedCard.exposure_bucket, func.count(FeedCard.id)).where(
+                FeedCard.user_id == user_id,
+                FeedCard.batch_id == batch_id,
+            ).group_by(FeedCard.exposure_bucket)
+        ).all()
+        counts = dict(rows)
+        total = sum(counts.values())
+        return {
+            "explicit_related": counts.get("explicit_related", 0),
+            "adjacent_domain": counts.get("adjacent_domain", 0),
+            "far_domain": counts.get("far_domain", 0),
+            "total": total,
+        }
 
     def count_by_batch(self, user_id: int, batch_id: str) -> int:
         return self.db.execute(

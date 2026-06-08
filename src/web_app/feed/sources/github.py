@@ -49,12 +49,12 @@ class GitHubSource(FeedSource):
                 response = await client.get("https://api.github.com/search/repositories", params={"q": query, "sort": "updated", "order": "desc", "per_page": min(10, self.max_items)}, headers=headers)
                 response.raise_for_status()
                 for repo in response.json().get("items", []):
-                    items.append(self._from_repo(repo))
+                    items.append(self._from_repo(repo, query))
                     if len(items) >= self.max_items:
                         break
         return items
 
-    def _from_repo(self, repo: dict[str, Any]) -> RawFeedItem:
+    def _from_repo(self, repo: dict[str, Any], query: str = "") -> RawFeedItem:
         topics = repo.get("topics") or []
         return RawFeedItem(
             source_id=f"github:{repo.get('full_name')}",
@@ -67,4 +67,7 @@ class GitHubSource(FeedSource):
             raw=repo,
             tags=["github", "repo", *(topics or [])],
             domain_hints=["ai", "agent", "devtools"],
+            provider="github",
+            source_kind="search",
+            search_query=query,
         )

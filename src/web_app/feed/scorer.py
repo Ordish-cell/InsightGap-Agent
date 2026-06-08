@@ -102,14 +102,23 @@ class FeedScorer:
         )
         personal_relevance = _clamp(personal_relevance)
 
+        source_kind_val = (info_item.raw_metadata or {}).get("source_kind", "")
         search_bucket = (info_item.raw_metadata or {}).get("search_bucket", "")
-        if search_bucket in ("adjacent_domain", "far_domain"):
+
+        # Bucket seeds must keep their intended bucket — never reclassify to explicit
+        if source_kind_val == "bucket_seed" and search_bucket in ("adjacent_domain", "far_domain"):
+            is_valid, reason = validate_bucket_semantics(info_item.title or "", info_item.summary or "", search_bucket)
+            if is_valid:
+                relation_type = search_bucket
+            else:
+                logger.error("far seed rejected title=%s summary=%s reason=%s", (info_item.title or "")[:120], (info_item.summary or "")[:120], reason)
+                relation_type = search_bucket  # force keep — seeds are pre-written to match
+        elif search_bucket in ("adjacent_domain", "far_domain"):
             is_valid, reason = validate_bucket_semantics(info_item.title or "", info_item.summary or "", search_bucket)
             if is_valid:
                 relation_type = search_bucket
             else:
                 logger.info("feed bucket semantic reject bucket=%s title=%s reason=%s", search_bucket, (info_item.title or "")[:80], reason)
-                # Re-classify by text content
                 if profile_match >= 0.55:
                     relation_type = "explicit_related"
                 elif profile_match >= 0.30:
@@ -132,7 +141,19 @@ class FeedScorer:
             0.30 * personal_relevance + 0.20 * novelty + 0.15 * cross_domain + 0.15 * opportunity + 0.10 * credibility + 0.10 * actionability,
             4,
         )
+        # Slight penalty for bucket seeds so real search results are preferred
+        source_kind = (info_item.raw_metadata or {}).get("source_kind", "")
+        if source_kind == "bucket_seed":
+            final = round(final - 0.03, 4)
         confidence = "low" if credibility < settings.feed_min_source_credibility or not info_item.source_url else "high" if final >= 0.6 else "medium"
+
+        # Bucket seeds must never be filtered or reclassified — they are deliberate fallbacks
+        if source_kind == "bucket_seed":
+            filtered = False
+            personal_relevance = max(personal_relevance, settings.feed_min_personal_relevance + 0.01)
+        else:
+            filtered = personal_relevance < settings.feed_min_personal_relevance
+
         return {
             "personal_relevance": personal_relevance,
             "novelty": novelty,
@@ -143,7 +164,7 @@ class FeedScorer:
             "final": final,
             "relation_type": relation_type,
             "confidence": confidence,
-            "filtered": personal_relevance < settings.feed_min_personal_relevance,
+            "filtered": filtered,
             "profile_match": profile_match,
             "semantic_memory_match": semantic_memory_match,
         }

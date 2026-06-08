@@ -63,6 +63,8 @@ class ManualSeedSource(FeedSource):
                 raw=row,
                 tags=row.get("tags", []),
                 domain_hints=row.get("domain_hints", []),
+                source_kind="manual_seed",
+                provider="manual_seed",
             )
             for row in rows[: self.max_items]
         ]
