@@ -34,3 +34,14 @@ class ToolCallRepository(BaseRepository[ToolCall]):
     def list_by_run(self, user_id: int, run_id: int) -> list[ToolCall]:
         stmt = select(ToolCall).where(ToolCall.user_id == user_id, ToolCall.run_id == run_id).order_by(ToolCall.created_at.desc())
         return list(self.db.execute(stmt).scalars())
+
+    def update_status(self, tool_call_id: int, status: str, output: dict | None = None, error_message: str | None = None) -> ToolCall:
+        obj = self.get_by_id(tool_call_id)
+        if not obj:
+            raise ValueError(f"ToolCall not found: {tool_call_id}")
+        kwargs: dict = {"status": status}
+        if output is not None:
+            kwargs["output"] = output
+        if error_message is not None:
+            kwargs["error_message"] = error_message
+        return self.update(obj, **kwargs)

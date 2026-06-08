@@ -820,39 +820,61 @@ class RuntimeNodes:
             return state
         try:
             route_plan = state.get("route_plan") or {}
-            if route_plan.get("needs_approval"):
+            tool_name, tool_input = infer_tool(state.get("user_input", ""), {**self.payload, "intent": route_plan.get("intent")})
+            if not tool_name:
+                append_error(state, "tool_agent", "tool_not_found")
+                mark_completed(state, "tool_agent")
+                return state
+
+            # Always go through mcp_service.call_tool — it handles approval creation internally
+            result = mcp_service.call_tool(self.db, state["user_id"], tool_name, tool_input,
+                                           agent_run_id=state["run_id"],
+                                           dry_run=bool(self.payload.get("dry_run", False)))
+            state["tool_call"] = result
+            state["tool_result"] = result
+
+            if result["status"] == "waiting_approval":
                 state["status"] = "waiting_approval"
-                state["tool_result"] = {
-                    "status": "approval_required",
-                    "tool_name": "inferred_from_input",
+                state["approval_required"] = True
+                approval_id = result.get("approval_id") or (result.get("output", {}).get("_metadata", {}).get("approval_id"))
+                state["approval_payload"] = {
+                    "approval_id": approval_id,
+                    "tool_name": tool_name,
                     "risk_level": route_plan.get("risk_level", "L3"),
-                    "summary": route_plan.get("reason", ""),
-                    "arguments_preview": {"user_input": state.get("user_input", "")},
+                    "tool_args": tool_input,
+                    "preview": result.get("output", {}),
+                    "run_id": state["run_id"],
+                    "user_id": state["user_id"],
+                    "title": f"需要你确认：{tool_name}",
+                    "actions": ["approve", "reject"],
                 }
-                append_output(state, "tool_agent", state["tool_result"])
+                append_output(state, "tool_agent", {"tool_name": tool_name, "status": "waiting_approval"})
                 record_step(self.db, state["run_id"], "tool_agent", "mcp_approval_required",
-                            {"route_plan": route_plan}, {"tool_result": state["tool_result"]})
+                            {"tool_name": tool_name, "tool_input": tool_input},
+                            {"status": "waiting_approval", "approval_id": approval_id})
                 append_status_step(
                     state,
                     key="tool_agent",
                     node_name="tool_agent",
                     status="waiting_approval",
                     detail=f"工具动作需要审批，风险等级 {route_plan.get('risk_level', 'L3')}",
-                    extra={"risk_level": route_plan.get("risk_level", "L3"), "dry_run": True, "approval_required": True},
+                    extra={"risk_level": route_plan.get("risk_level", "L3"), "tool_name": tool_name, "approval_required": True},
                 )
-                emit_visible_thought(self.db, state, "tool_agent")
-                mark_completed(state, "tool_agent")
-                return state
-
-            tool_name, tool_input = infer_tool(state.get("user_input", ""), self.payload)
-            if not tool_name:
-                append_error(state, "tool_agent", "tool_not_found")
+            elif result["status"] in {"failed", "blocked"}:
+                state["status"] = "failed"
+                state["error"] = result.get("error", "")
+                state["final_output"] = f"工具 {tool_name} 失败: {result.get('error', 'unknown')}"
+                append_error(state, "tool_agent", result.get("error", "tool_failed"))
+                record_step(self.db, state["run_id"], "tool_agent", "mcp_call",
+                            {"tool_name": tool_name}, {"status": result["status"], "error": result.get("error")}, status="failed")
+                append_status_step(
+                    state,
+                    key="tool_agent",
+                    node_name="tool_agent",
+                    detail=f"工具 {tool_name} 执行失败",
+                    extra={"risk_level": route_plan.get("risk_level", "L0"), "status": result["status"]},
+                )
             else:
-                result = mcp_service.call_tool(self.db, state["user_id"], tool_name, tool_input,
-                                               agent_run_id=state["run_id"],
-                                               dry_run=bool(self.payload.get("dry_run", False)))
-                state["tool_call"] = result
-                state["tool_result"] = result
                 append_output(state, "tool_agent", {"tool_name": tool_name, "status": result.get("status")})
                 record_step(self.db, state["run_id"], "tool_agent", "mcp_call",
                             {"tool_name": tool_name}, {"status": result.get("status")})

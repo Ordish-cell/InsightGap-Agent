@@ -49,6 +49,17 @@ _TOOL_TERMS = [
     "提交", "发布", "删除", "修改外部系统", "付款", "支付", "转账",
     "email", "send", "post", "submit", "delete", "payment",
     "执行", "运行命令",
+    # ── Local file operations ──
+    "创建文件", "写入文件", "修改文件", "保存到本地", "读取文件",
+    "列出目录", "打开文件", "删除文件", "新建文件", "写文件",
+    "写一个文件", "帮我创建", "帮我写", "写到本地", "写入本地",
+    "保存文件", "本地文件", "读写文件",
+    # ── Shell commands ──
+    "运行命令", "执行脚本", "shell", "terminal", "cmd", "powershell",
+    "命令行", "终端", "执行命令", "跑命令",
+    # ── Browser / form ──
+    "打开网页", "填写表单",
+    "发评论", "发布评论",
 ]
 
 _MEMORY_TERMS = [
@@ -158,10 +169,11 @@ def plan_route(
     is_memory_write = any(pattern in text for pattern in _MEMORY_WRITE_PATTERNS)
 
     llm_intent = str((home_intent or {}).get("intent") or (home_intent or {}).get("detected_intent") or "")
-    if not forced and llm_intent in {"chat", "research", "rag", "artifact", "feed_research", "tool", "tool.email", "tool.browser", "tool.comment", "tool.form_submit", "memory", "skill", "mixed"}:
+    _tool_intents = {"tool", "tool.email", "tool.local_file", "tool.browser", "tool.comment", "tool.form_submit", "tool.shell_readonly", "tool.shell_write", "tool.dangerous"}
+    if not forced and llm_intent in {"chat", "research", "rag", "artifact", "feed_research", "memory", "skill", "mixed"} | _tool_intents:
         intent = llm_intent  # type: ignore[assignment]
         reasons.append("home_intent_used")
-        if llm_intent.startswith("tool."):
+        if llm_intent.startswith("tool.") or llm_intent in _tool_intents:
             is_tool = True
 
     # Feed card deep-dive takes priority
@@ -263,18 +275,63 @@ def plan_route(
 
     # ── Risk assessment ─────────────────────────────────────────
     if is_tool:
-        high_risk = any(t in text for t in ["删除", "支付", "付款", "转账", "delete", "payment"])
-        ext_write = any(t in text for t in ["发邮件", "发送邮件", "评论", "发布", "提交", "email", "send", "post", "submit"])
-        high_risk = high_risk or any(t in text for t in ["删除", "支付", "付款", "转账", "delete", "payment"])
-        ext_write = ext_write or any(t in text for t in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交", "email", "send", "post", "submit"])
-        if high_risk:
+        # ── Detect sub-intents for finer risk ───────────────────
+        text = user_input.lower()
+        _is_email = any(t in text for t in ["发邮件", "发送邮件", "邮件", "email", "send", "mail", "给", "发一封"])
+        _is_local_write = any(t in text for t in ["创建文件", "写入文件", "修改文件", "保存到本地", "写文件", "写一个文件", "帮我创建", "帮我写", "写到本地", "写入本地", "保存文件", "新建文件", "写入"])
+        _is_local_read = any(t in text for t in ["读取文件", "列出目录", "打开文件", "查看文件", "帮我看看", "看看本地", "列出文件", "查看目录", "看看文件", "列出"])
+        _is_delete = any(t in text for t in ["删除", "delete", "remove", "rm "])
+        _is_shell = any(t in text for t in ["运行命令", "执行脚本", "shell", "terminal", "cmd", "powershell", "命令行", "终端", "执行命令", "跑命令"])
+        _is_browser = any(t in text for t in ["打开网页", "填写表单", "browser", "浏览器"])
+        _is_form = any(t in text for t in ["提交", "submit", "post", "发布评论", "发评论", "评论"])
+        _is_high_risk = any(t in text for t in ["删除全部", "删除数据库", "支付", "付款", "转账", "删除项目", "删除所有", "全部删除",
+                                                  "payment", "transfer", "drop database", "format", "shutdown",
+                                                  "rm -rf", "sudo ", "chmod 777", "chown"])
+
+        if _is_high_risk:
             risk_level = "L4"
             needs_approval = True
-            reasons.append("high_risk_l4")
-        elif ext_write:
+            intent = "tool.dangerous"
+            reasons.append("high_risk_l4_blocked")
+        elif _is_delete:
+            risk_level = "L4"
+            needs_approval = True
+            if _is_local_write:
+                intent = "tool.local_file"
+            reasons.append("delete_l4")
+        elif _is_shell and (_is_local_write or _is_delete):
+            risk_level = "L4"
+            needs_approval = True
+            intent = "tool.shell_write"
+            reasons.append("shell_write_l4")
+        elif _is_shell and not (_is_local_write or _is_delete):
+            risk_level = "L2"
+            intent = "tool.shell_readonly"
+            reasons.append("shell_readonly_l2")
+        elif _is_email and any(t in text for t in ["发邮件", "发送邮件", "send", "mail", "发一封"]):
             risk_level = "L3"
             needs_approval = True
-            reasons.append("external_write_l3")
+            intent = "tool.email"
+            reasons.append("email_send_l3")
+        elif _is_local_write:
+            risk_level = "L3"
+            needs_approval = True
+            intent = "tool.local_file"
+            reasons.append("local_file_write_l3")
+        elif _is_local_read:
+            risk_level = "L1"
+            intent = "tool.local_file" if not intent.startswith("tool.") else intent
+            reasons.append("local_file_read_l1")
+        elif _is_browser:
+            risk_level = "L3"
+            needs_approval = True
+            intent = "tool.browser"
+            reasons.append("browser_l3")
+        elif _is_form:
+            risk_level = "L3"
+            needs_approval = True
+            intent = "tool.form_submit"
+            reasons.append("form_submit_l3")
         elif intent == "tool":
             risk_level = "L2"
     elif intent in ("research", "feed_research", "rag"):
@@ -298,6 +355,14 @@ def plan_route(
         "document_qa": "document_summary",
         "artifact": "document_or_code",
         "tool": "action_result",
+        "tool.email": "action_result",
+        "tool.local_file": "action_result",
+        "tool.browser": "action_result",
+        "tool.comment": "action_result",
+        "tool.form_submit": "action_result",
+        "tool.shell_readonly": "action_result",
+        "tool.shell_write": "action_result",
+        "tool.dangerous": "action_result",
         "skill": "skill_draft",
         "memory": "memory_update",
         "mixed": "structured_report",

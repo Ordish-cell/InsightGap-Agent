@@ -160,6 +160,20 @@ class Settings(BaseSettings):
     qwen_advanced_model: str = "qwen3.6-max-preview"
     qwen_vision_model: str = "qwen3.6-plus"
     max_chat_upload_bytes: int = 20 * 1024 * 1024
+    # ── Local File Tools ───────────────────────────────────────────
+    local_tools_enabled: bool = True
+    local_tools_workspace_dir: str = "./agent_workspace"
+    local_tools_allow_delete: bool = False
+    local_tools_max_read_chars: int = 8000
+    local_tools_max_write_chars: int = 20000
+    # ── Email Provider ────────────────────────────────────────────
+    email_provider: str = "mock"  # mock | smtp
+    email_from: str = ""
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_use_tls: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",

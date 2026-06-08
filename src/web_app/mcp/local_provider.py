@@ -7,6 +7,24 @@ from src.web_app.db.repositories.artifact_repository import ArtifactRepository
 from src.web_app.services.artifact_service import artifact_service
 from src.web_app.services.memory_service import memory_service
 from src.web_app.services.skill_service import skill_service
+from src.web_app.mcp.local_file_tools import (
+    local_file_append,
+    local_file_delete,
+    local_file_list,
+    local_file_read,
+    local_file_write,
+)
+from src.web_app.mcp.email_provider import get_email_provider
+
+# Module-scope email provider instance (created once)
+_email_provider = None
+
+
+def _resolve_email_provider():
+    global _email_provider
+    if _email_provider is None:
+        _email_provider = get_email_provider()
+    return _email_provider
 
 
 class LocalMCPProvider:
@@ -20,7 +38,14 @@ class LocalMCPProvider:
             "memory_mcp.add": self._add_memory,
             "skill_mcp.create_draft": self._create_skill_draft,
             "email_mcp.create_draft": self._create_email_draft,
+            "email.send": self._send_email,
             "browser_mcp.plan_actions": self._plan_browser_actions,
+            # ── Local file tools ────────────────────────────
+            "local_file.list": self._list_local_files,
+            "local_file.read": self._read_local_file,
+            "local_file.write": self._write_local_file,
+            "local_file.append": self._append_local_file,
+            "local_file.delete": self._delete_local_file,
         }
         handler = handlers.get(tool_name)
         if not handler:
@@ -82,6 +107,46 @@ class LocalMCPProvider:
     def _plan_browser_actions(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
         url = payload.get("url") or "about:blank"
         return {"plan": [{"action": "open_url", "target": url}, {"action": "read_page", "target": url}, {"action": "summarize_for_goal", "target": payload.get("goal", "")}], "executed": False}
+
+    # ── Email send ──────────────────────────────────────────────
+    def _send_email(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        import asyncio
+        to = str(payload.get("to", ""))
+        subject = str(payload.get("subject", ""))
+        body = str(payload.get("body", ""))
+        provider = _resolve_email_provider()
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                future = concurrent.futures.Future()
+
+                async def _send():
+                    result = await provider.send_email(to, subject, body)
+                    future.set_result(result)
+
+                loop.create_task(_send())
+                return future.result(timeout=10)
+            return loop.run_until_complete(provider.send_email(to, subject, body))
+        except RuntimeError:
+            import asyncio as _asyncio
+            return _asyncio.run(provider.send_email(to, subject, body))
+
+    # ── Local file tools ────────────────────────────────────────
+    def _list_local_files(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        return local_file_list(path=str(payload.get("path", ".")))
+
+    def _read_local_file(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        return local_file_read(path=str(payload.get("path", "")), max_chars=payload.get("max_chars"))
+
+    def _write_local_file(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        return local_file_write(path=str(payload.get("path", "")), content=str(payload.get("content", "")), mode=str(payload.get("mode", "create_or_overwrite")))
+
+    def _append_local_file(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        return local_file_append(path=str(payload.get("path", "")), content=str(payload.get("content", "")))
+
+    def _delete_local_file(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        return local_file_delete(path=str(payload.get("path", "")))
 
 
 local_provider = LocalMCPProvider()

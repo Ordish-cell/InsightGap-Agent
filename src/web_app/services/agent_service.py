@@ -619,8 +619,12 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         already_streamed = state.get("_answer_delta_emitted", False)
         if state.get("approval_required") or state.get("status") == "waiting_approval":
             await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
-            record_event(db, run.id, "approval_required", state.get("approval_payload") or {}, user_id=user_id, thread_id=thread_id)
-            _queue_stream_event(stream_queue, "approval_required", state.get("approval_payload") or {}, run_id=run.id, thread_id=thread_id)
+            # Build rich approval_required payload with preview for frontend
+            approval_payload = _build_approval_sse_payload(state, run.id)
+            record_event(db, run.id, "approval_required", approval_payload, user_id=user_id, thread_id=thread_id)
+            _queue_stream_event(stream_queue, "approval_required", approval_payload, run_id=run.id, thread_id=thread_id)
+            # Emit run_paused to confirm the run is waiting
+            _queue_stream_event(stream_queue, "run_paused", {"status": "waiting_approval", "approval_id": approval_payload.get("approval_id")}, run_id=run.id, thread_id=thread_id)
         elif state.get("status") == "failed":
             record_event(db, run.id, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
             _queue_stream_event(stream_queue, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, run_id=run.id, thread_id=thread_id)
@@ -1140,3 +1144,24 @@ def _state_for_storage(state: dict[str, Any]) -> dict[str, Any]:
     data = dict(state)
     data.pop("_stream_queue", None)
     return data
+
+
+def _build_approval_sse_payload(state: dict[str, Any], run_id: int) -> dict[str, Any]:
+    """Build a rich SSE payload for the approval_required event."""
+    approval_payload = state.get("approval_payload") or {}
+    tool_call = state.get("tool_call") or {}
+    route_plan = state.get("route_plan") or {}
+
+    return {
+        "run_id": run_id,
+        "approval_id": approval_payload.get("approval_id"),
+        "risk_level": approval_payload.get("risk_level") or route_plan.get("risk_level", "L3"),
+        "tool_name": approval_payload.get("tool_name") or tool_call.get("tool_name", ""),
+        "title": approval_payload.get("title") or f"需要你确认操作",
+        "preview": approval_payload.get("preview") or tool_call.get("output", {}),
+        "tool_args": approval_payload.get("tool_args", {}),
+        "actions": ["approve", "reject"],
+        "safety_notes": approval_payload.get("safety_notes", []),
+        "status": "waiting_approval",
+        "user_id": state.get("user_id"),
+    }

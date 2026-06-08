@@ -4,6 +4,18 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+class ToolActionPlan(BaseModel):
+    """Structured plan for a tool action that may require approval."""
+    intent: str = ""
+    tool_name: str = ""
+    risk_level: str = "L0"
+    requires_approval: bool = False
+    args: dict[str, Any] = Field(default_factory=dict)
+    preview: dict[str, Any] = Field(default_factory=dict)
+    missing_fields: list[str] = Field(default_factory=list)
+    safety_notes: list[str] = Field(default_factory=list)
+
+
 class MCPToolSpec(BaseModel):
     name: str
     description: str = ""

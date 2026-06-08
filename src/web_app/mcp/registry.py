@@ -2,7 +2,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from src.web_app.core.constants import L0_READ_ONLY, L1_DRAFT, L2_LOCAL_WRITE
+from src.web_app.core.constants import L0_READ_ONLY, L1_DRAFT, L2_LOCAL_WRITE, L3_EXTERNAL_WRITE, L4_HIGH_RISK
 from src.web_app.db.repositories.mcp_repository import MCPServerRepository, MCPToolRepository
 from src.web_app.mcp.schemas import MCPToolRead, MCPToolSpec
 
@@ -80,6 +80,61 @@ BUILTIN_TOOLS = [
         safety_level=L1_DRAFT,
         input_schema={"type": "object", "properties": {"goal": {"type": "string"}, "url": {"type": "string"}}},
         output_schema={"type": "object", "properties": {"plan": {"type": "array"}, "executed": {"type": "boolean"}}},
+    ),
+    # ── Local file tools ──────────────────────────────────────
+    MCPToolSpec(
+        name="local_file.list",
+        description="List files in the allowed workspace directory.",
+        category="local_file",
+        safety_level=L0_READ_ONLY,
+        input_schema={"type": "object", "properties": {"path": {"type": "string", "default": "."}}},
+        output_schema={"type": "object", "properties": {"path": {"type": "string"}, "files": {"type": "array"}}},
+    ),
+    MCPToolSpec(
+        name="local_file.read",
+        description="Read a file in the allowed workspace directory.",
+        category="local_file",
+        safety_level=L0_READ_ONLY,
+        input_schema={"type": "object", "properties": {"path": {"type": "string"}, "max_chars": {"type": "integer"}}},
+        output_schema={"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}},
+    ),
+    MCPToolSpec(
+        name="local_file.write",
+        description="Write a file in the allowed workspace directory. Requires approval (L3).",
+        category="local_file",
+        safety_level=L3_EXTERNAL_WRITE,
+        requires_approval=True,
+        input_schema={"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "mode": {"type": "string", "default": "create_or_overwrite"}}},
+        output_schema={"type": "object", "properties": {"path": {"type": "string"}, "written": {"type": "boolean"}}},
+    ),
+    MCPToolSpec(
+        name="local_file.append",
+        description="Append content to a file in the workspace. Requires approval (L3).",
+        category="local_file",
+        safety_level=L3_EXTERNAL_WRITE,
+        requires_approval=True,
+        input_schema={"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}},
+        output_schema={"type": "object", "properties": {"path": {"type": "string"}, "written": {"type": "boolean"}}},
+    ),
+    MCPToolSpec(
+        name="local_file.delete",
+        description="Delete a file in the workspace. L4 – blocked by default.",
+        category="local_file",
+        safety_level=L4_HIGH_RISK,
+        requires_approval=True,
+        enabled=False,  # blocked by default
+        input_schema={"type": "object", "properties": {"path": {"type": "string"}}},
+        output_schema={"type": "object", "properties": {"path": {"type": "string"}, "deleted": {"type": "boolean"}}},
+    ),
+    # ── Email send ────────────────────────────────────────────
+    MCPToolSpec(
+        name="email.send",
+        description="Send an email. L3 – requires approval. Currently uses mock provider unless SMTP is configured.",
+        category="email",
+        safety_level=L3_EXTERNAL_WRITE,
+        requires_approval=True,
+        input_schema={"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}},
+        output_schema={"type": "object", "properties": {"sent": {"type": "boolean"}, "provider": {"type": "string"}, "message": {"type": "string"}}},
     ),
 ]
 

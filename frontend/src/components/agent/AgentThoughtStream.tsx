@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 
 import type { AgentChatMessage, AgentEvent, UnknownRecord } from '../../api/types'
+import { ApprovalCard, type ApprovalCardData } from './ApprovalCard'
 
 type AgentThoughtStreamProps = {
   message: AgentChatMessage & { trace_events?: AgentEvent[] }
@@ -77,33 +78,50 @@ function collectVisibleThoughts(message: AgentThoughtStreamProps['message']) {
   return items
 }
 
-function approvalFrom(message: AgentThoughtStreamProps['message']) {
+function approvalFrom(message: AgentThoughtStreamProps['message']): { approvalId: number; cardData: ApprovalCardData } {
   const event = (message.trace_events || []).find((item) => item.event_type === 'approval_required')
-  const payload = asRecord(event?.payload)
-  const approvalId = Number(payload.approval_id || asRecord(payload.approval_payload).approval_id || 0)
-  return { approvalId, payload }
+  if (!event) return { approvalId: 0, cardData: {} }
+
+  const payload = asRecord(event.payload)
+  // The SSE approval_required payload has the data directly
+  const approvalId = Number(payload.approval_id || 0)
+  const cardData: ApprovalCardData = {
+    approval_id: payload.approval_id,
+    run_id: payload.run_id,
+    risk_level: String(payload.risk_level || 'L3'),
+    tool_name: String(payload.tool_name || ''),
+    title: String(payload.title || '需要你确认'),
+    preview: asRecord(payload.preview),
+    tool_args: asRecord(payload.tool_args),
+    safety_notes: Array.isArray(payload.safety_notes) ? payload.safety_notes : [],
+    actions: Array.isArray(payload.actions) ? payload.actions : ['approve', 'reject'],
+  }
+  return { approvalId, cardData }
 }
 
 export function AgentThoughtStream({ message, locale, onApprove, onReject }: AgentThoughtStreamProps) {
   const thoughts = collectVisibleThoughts(message)
   const status = String(message.status || 'completed')
   const running = ['thinking', 'running', 'created', 'queued'].includes(status)
+  const waitingApproval = status === 'waiting_approval'
   const answering = status === 'streaming'
   const failed = status === 'failed'
   const elapsed = seconds(message.elapsed_ms)
   const label = answering
     ? text(locale, zhText.answering, 'Answering')
-    : running
-      ? text(locale, zhText.thinking, 'Thinking')
-      : failed
-        ? text(locale, zhText.failed, 'Thinking interrupted')
-        : text(locale, zhText.completed, 'Completed reasoning')
-  const { approvalId, payload } = approvalFrom(message)
-  const [open, setOpen] = useState(running || failed)
+    : waitingApproval
+      ? '等待审批'
+      : running
+        ? text(locale, zhText.thinking, 'Thinking')
+        : failed
+          ? text(locale, zhText.failed, 'Thinking interrupted')
+          : text(locale, zhText.completed, 'Completed reasoning')
+  const { approvalId, cardData } = approvalFrom(message)
+  const [open, setOpen] = useState(running || failed || waitingApproval)
 
   useEffect(() => {
-    setOpen(running || failed)
-  }, [failed, running, message.message_id])
+    setOpen(running || failed || waitingApproval)
+  }, [failed, running, waitingApproval, message.message_id])
 
   if (!thoughts.length && !running && !failed && !answering && !approvalId) return null
 
@@ -123,15 +141,12 @@ export function AgentThoughtStream({ message, locale, onApprove, onReject }: Age
         </div>
       ) : null}
       {approvalId && open ? (
-        <div className="approval-inline-actions thought-actions">
-          <small>{String(payload.risk_level || payload.permission_level || 'L3')}</small>
-          <button className="light-mini-button" type="button" onClick={() => onApprove(approvalId)}>
-            {text(locale, zhText.approve, 'Approve')}
-          </button>
-          <button className="light-mini-button" type="button" onClick={() => onReject(approvalId)}>
-            {text(locale, zhText.reject, 'Reject')}
-          </button>
-        </div>
+        <ApprovalCard
+          data={cardData}
+          locale={locale}
+          onApprove={onApprove}
+          onReject={onReject}
+        />
       ) : null}
     </div>
   )

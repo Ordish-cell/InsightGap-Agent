@@ -2,7 +2,7 @@ from typing import Any, Literal, TypedDict
 
 AgentRoute = Literal["research", "rag", "artifact", "skill", "memory", "tool", "blocked", "approval", "chat", "feed_research", "mixed"]
 
-AgentIntent = Literal["chat", "research", "rag", "artifact", "tool", "tool.email", "tool.browser", "tool.comment", "tool.form_submit", "memory", "skill", "feed_research", "mixed"]
+AgentIntent = Literal["chat", "research", "rag", "artifact", "tool", "tool.email", "tool.local_file", "tool.browser", "tool.comment", "tool.form_submit", "tool.shell_readonly", "tool.shell_write", "tool.dangerous", "memory", "skill", "feed_research", "mixed"]
 
 RiskLevel = Literal["L0", "L1", "L2", "L3", "L4"]
 
