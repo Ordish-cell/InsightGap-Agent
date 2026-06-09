@@ -11,14 +11,15 @@ from src.web_app.agent.llm.factory import get_chat_model
 from src.web_app.agent.llm.router import resolve_model_name
 from src.web_app.agent.llm.usage import record_llm_call
 from src.web_app.agent.runtime.checkpoint import record_event, record_step
-from src.web_app.agent.runtime.intent_llm import infer_home_intent_with_llm
-from src.web_app.agent.runtime.intent_schema import HomeIntentResult
+from src.web_app.agent.runtime.intent_llm import infer_home_intent_with_llm, llm_select_tools
+from src.web_app.agent.runtime.intent_schema import HomeIntentResult, LLMToolSelectionResult
 from src.web_app.agent.runtime.langgraph_status import append_status_step
 from src.web_app.agent.runtime.planner import plan_route
 from src.web_app.agent.runtime.router import route_user_input
 from src.web_app.agent.runtime.state import AgentRuntimeState, append_error, append_output, mark_completed
 from src.web_app.agent.runtime.visible_thoughts import emit_visible_thought, visible_thought_texts
-from src.web_app.mcp.tool_router import infer_tool
+from src.web_app.mcp.registry import BUILTIN_TOOLS
+from src.web_app.mcp.tool_router import _build_email_input, infer_tool, validate_tool_input
 from src.web_app.context.builder import ContextBuilder
 from src.web_app.core.constants import L3_EXTERNAL_WRITE, L4_HIGH_RISK
 from src.web_app.db.repositories.agent_repository import AgentChatMessageRepository, AgentStepRepository
@@ -40,6 +41,68 @@ EXTERNAL_WRITE_TERMS = ("发邮件", "发送邮件", "邮件", "评论", "发布
 HIGH_RISK_TERMS = ("删除", "支付", "付款", "转账", "delete", "payment")
 
 logger = logging.getLogger(__name__)
+
+
+def _is_obvious_email_intent(db: Session, user_text: str, route_plan: dict[str, Any]) -> bool:
+    """Check if user clearly wants to send email — prevents false tool_not_found.
+
+    Conditions: email.send is registered AND (user has email address in text OR clear email keywords).
+    """
+    import re
+    from src.web_app.mcp.registry import registry as mcp_registry
+    if mcp_registry.get_tool(db, "email.send") is None:
+        return False
+    text = user_text.lower()
+    has_address = bool(re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', user_text))
+    has_email_semantics = any(kw in text for kw in (
+        "发邮件", "发送邮件", "send email", "send mail", "mail", "寄邮件",
+        "给", "发给", "发一封",
+    ))
+    return has_address or has_email_semantics
+
+
+def _build_missing_fields_answer(
+    tool_name: str,
+    provided_args: dict[str, Any],
+    missing_fields: list[dict[str, str]],
+) -> str:
+    """Generate a natural-language Chinese response asking the user to fill in missing fields.
+
+    Does NOT create approval, does NOT execute the tool.
+    """
+    # ── Per-tool templates for what was recognized ──
+    if tool_name == "email.send":
+        parts = ["可以，我已经识别到你要发送邮件"]
+        if provided_args.get("to"):
+            parts.append(f"收件人是 {provided_args['to']}")
+        if provided_args.get("subject"):
+            parts.append(f"主题是「{provided_args['subject']}」")
+        if provided_args.get("body"):
+            body_preview = str(provided_args["body"])[:100]
+            parts.append(f"正文是「{body_preview}」")
+        questions = [m["question"] for m in missing_fields]
+        answer = "，".join(parts) + "。还需要补充：" + "；".join(questions)
+        return answer
+
+    elif tool_name in ("local_file.write", "local_file.append"):
+        parts = ["可以，我已经识别到你要写入文件"]
+        if provided_args.get("path"):
+            parts.append(f"路径是「{provided_args['path']}」")
+        if provided_args.get("content"):
+            content_preview = str(provided_args["content"])[:100]
+            parts.append(f"内容是「{content_preview}」")
+        questions = [m["question"] for m in missing_fields]
+        answer = "，".join(parts) + "。还需要补充：" + "；".join(questions)
+        return answer
+
+    elif tool_name == "local_file.read":
+        questions = [m["question"] for m in missing_fields]
+        return "可以，但还需要补充信息：" + "；".join(questions)
+
+    # ── Generic fallback ──
+    questions = [m["question"] for m in missing_fields]
+    provided_desc = ", ".join(f"{k}={str(v)[:80]}" for k, v in provided_args.items())
+    return f"可以，我已经识别到你要执行 {tool_name}。已提供：{provided_desc}。还需要补充：" + "；".join(questions)
 
 
 class RuntimeNodes:
@@ -918,9 +981,98 @@ class RuntimeNodes:
 
         try:
             route_plan = state.get("route_plan") or {}
-            tool_name, tool_input = infer_tool(state.get("user_input", ""), {**self.payload, "intent": route_plan.get("intent")})
+            user_text = state.get("user_input", "")
+
+            # ── LLM tool selection (first entry only, reused on resume) ──
+            llm_selection = None
+            if state.get("llm_tool_selection"):
+                # Reuse stored result (dict form from model_dump)
+                try:
+                    llm_selection = LLMToolSelectionResult.model_validate(state["llm_tool_selection"])
+                except Exception:
+                    llm_selection = None
+            elif state.get("status") != "resuming":
+                # First entry: call LLM
+                try:
+                    available_tools = [
+                        {
+                            "name": spec.name,
+                            "description": spec.description,
+                            "risk_level": spec.safety_level,
+                            "requires_approval": spec.requires_approval,
+                            "aliases": spec.aliases,
+                            "input_schema": spec.input_schema,
+                        }
+                        for spec in BUILTIN_TOOLS
+                        if spec.enabled
+                    ]
+                    llm_selection = llm_select_tools(
+                        self.db,
+                        run_id=state["run_id"],
+                        thread_id=state.get("thread_id", ""),
+                        user_id=state["user_id"],
+                        user_input=user_text,
+                        available_tools=available_tools,
+                    )
+                    state["llm_tool_selection"] = llm_selection.model_dump()
+                    logger.info(
+                        "[LLM_TOOL_SELECT_DEBUG] available_tools_count=%d user_text=%.200s "
+                        "confidence=%.2f tool_name=%s route=%s missing_fields=%s",
+                        len(available_tools), user_text[:200],
+                        llm_selection.confidence,
+                        llm_selection.tool_calls[0].name if llm_selection.tool_calls else "",
+                        llm_selection.route,
+                        str(llm_selection.missing_fields)[:200],
+                    )
+                except Exception as exc:
+                    logger.warning("[LLM_TOOL_SELECT_DEBUG] llm_select_tools failed, falling back to keywords: %s", exc)
+                    state["llm_tool_selection"] = None
+                    llm_selection = None
+
+            tool_name, tool_input = infer_tool(
+                user_text,
+                {**self.payload, "intent": route_plan.get("intent")},
+                llm_result=llm_selection,
+            )
+
+            # ── Hard fallback guard: obvious email intent must never become tool_not_found ──
+            if not tool_name and _is_obvious_email_intent(self.db, user_text, route_plan):
+                logger.warning(
+                    "[TOOL_NOT_FOUND_DEBUG] requested_tool=email.send normalized_tool=email.send "
+                    "registered_tools=[email.send,...] user_text=%.200s — forcing email.send fallback",
+                    user_text[:200],
+                )
+                tool_name = "email.send"
+                tool_input = _build_email_input(user_text, self.payload)
+
             if not tool_name:
+                logger.warning(
+                    "[TOOL_NOT_FOUND_DEBUG] requested_tool=<none> normalized_tool=<none> "
+                    "registered_tools=%s planner_raw_output=%s user_text=%.200s",
+                    list(t.name for t in BUILTIN_TOOLS if t.enabled),
+                    str(route_plan)[:200],
+                    user_text[:200],
+                )
                 append_error(state, "tool_agent", "tool_not_found")
+                mark_completed(state, "tool_agent")
+                return state
+
+            # ── Missing fields guard: stop BEFORE approval/execution ──
+            cleaned_args, missing = validate_tool_input(tool_name, tool_input)
+            if missing:
+                answer = _build_missing_fields_answer(tool_name, cleaned_args, missing)
+                state["final_output"] = answer
+                state["tool_call"] = {
+                    "status": "missing_fields",
+                    "tool_name": tool_name,
+                    "provided_args": cleaned_args,
+                    "missing_fields": missing,
+                }
+                logger.info(
+                    "[LLM_TOOL_SELECT_DEBUG] tool=%s missing_fields=%s — stopping for user clarification",
+                    tool_name, str(missing)[:200],
+                )
+                emit_visible_thought(self.db, state, "tool_agent")
                 mark_completed(state, "tool_agent")
                 return state
 

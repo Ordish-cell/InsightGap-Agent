@@ -82,6 +82,28 @@ def _is_sensitive(filename: str) -> bool:
     return bool(_BLOCKED_REGEX.search(Path(filename).name))
 
 
+# ── Tool aliases declared at provider registration point ──────────
+LOCAL_FILE_TOOL_ALIASES: dict[str, list[str]] = {
+    "local_file.write": [
+        "写文件", "创建文件", "写入文件", "保存文件", "新建文件",
+        "write_file", "create_file",
+    ],
+    "local_file.read": [
+        "读文件", "读取文件", "查看文件", "打开文件", "看看文件",
+        "read_file",
+    ],
+    "local_file.list": [
+        "列出文件", "文件列表", "ls", "list_files", "查看目录",
+        "列出目录", "看看workspace", "看看本地",
+    ],
+    "local_file.append": [
+        "追加文件", "追加写入", "追加", "append_file",
+    ],
+    "local_file.delete": [
+        "删除文件", "delete_file", "rm",
+    ],
+}
+
 # ── Tool implementations ──────────────────────────────────────
 
 

@@ -26,6 +26,7 @@ class MCPToolSpec(BaseModel):
     enabled: bool = True
     requires_approval: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
+    aliases: list[str] = Field(default_factory=list)
 
 
 class MCPToolRead(BaseModel):

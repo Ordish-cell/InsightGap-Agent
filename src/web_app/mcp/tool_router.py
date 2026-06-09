@@ -1,4 +1,12 @@
-from typing import Any
+from __future__ import annotations
+
+import logging
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.web_app.agent.runtime.intent_schema import LLMToolSelectionResult
+
+logger = logging.getLogger(__name__)
 
 TOOL_HINTS = {
     "search": "search_mcp.search",
@@ -29,14 +37,52 @@ _INTENT_TOOL_MAP: dict[str, str] = {
 }
 
 
-def infer_tool(user_input: str, payload: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+def infer_tool(
+    user_input: str,
+    payload: dict[str, Any],
+    llm_result: "LLMToolSelectionResult | None" = None,  # noqa: F821
+) -> tuple[str | None, dict[str, Any]]:
+    """Determine tool name and input from user text, LLM result, or payload.
+
+    Priority:
+    1. Explicit tool_name in payload
+    2. LLM result (confidence >= 0.5)
+    3. Intent → tool map from payload
+    4. Keyword matching on user_input (fallback)
+    """
+    # 1. Explicit tool_name
     if payload.get("tool_name"):
         return payload["tool_name"], payload.get("tool_input", payload.get("input", {}))
+
+    # 2. LLM result (primary path for natural language)
+    if llm_result is not None and llm_result.confidence >= 0.5 and llm_result.tool_calls:
+        from src.web_app.mcp.registry import normalize_tool_name
+        first_call = llm_result.tool_calls[0]
+        raw_name = first_call.name
+        canonical = normalize_tool_name(raw_name)
+        args = first_call.arguments
+        cleaned_args, missing = validate_tool_input(canonical, args)
+        logger.info(
+            "[LLM_TOOL_SELECT_DEBUG] available_tools_count=%d user_text=%.200s raw_model_output=%.300s "
+            "parsed_tool_calls=[%s] normalized_tool=%s final_args=%s missing_fields=%s confidence=%.2f",
+            -1,  # count filled in caller
+            user_input[:200],
+            raw_name[:300],
+            canonical,
+            canonical,
+            str(cleaned_args)[:300],
+            str(missing)[:200],
+            llm_result.confidence,
+        )
+        return canonical, cleaned_args
+
+    # 3. Intent → tool map
     if payload.get("intent"):
         tool_name = _INTENT_TOOL_MAP.get(payload["intent"])
         if tool_name:
             return tool_name, _build_input_for_tool(tool_name, user_input, payload)
 
+    # 4. Keyword fallback (existing behavior, unchanged)
     text = user_input.lower()
     if "github" in text:
         return TOOL_HINTS["github"], {"repo": payload.get("repo", "owner/name")}
@@ -170,3 +216,93 @@ def _build_input_for_tool(tool_name: str, user_input: str, payload: dict[str, An
     if tool_name == "local_file.append":
         return {"path": payload.get("path", ""), "content": payload.get("content", user_input)}
     return {}
+
+
+# ── Tool input validation ─────────────────────────────────────────
+
+def validate_tool_input(
+    tool_name: str, arguments: dict[str, Any]
+) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """Validate arguments against the tool's input_schema.
+
+    Returns (cleaned_args, missing_fields).
+    missing_fields items: {"field": "...", "question": "..."}
+    """
+    from src.web_app.mcp.registry import BUILTIN_TOOLS
+
+    spec = None
+    for t in BUILTIN_TOOLS:
+        if t.name == tool_name:
+            spec = t
+            break
+
+    if spec is None:
+        logger.warning("[TOOL_NOT_FOUND_DEBUG] tool=%s not in BUILTIN_TOOLS", tool_name)
+        return arguments, []
+
+    schema = spec.input_schema or {}
+    properties = schema.get("properties", {})
+    required: list[str] = schema.get("required", []) if isinstance(schema.get("required"), list) else []
+
+    cleaned: dict[str, Any] = {}
+    missing: list[dict[str, str]] = []
+
+    # ── Field question templates ──
+    _FIELD_QUESTIONS_ZH: dict[str, dict[str, str]] = {
+        "email.send": {
+            "to": "收件人邮箱是什么？",
+            "subject": "邮件主题是什么？",
+            "body": "邮件正文是什么？",
+        },
+        "local_file.write": {
+            "path": "文件路径是什么？",
+            "content": "文件内容是什么？",
+        },
+        "local_file.read": {
+            "path": "要读取哪个文件？",
+        },
+        "local_file.append": {
+            "path": "要追加到哪个文件？",
+            "content": "要追加什么内容？",
+        },
+        "local_file.delete": {
+            "path": "要删除哪个文件？",
+        },
+        "local_file.list": {
+            "path": "要列出哪个目录的文件？",
+        },
+    }
+    field_questions = _FIELD_QUESTIONS_ZH.get(tool_name, {})
+
+    for field_name in required:
+        raw = arguments.get(field_name)
+        present = raw is not None and (not isinstance(raw, str) or raw.strip() != "")
+        if present:
+            cleaned[field_name] = raw.strip() if isinstance(raw, str) else raw
+        else:
+            question = field_questions.get(field_name, f"请提供 {field_name}")
+            missing.append({"field": field_name, "question": question})
+
+    # Copy optional fields too
+    for field_name, field_schema in properties.items():
+        if field_name not in required and field_name in arguments and arguments[field_name]:
+            cleaned[field_name] = arguments[field_name]
+
+    # ── email.send: basic format check on `to` ──
+    if tool_name == "email.send" and "to" in cleaned:
+        import re
+        to_val = cleaned["to"]
+        if not re.search(r'@.{2,}', to_val):
+            cleaned.pop("to", None)
+            missing.append({
+                "field": "to",
+                "question": f"收件人地址 \"{to_val[:50]}\" 格式不对，请提供正确的邮箱地址。",
+            })
+
+    if missing:
+        logger.debug(
+            "[LLM_TOOL_SELECT_DEBUG] tool=%s missing_fields=%s args=%s",
+            tool_name, str(missing), str(cleaned)[:200],
+        )
+
+    return cleaned, missing

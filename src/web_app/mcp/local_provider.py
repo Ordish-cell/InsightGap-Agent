@@ -163,9 +163,11 @@ class LocalMCPProvider:
                         "success": False,
                         "provider": "smtp",
                         "sent": False,
-                        "message": "SMTP send timed out after 30s.",
                         "to": to,
                         "subject": subject,
+                        "body": body,
+                        "body_preview": body[:200],
+                        "message": "SMTP send timed out after 30s.",
                     }
             else:
                 return asyncio.run(provider.send_email(to, subject, body))
@@ -177,9 +179,11 @@ class LocalMCPProvider:
                 "success": False,
                 "provider": "smtp",
                 "sent": False,
-                "message": f"SMTP send failed. Error: {exc}",
                 "to": to,
                 "subject": subject,
+                "body": body,
+                "body_preview": body[:200],
+                "message": f"SMTP send failed: {exc}",
             }
 
     # ── Local file tools ────────────────────────────────────────

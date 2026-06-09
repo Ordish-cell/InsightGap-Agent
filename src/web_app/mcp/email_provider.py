@@ -12,18 +12,31 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# ── Tool aliases declared at provider registration point ──────────
+# Registry collects and normalizes. Add canonical→aliases here.
+EMAIL_TOOL_ALIASES: dict[str, list[str]] = {
+    "email.send": [
+        "发送邮件", "发邮件", "send_email", "email_send",
+        "mail.send", "send.mail", "sendEmail", "寄邮件", "send_mail",
+        "发一封", "给…发邮件",
+    ],
+    "email_mcp.create_draft": ["邮件草稿", "草稿", "draft", "email_draft"],
+}
+
 
 class MockEmailProvider:
     """Mock email provider that only writes audit logs, never sends."""
 
     async def send_email(self, to: str, subject: str, body: str) -> dict[str, Any]:
         return {
+            "success": True,
             "provider": "mock",
             "sent": False,
-            "message": "EMAIL_PROVIDER=mock, email was not actually sent.",
             "to": to,
             "subject": subject,
+            "body": body,
             "body_preview": body[:200],
+            "message": "EMAIL_PROVIDER=mock, email was not actually sent.",
         }
 
 
@@ -48,14 +61,14 @@ class SMTPEmailProvider:
         }
 
     async def send_email(self, to: str, subject: str, body: str) -> dict[str, Any]:
+        base = {"to": to, "subject": subject, "body": body, "body_preview": body[:200]}
         if not self.host or not self.username:
             return {
+                **base,
+                "success": False,
                 "provider": "smtp",
                 "sent": False,
                 "message": "SMTP not configured. Set SMTP_HOST and SMTP_USERNAME.",
-                "smtp_params": self._smtp_params(),
-                "to": to,
-                "subject": subject,
             }
 
         msg = MIMEText(body, "plain", "utf-8")
@@ -71,20 +84,20 @@ class SMTPEmailProvider:
             server.sendmail(self.from_email, [to], msg.as_string())
             server.quit()
             return {
+                **base,
+                "success": True,
                 "provider": "smtp",
                 "sent": True,
                 "message": "Email sent successfully.",
-                "to": to,
-                "subject": subject,
             }
         except Exception as exc:
             logger.error("SMTP send failed: %s", exc)
             return {
+                **base,
+                "success": False,
                 "provider": "smtp",
                 "sent": False,
-                "message": f"SMTP send failed. Error: {exc}",
-                "to": to,
-                "subject": subject,
+                "message": f"SMTP send failed: {exc}",
             }
 
 

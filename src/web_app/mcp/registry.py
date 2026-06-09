@@ -1,3 +1,4 @@
+import logging
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -5,6 +6,8 @@ from sqlalchemy.orm import Session
 from src.web_app.core.constants import L0_READ_ONLY, L1_DRAFT, L2_LOCAL_WRITE, L3_EXTERNAL_WRITE, L4_HIGH_RISK
 from src.web_app.db.repositories.mcp_repository import MCPServerRepository, MCPToolRepository
 from src.web_app.mcp.schemas import MCPToolRead, MCPToolSpec
+
+logger = logging.getLogger(__name__)
 
 BUILTIN_SERVER_NAME = "builtin_local_mcp"
 
@@ -104,7 +107,7 @@ BUILTIN_TOOLS = [
         category="local_file",
         safety_level=L3_EXTERNAL_WRITE,
         requires_approval=True,
-        input_schema={"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "mode": {"type": "string", "default": "create_or_overwrite"}}},
+        input_schema={"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}, "mode": {"type": "string", "default": "create_or_overwrite"}}, "required": ["path", "content"]},
         output_schema={"type": "object", "properties": {"path": {"type": "string"}, "written": {"type": "boolean"}}},
     ),
     MCPToolSpec(
@@ -133,8 +136,12 @@ BUILTIN_TOOLS = [
         category="email",
         safety_level=L3_EXTERNAL_WRITE,
         requires_approval=True,
-        input_schema={"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}},
-        output_schema={"type": "object", "properties": {"sent": {"type": "boolean"}, "provider": {"type": "string"}, "message": {"type": "string"}}},
+        input_schema={
+            "type": "object",
+            "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}, "cc": {"type": "string"}, "bcc": {"type": "string"}},
+            "required": ["to", "subject", "body"],
+        },
+        output_schema={"type": "object", "properties": {"success": {"type": "boolean"}, "sent": {"type": "boolean"}, "provider": {"type": "string"}, "message": {"type": "string"}, "to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}, "body_preview": {"type": "string"}}},
     ),
 ]
 
@@ -193,6 +200,46 @@ def tool_to_read(tool) -> MCPToolRead:
         requires_approval=tool.approval_required,
         metadata={},
     )
+
+
+# ── Alias → canonical name normalization ──────────────────────────
+_ALIAS_TO_CANONICAL: dict[str, str] | None = None
+
+
+def _collect_all_aliases() -> dict[str, list[str]]:
+    """Collect aliases from provider modules."""
+    from src.web_app.mcp.email_provider import EMAIL_TOOL_ALIASES
+    from src.web_app.mcp.local_file_tools import LOCAL_FILE_TOOL_ALIASES
+    merged: dict[str, list[str]] = {}
+    merged.update(EMAIL_TOOL_ALIASES)
+    merged.update(LOCAL_FILE_TOOL_ALIASES)
+    return merged
+
+
+def _build_alias_map() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    all_aliases = _collect_all_aliases()
+    for canonical, aliases in all_aliases.items():
+        mapping[canonical.lower()] = canonical
+        for alias in aliases:
+            key = alias.strip().lower()
+            if key and key not in mapping:
+                mapping[key] = canonical
+    return mapping
+
+
+def normalize_tool_name(name: str) -> str:
+    """Map alias / short name to canonical tool name. Returns original if no match."""
+    if not name:
+        return name
+    global _ALIAS_TO_CANONICAL
+    if _ALIAS_TO_CANONICAL is None:
+        _ALIAS_TO_CANONICAL = _build_alias_map()
+    key = name.strip().lower()
+    resolved = _ALIAS_TO_CANONICAL.get(key, name)
+    if resolved != name:
+        logger.debug("Tool name normalized: %r → %r", name, resolved)
+    return resolved
 
 
 registry = MCPRegistry()
