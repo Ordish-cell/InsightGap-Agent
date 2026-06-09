@@ -59,15 +59,48 @@ class MCPToolExecutor:
             return self._finish(db, call, "failed", {}, str(exc))
 
     def execute_approved_tool(self, db: Session, user_id: int, tool_call_id: int, tool_name: str, input_data: dict[str, Any], agent_run_id: int | None = None) -> dict[str, Any]:
-        """Execute a tool that has been approved. Bypasses the permission guard."""
+        """Execute a tool that has been approved. Bypasses the permission guard.
+
+        Always returns a flat dict with:
+          success: True | False
+          tool_name: str
+          provider: str | None  (mock / smtp / local_file / None)
+          message: str
+        Plus tool-specific fields (to, subject, body_preview, path, etc.)
+        """
         ToolCallRepository(db).update_status(tool_call_id, "running")
         try:
             output = local_provider.call(db, user_id, tool_name, input_data, agent_run_id)
             ToolCallRepository(db).update_status(tool_call_id, "completed", output=output)
-            return {"status": "completed", "tool_name": tool_name, "output": output}
+
+            # Normalize to flat dict with success at top level
+            if not isinstance(output, dict):
+                return {
+                    "success": False,
+                    "tool_name": tool_name,
+                    "error_code": "EMPTY_TOOL_RESULT",
+                    "message": "工具没有返回结果，无法确认执行成功。",
+                }
+
+            # Flatten: if success is nested inside output, lift it
+            success = output.get("success", None)
+            if success is None:
+                # Check if the outer wrapper has success
+                success = output.get("success", output.get("sent", output.get("written", None)))
+
+            return {
+                "success": success if isinstance(success, bool) else True,
+                "tool_name": tool_name,
+                **{k: v for k, v in output.items() if k not in ("_metadata",)},
+            }
         except Exception as exc:
             ToolCallRepository(db).update_status(tool_call_id, "failed", error_message=str(exc))
-            raise
+            return {
+                "success": False,
+                "tool_name": tool_name,
+                "error_code": type(exc).__name__,
+                "message": str(exc),
+            }
 
     def _finish(self, db: Session, call, status: str, output: dict[str, Any], error: str, approval_id: int | None = None) -> ToolCallRead:
         completed_at = datetime.now(UTC).replace(tzinfo=None)

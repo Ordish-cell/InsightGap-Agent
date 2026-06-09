@@ -1,6 +1,6 @@
-# Open Deep Research -- 信息差 Agent OS 项目全量上下文
+# Open Deep Research — 信息差 Agent OS 项目全量上下文
 
-> 本文档供 AI 助手快速建立对该项目的完整理解。最后更新: 2026-06-08。
+> 本文档供 AI 助手快速建立对该项目的完整理解。最后更新: 2026-06-09。
 
 ---
 
@@ -14,7 +14,7 @@ Feed (信息流接入) → Agent 研究 → Artifact (成果物) → Memory/Skil
 
 - **技术栈**: Python 3.10+, FastAPI, LangGraph, LangChain, PostgreSQL, Qdrant, Redis
 - **LLM**: 主要使用阿里云 DashScope (百炼) 的 Qwen 系列模型
-- **前端**: Vite + React + TypeScript (独立项目，端口 localhost:5173)
+- **前端**: Vite + React 19 + TypeScript (独立项目，端口 localhost:5173。注意: frontend/README.md 误写为 Vue 3，实际是 React)
 - **作者**: Ordish
 - **当前分支**: `feature/bendicaozuo`
 - **上游来源**: https://github.com/langchain-ai/open_deep_research
@@ -46,7 +46,7 @@ open_deep_research/
 │   │   │   │   └── security.py      # 安全工具函数
 │   │   │   │
 │   │   │   ├── models/              # SQLAlchemy ORM 模型 (25+ 表)
-│   │   │   │   ├── orm.py           # 主ORM定义 (未在Glob中直接出现，entities.py等拆分)
+│   │   │   │   ├── orm.py           # 主ORM定义
 │   │   │   │   ├── agent_run.py     # AgentRun模型
 │   │   │   │   ├── approval.py      # Approval模型
 │   │   │   │   ├── artifact.py      # Artifact模型
@@ -65,6 +65,8 @@ open_deep_research/
 │   │   │   │       ├── approval_repository.py
 │   │   │   │       ├── artifact_repository.py
 │   │   │   │       ├── document_repository.py
+│   │   │   │       ├── feed_repository.py
+│   │   │   │       ├── info_repository.py
 │   │   │   │       ├── mcp_repository.py
 │   │   │   │       ├── memory_repository.py
 │   │   │   │       ├── profile_repository.py
@@ -84,19 +86,20 @@ open_deep_research/
 │   │   │   │   ├── approvals.py     # 审批管理
 │   │   │   │   ├── auth.py          # 认证 (login/register)
 │   │   │   │   ├── profile.py       # 用户画像
+│   │   │   │   ├── feed.py          # Feed流接口
 │   │   │   │   └── health.py        # 健康检查 /api/health
 │   │   │   │
 │   │   │   ├── services/            # 业务逻辑层 (单例模式)
-│   │   │   │   ├── agent_service.py     # 【核心】Agent运行主流程
-│   │   │   │   ├── research_service.py  # 深度研究编排 (adapter/fallback)
+│   │   │   │   ├── agent_service.py     # 【核心】Agent运行主流程 (含图片快速通道)
+│   │   │   │   ├── research_service.py  # 深度研究编排 (adapter/fallback, 490行+)
 │   │   │   │   ├── memory_service.py    # 记忆提取+存储+检索 (三级回退)
 │   │   │   │   ├── rag_service.py       # RAG检索问答
 │   │   │   │   ├── document_service.py  # 文档上传/解析/摄入
 │   │   │   │   ├── qwen_multimodal_service.py # 图片分析 (Qwen多模态)
-│   │   │   │   ├── feed_service.py      # Feed刷新/混排
+│   │   │   │   ├── feed_service.py      # Feed刷新/混排 (814行+)
 │   │   │   │   ├── skill_service.py     # Skill匹配/创建/审批
 │   │   │   │   ├── mcp_service.py       # MCP工具调用
-│   │   │   │   ├── approval_service.py  # 审批流程
+│   │   │   │   ├── approval_service.py  # 审批流程 (124行+)
 │   │   │   │   ├── auth_service.py      # JWT认证
 │   │   │   │   ├── profile_service.py   # 用户画像
 │   │   │   │   ├── context_service.py   # 上下文组装
@@ -104,7 +107,9 @@ open_deep_research/
 │   │   │   │   ├── permission_service.py   # 权限检查
 │   │   │   │   ├── eval_service.py      # 质量评估
 │   │   │   │   ├── scoring_service.py   # Feed评分
-│   │   │   │   └── source_service.py    # Feed数据源管理
+│   │   │   │   ├── source_service.py    # Feed数据源管理
+│   │   │   │   ├── artifact_service.py  # 成果物生成保存
+│   │   │   │   └── conversation_lock.py # 会话并发锁 (防止同一会话并发执行)
 │   │   │   │
 │   │   │   ├── agent/                # Agent运行时 (LangGraph多智能体)
 │   │   │   │   ├── state.py          # AgentState定义
@@ -115,7 +120,7 @@ open_deep_research/
 │   │   │   │   │   ├── graph.py      # ★ LangGraph图定义 (AgentRuntime._build_langgraph)
 │   │   │   │   │   ├── nodes.py      # ★ RuntimeNodes类 (15个节点方法)
 │   │   │   │   │   ├── router.py     # 条件路由 dispatch_next_route_node
-│   │   │   │   │   ├── planner.py    # 确定性关键字路由 plan_route()
+│   │   │   │   │   ├── planner.py    # 确定性关键字路由 plan_route() + 强制路由
 │   │   │   │   │   ├── state.py      # AgentRuntimeState TypedDict + AgentIntent枚举
 │   │   │   │   │   ├── events.py     # SSE事件类型+display_channel定义
 │   │   │   │   │   ├── visible_thoughts.py # 用户可见思考进度
@@ -152,19 +157,20 @@ open_deep_research/
 │   │   │   │
 │   │   │   ├── feed/                 # Feed系统
 │   │   │   │   ├── sources/          # 7种数据源
-│   │   │   │   │   ├── manager.py    # SearchSourceManager (统一调度)
+│   │   │   │   │   ├── manager.py    # SearchSourceManager (统一调度, 45s超时)
 │   │   │   │   │   ├── arxiv.py      # Arxiv论文
 │   │   │   │   │   ├── github.py     # GitHub仓库 (min_stars≥50)
 │   │   │   │   │   ├── rss.py        # RSS订阅
 │   │   │   │   │   ├── duckduckgo.py # DuckDuckGo搜索 (中文区域)
 │   │   │   │   │   ├── tavily.py     # Tavily搜索
 │   │   │   │   │   ├── serpapi.py    # SerpApi搜索
+│   │   │   │   │   ├── bucket_seed.py # 桶种子数据
 │   │   │   │   │   └── manual_seed.py # 手动种子数据 (final fallback)
-│   │   │   │   ├── scorer.py         # FeedScorer 评分引擎
+│   │   │   │   ├── scorer.py         # FeedScorer 评分引擎 (4维评分)
 │   │   │   │   ├── normalizer.py     # 数据标准化
 │   │   │   │   ├── dedup.py          # 去重逻辑
 │   │   │   │   ├── mixer.py          # 卡片混排 (30/40/30比例)
-│   │   │   │   └── card_generator.py # 卡片生成
+│   │   │   │   └── card_generator.py # 卡片生成 (title, one_sentence_value, information_gap)
 │   │   │   │
 │   │   │   ├── rag/                  # RAG系统
 │   │   │   │   ├── vector_store.py   # QdrantVectorStore (Qdrant Cloud API)
@@ -177,6 +183,8 @@ open_deep_research/
 │   │   │   │   ├── tool_executor.py  # 工具执行 (含审批检查)
 │   │   │   │   ├── tool_router.py    # 工具路由 (匹配工具→执行)
 │   │   │   │   ├── local_provider.py # 本地工具Provider
+│   │   │   │   ├── email_provider.py # ★ 邮件工具Provider (发送邮件等)
+│   │   │   │   ├── local_file_tools.py # ★ 本地文件操作工具 (读写文件)
 │   │   │   │   ├── permissions.py    # 权限控制
 │   │   │   │   ├── schemas.py        # 数据结构
 │   │   │   │   └── audit.py          # 审计日志
@@ -188,7 +196,7 @@ open_deep_research/
 │   │   │   │   └── quality.py        # 质量评估
 │   │   │   │
 │   │   │   ├── research/             # 研究子系统
-│   │   │   │   ├── open_deep_research_adapter.py # 上游ODR适配器
+│   │   │   │   ├── open_deep_research_adapter.py # 上游ODR适配器 (334行+)
 │   │   │   │   ├── fallback_researcher.py        # 兜底研究员
 │   │   │   │   ├── report_builder.py             # 报告生成
 │   │   │   │   ├── evidence_builder.py           # 证据构建
@@ -212,13 +220,14 @@ open_deep_research/
 │   │       ├── utils.py
 │   │       └── tests/
 │   │
-│   ├── tests/                       # 评估框架
+│   ├── tests/                       # 评估框架 + 单元测试
 │   │   ├── run_evaluate.py          # LangSmith评估主脚本
-│   │   ├── evaluators.py            # 6个评估器 (overall/relevance/structure/correctness/groundedness/completeness)
+│   │   ├── evaluators.py            # 6个评估器
 │   │   ├── prompts.py               # 评估提示词
 │   │   ├── pairwise_evaluation.py   # 配对比较评估
 │   │   ├── supervisor_parallel_evaluation.py  # 多线程并行评估
 │   │   ├── extract_langsmith_data.py # LangSmith数据导出
+│   │   ├── test_approval_workflow.py # ★ 审批工作流测试 (277行)
 │   │   └── expt_results/            # 实验结果 (JSONL)
 │   │
 │   ├── examples/                    # 研究示例
@@ -226,14 +235,77 @@ open_deep_research/
 │   │   ├── pubmed.md
 │   │   └── inference-market.md
 │   │
-│   ├── .github/
-│   │   ├── workflows/claude.yml            # Claude Code Bot (@claude触发)
-│   │   ├── workflows/claude-code-review.yml # 自动PR Code Review
-│   │   └── dependabot.yml                  # 每周pip+actions依赖更新
+│   ├── scripts/
+│   │   ├── ensure_qdrant_indexes.py  # Qdrant索引初始化脚本
+│   │   └── backfill_memory_vectors.py # 记忆向量回填脚本 (315行)
+│   │
+│   ├── alembic/                     # 数据库迁移
+│   │   └── versions/
+│   │       ├── 20260608_0007_feed_batch.py
+│   │       └── 20260608_0008_feed_refresh_attempt.py
+│   │
+│   ├── frontend/                    # React前端 (独立Vite项目)
+│   │   ├── src/
+│   │   │   ├── main.tsx             # React入口
+│   │   │   ├── App.tsx              # 根组件+路由
+│   │   │   ├── api/                 # API层 (13个模块)
+│   │   │   │   ├── client.ts        # HTTP客户端
+│   │   │   │   ├── agent.ts         # Agent SSE流式API
+│   │   │   │   ├── research.ts      # 深度研究API
+│   │   │   │   ├── feed.ts          # Feed API
+│   │   │   │   ├── documents.ts     # 文档上传/RAG API
+│   │   │   │   ├── memory.ts        # 记忆API
+│   │   │   │   ├── artifacts.ts     # 成果物API
+│   │   │   │   ├── skills.ts        # Skill API
+│   │   │   │   ├── mcp.ts           # MCP API
+│   │   │   │   ├── approvals.ts     # 审批API
+│   │   │   │   ├── auth.ts          # 认证API
+│   │   │   │   ├── health.ts        # 健康检查
+│   │   │   │   ├── types.ts         # TypeScript类型定义
+│   │   │   │   └── normalizers.ts   # 数据标准化
+│   │   │   ├── pages/               # 13个页面组件
+│   │   │   │   ├── HomePage.tsx      # 首页/Feed流
+│   │   │   │   ├── AgentRunPage.tsx  # Agent对话页
+│   │   │   │   ├── FeedPage.tsx      # Feed信息流页
+│   │   │   │   ├── FeedCardDetailPage.tsx  # Feed卡片详情
+│   │   │   │   ├── ResearchRunsPage.tsx    # 研究运行列表
+│   │   │   │   ├── ResearchRunDetailPage.tsx # 研究运行详情
+│   │   │   │   ├── MemoryPage.tsx    # 记忆管理
+│   │   │   │   ├── ArtifactsPage.tsx # 成果物管理
+│   │   │   │   ├── SkillsPage.tsx    # Skill管理
+│   │   │   │   ├── McpToolCallsPage.tsx # MCP工具调用
+│   │   │   │   ├── ApprovalsPage.tsx # 审批管理
+│   │   │   │   ├── LoginPage.tsx     # 登录页
+│   │   │   │   ├── ProfilePage.tsx   # 用户画像
+│   │   │   │   └── SettingsPage.tsx  # 设置
+│   │   │   ├── components/          # 组件库
+│   │   │   │   ├── agent/
+│   │   │   │   │   ├── AgentChatPanel.tsx    # 聊天面板 (含图片附件处理)
+│   │   │   │   │   ├── AgentThoughtStream.tsx # 思考流展示
+│   │   │   │   │   └── ApprovalCard.tsx      # ★ 审批卡片组件 (219行)
+│   │   │   │   ├── common/
+│   │   │   │   │   ├── MarkdownRenderer.tsx   # Markdown渲染 (含Github Flavored Markdown)
+│   │   │   │   │   ├── JsonBlock.tsx
+│   │   │   │   │   ├── EvidenceList.tsx
+│   │   │   │   │   ├── StatusPill.tsx
+│   │   │   │   │   ├── ScoreBadge.tsx
+│   │   │   │   │   ├── LoadingState.tsx
+│   │   │   │   │   ├── EmptyState.tsx
+│   │   │   │   │   ├── ErrorState.tsx
+│   │   │   │   │   ├── ConfirmModal.tsx
+│   │   │   │   │   └── PageHeader.tsx
+│   │   │   │   └── layout/
+│   │   │   │       ├── AppShell.tsx
+│   │   │   │       ├── Sidebar.tsx
+│   │   │   │       └── Topbar.tsx
+│   │   │   └── utils/
+│   │   │       └── labels.ts
+│   │   └── package.json             # React 19, react-markdown, react-router-dom
 │   │
 │   ├── langgraph.json               # LangGraph部署配置 (入口: deep_researcher)
 │   ├── pyproject.toml               # 项目依赖 (60+包) + ruff配置
 │   ├── .env.example                 # 环境变量模板 (100+项)
+│   ├── .mcp.json                    # MCP服务器配置
 │   ├── CLAUDE.md                    # Claude Code项目指令
 │   └── PROJECT_CONTEXT.md           # 本文档
 ```
@@ -317,7 +389,7 @@ START
 | L0 | 只读 | 对话, 搜索, RAG | 直接放行 |
 | L1 | 搜索 | 搜索, Feed | 直接放行 |
 | L2 | 生成 | 研究, 生成Artifact | 直接放行 |
-| L3 | 外部写入 | 发送邮件, 评论 | 需要审批 |
+| L3 | 外部写入 | 发送邮件, 评论, 文件操作 | 需要审批 |
 | L4 | 破坏性 | 删除, 支付, 转账 | 需要审批 |
 
 ---
@@ -356,7 +428,7 @@ START
 | **semantic** | PostgreSQL + Qdrant | 永久 | 长期偏好/知识 (用户设定, 项目目标, 技术栈, 兴趣) |
 | **perceptual** | - | - | 原始感知数据缓存 |
 
-### 5.2 记忆提取器 (MemoryExtractor) ★
+### 5.2 记忆提取器 (MemoryExtractor)
 
 文件: `src/web_app/memory/extractor.py` — **无LLM, 纯正则规则引擎**
 
@@ -411,6 +483,7 @@ START
 | 来源 | 默认状态 | 配置要点 |
 |------|---------|---------|
 | ManualSeed | 启用 | 手动种子数据, 也是最终fallback |
+| BucketSeed | 启用 | 桶种子数据 (预置高质量信息) |
 | GitHub | 启用 | topics: agent, rag, llm, langgraph, mcp; min_stars≥50; Python/TypeScript |
 | Arxiv | 启用 | 类别: cs.AI, cs.CL, cs.LG; 查询词: agent, rag, multi-agent, tool use, llm |
 | DuckDuckGo | 启用 | region: wt-wt; safesearch: moderate; time: w (一周) |
@@ -457,7 +530,7 @@ START
 
 ---
 
-## 8. 图片识别系统 ★ (最新完成)
+## 8. 图片识别系统 (已完成)
 
 文件: `src/web_app/services/qwen_multimodal_service.py`, `src/web_app/services/agent_service.py`
 
@@ -591,6 +664,7 @@ data: {json_string}
 | mcp_tools | MCP工具注册 |
 | info_sources | Feed数据源配置 |
 | feed_feedback | 用户对Feed卡片的反馈 (thumbs_up/down, dismissed) |
+| feed_refresh_attempts | Feed刷新尝试记录 (新增) |
 | eval_records | 质量评估记录 |
 
 ---
@@ -609,7 +683,7 @@ data: {json_string}
 - **记忆检索**: Qdrant语义搜索 → PostgreSQL ILIKE → 最近重要记忆
 - **研究执行**: 上游ODR Adapter → FallbackResearcher (模拟数据)
 - **最终回答**: LLM流式生成 → 规则兜底文案
-- **Feed**: 7个真实源 → ManualSeed种子数据
+- **Feed**: 7个真实源 → BucketSeed → ManualSeed种子数据
 
 ### 12.4 非阻塞设计
 - RAG搜索失败不阻断Agent流水线
@@ -619,9 +693,10 @@ data: {json_string}
 
 ### 12.5 安全防护
 - 权限守卫节点在所有处理之前执行
-- L3/L4操作需要审批 (approvals表)
+- L3/L4操作需要审批 (approvals表, 含完整审批工作流)
 - `final_response` 防护内部JSON泄露给普通用户
 - JWT认证 (python-jose) + bcrypt密码哈希
+- 会话并发锁 (conversation_lock.py) 防止同一会话并发执行
 
 ---
 
@@ -700,16 +775,34 @@ START → researcher ⇄ researcher_tools → compress_research → END
 
 ---
 
-## 15. 提交历史 (最近10次)
+## 15. 提交历史 (最近20次)
 
 ```
-2406e69 ← HEAD: 完成了信息差卡片基本情况，下一步操作电脑
+24cebd9 ← HEAD: 下一步修思考过程中的出现审阅bug
+  (新增: ApprovalCard组件, AgentThoughtStream改进, MCP email_provider,
+   local_file_tools, test_approval_workflow, intent_schema扩展)
+31571e3: 完成了深度研究，下一步本地电脑操作
+  (新增: ResearchRunDetailPage大改, ODR Adapter增强, research_service扩展至490行,
+   feed_service增强, 多个research report样本文件)
+2406e69: 完成了信息差卡片基本情况，下一步操作电脑
+  (新增: mixer混排逻辑, card_generator增强, scorer评分优化, feed_service增强)
 4e7d70e: 完成了基本搜索展示，下一步从多方搜
+  (新增: feed_refresh_attempt表, mixer重构, duckduckgo/serpapi/tavily源增强,
+   feed_service重写到814行)
 09a8c5f: 下一步修远域
+  (新增: feed_batch迁移, bucket_seed数据源, card_generator重构296行,
+   scorer增强84行, feed_service增强357行)
 fc60ce1: 完成了识图和文件
+  (新增: qwen_multimodal_service, 文档解析增强, agent_service图片快速通道,
+   conversation_lock会话锁, Qdrant索引初始化脚本, RAG service增强)
 6d5cacd: 识图完成，下一步文档bug
+  (新增: PROJECT_CONTEXT.md 627行, agent.py图片上传支持)
 815eb33: 完成了图片识别，下一步sse输出
+  (新增: qwen_multimodal_service 184行, AgentChatPanel大改424行,
+   document_service 141行, documents API扩展, global.css增强)
 cbb5fa2: 完成qdrant，下一步rag
+  (新增: Qdrant记忆存储266行, memory_service增强, 记忆向量回填脚本315行,
+   MarkdownRenderer 84行, .mcp.json)
 1e2611a: 完成了基本记忆完善，下一步是markdown前端渲染
 1d34c14: 完成记忆，下一步修复LLM识别回答问题
 d99bd42: 下一步学codex
@@ -732,24 +825,27 @@ eff3b0b: 完成信息接入
 ### 已完成
 - 基础Agent框架 (LangGraph 14节点多智能体图)
 - 会话管理 (CRUD, 多轮对话, agent_conversations/agent_chat_messages)
-- Feed系统 (7源聚合, 评分, 混排, 信息差卡片)
-- 记忆系统 (三层架构 + Qdrant语义检索 + 确定性提取器)
+- Feed系统 (7源+1桶聚合, 评分, 混排30/40/30, 信息差卡片)
+- 记忆系统 (三层架构 + Qdrant语义检索 + 确定性提取器 + 向量回填)
 - RAG系统 (文档上传/解析/分块/摄入/检索问答)
 - 图片识别 (Qwen多模态, 直接问答快速通道, 混合附件处理)
 - SSE流式输出 (4 channel: thinking/answer/tool/status)
 - Skill系统 (匹配/创建/审批/自动草稿)
-- MCP工具系统 (注册/执行/审批/审计)
+- MCP工具系统 (注册/执行/审批/审计, 新增email_provider + local_file_tools)
+- 审批工作流 (完整ApprovalCard前端 + approval_service后端 + test_approval_workflow)
 - LLM配置体系 (3 tier × 10 purpose, aliyun DashScope为主)
 - 多层降级策略 (LLM→规则, Qdrant→PostgreSQL→recent, 上游→fallback)
+- 深度研究 (上游ODR Adapter + ResearchService编排 + 前端ResearchRunDetailPage)
+- 前端Markdown渲染 (react-markdown + remark-gfm)
+- 会话并发锁 (conversation_lock.py)
 
 ### 已知待优化
-- SSE流式输出体验优化
-- Markdown前端渲染
+- 思考过程中出现的审阅bug (当前提交标题)
 - LLM回答质量 (有时输出JSON而非自然语言, 已有防护但需改进)
-- Research Adapter主要是mock, 真实调用上游需配置
-- Codex风格的界面布局
+- 流式输出体验优化
 - 远域 (remote domain) 功能
-- 文档bug修复
+- Codex风格的界面布局
+- 文档相关bug修复
 
 ### 用户约束 (从项目中记忆提取)
 - 不要修改 `src/open_deep_research/` 目录 (上游原始项目)
@@ -771,11 +867,22 @@ cp .env.example .env
 uvx langgraph dev                         # LangGraph Studio (上游)
 uvicorn src.web_app.main:app --reload     # FastAPI Agent OS (主服务)
 
+# 前端开发
+cd frontend && npm run dev                # Vite React 开发服务器 (localhost:5173)
+
+# 数据库迁移
+alembic upgrade head                      # 执行所有迁移
+
+# Qdrant 索引初始化
+python scripts/ensure_qdrant_indexes.py   # 确保Qdrant集合和索引
+python scripts/backfill_memory_vectors.py # 回填记忆向量
+
 # 代码质量
 ruff check                                # linting (E, F, I, D, UP规则)
 mypy                                      # type checking
 
 # 测试
 python tests/run_evaluate.py              # LangSmith评估
+python tests/test_approval_workflow.py    # 审批工作流测试
 pytest                                    # 单元测试
 ```

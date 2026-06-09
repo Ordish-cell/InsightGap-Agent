@@ -64,11 +64,89 @@ def infer_tool(user_input: str, payload: dict[str, Any]) -> tuple[str | None, di
     return None, {}
 
 
+def _parse_email_fields(text: str) -> dict[str, str]:
+    """Extract to/subject/body from Chinese email request text.
+
+    Supports:
+      - 发邮件给 test@example.com，主题 Hello，正文 This is a test
+      - 给 test@example.com 发邮件，主题是 Hello，正文是 This is a test
+      - 收件人 test@example.com 主题 Hello 正文 This is a test
+    """
+    import re
+
+    to = ""
+    subject = ""
+    body = ""
+
+    # ── Extract to (email address) ──────────────────────────
+    to_match = re.search(
+        r'(?:发给|发邮件给|发送给|给|收件人[：:\s]*)\s*'
+        r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+        text,
+    )
+    if to_match:
+        to = to_match.group(1).strip()
+
+    # Also try bare email in the text (发邮件给 xxx@yy.com)
+    if not to:
+        bare_email = re.search(
+            r'([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
+            text,
+        )
+        if bare_email:
+            to = bare_email.group(1).strip()
+
+    # ── Extract subject ──────────────────────────────────────
+    # Match: 主题[：:是]? <text> (stop before 正文/内容/body/.)
+    subj_match = re.search(
+        r'主题[：:\s]*(?:是\s*)?(.+?)(?=\s*(?:正文|内容|body|。|$))',
+        text,
+    )
+    if subj_match:
+        subject = subj_match.group(1).strip().rstrip('，,')
+        # Truncate at "正文" or "内容" marker if present
+        for marker in ('正文', '内容', 'body'):
+            idx = subject.find(marker)
+            if idx >= 0:
+                subject = subject[:idx].strip().rstrip('，,')
+
+    # ── Extract body ─────────────────────────────────────────
+    # Match: 正文[：:是]? <text> (to end or next known marker)
+    body_match = re.search(
+        r'(?:正文|内容|body)[：:\s]*(?:是\s*)?(.+)',
+        text,
+        re.IGNORECASE,
+    )
+    if body_match:
+        body = body_match.group(1).strip()
+
+    # If subject is still empty but there's text between to-email and body,
+    # extract it
+    if not subject and to:
+        # Find text between email extract and "正文" marker
+        after_to = text.split(to, 1)[-1] if to in text else text
+        # Remove leading punctuation
+        after_to = re.sub(r'^[，,\s]*', '', after_to)
+        # Find subject-like patterns
+        subj_match2 = re.search(
+            r'(?:主题[：:\s]*(?:是\s*)?)?(.+?)(?=\s*(?:正文|内容|body|。|$))',
+            after_to,
+        )
+        if subj_match2:
+            subject = subj_match2.group(1).strip().rstrip('，,')
+            # If the extracted text is just the email address again or empty, clear it
+            if '@' in subject and len(subject) < 50:
+                subject = ""
+
+    return {"to": to, "subject": subject, "body": body}
+
+
 def _build_email_input(user_input: str, payload: dict[str, Any]) -> dict[str, Any]:
+    parsed = _parse_email_fields(user_input)
     return {
-        "to": payload.get("to", ""),
-        "subject": payload.get("subject", user_input[:80]),
-        "body": payload.get("body", user_input),
+        "to": payload.get("to") or parsed["to"],
+        "subject": payload.get("subject") or parsed["subject"] or "",
+        "body": payload.get("body") or parsed["body"] or user_input,
     }
 
 

@@ -14,7 +14,7 @@ from src.web_app.mcp.local_file_tools import (
     local_file_read,
     local_file_write,
 )
-from src.web_app.mcp.email_provider import get_email_provider
+from src.web_app.mcp.email_provider import MockEmailProvider, get_email_provider
 
 # Module-scope email provider instance (created once)
 _email_provider = None
@@ -110,27 +110,77 @@ class LocalMCPProvider:
 
     # ── Email send ──────────────────────────────────────────────
     def _send_email(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
-        import asyncio
+        """Send email via the configured provider.
+
+        Mock path: returns a sync result immediately — no event-loop hopping,
+        no Future, no timeout.  This is a pure synchronous fast path.
+
+        SMTP path: runs the async provider through the event loop.
+        Timeouts are caught and returned as structured failures.
+        """
         to = str(payload.get("to", ""))
         subject = str(payload.get("subject", ""))
         body = str(payload.get("body", ""))
+
+        # ── Mock fast path (sync, never blocks) ──────────────────
         provider = _resolve_email_provider()
+        if isinstance(provider, MockEmailProvider):
+            return {
+                "success": True,
+                "provider": "mock",
+                "sent": False,
+                "message": "EMAIL_PROVIDER=mock, email was not actually sent.",
+                "to": to,
+                "subject": subject,
+                "body": body,
+                "body_preview": body[:200],
+            }
+
+        # ── SMTP path (needs event loop) ─────────────────────────
+        import asyncio
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None:
+                # Running inside an event loop — schedule and wait
                 import concurrent.futures
                 future = concurrent.futures.Future()
 
                 async def _send():
-                    result = await provider.send_email(to, subject, body)
-                    future.set_result(result)
+                    try:
+                        result = await provider.send_email(to, subject, body)
+                        future.set_result(result)
+                    except Exception as exc:
+                        future.set_exception(exc)
 
                 loop.create_task(_send())
-                return future.result(timeout=10)
-            return loop.run_until_complete(provider.send_email(to, subject, body))
-        except RuntimeError:
-            import asyncio as _asyncio
-            return _asyncio.run(provider.send_email(to, subject, body))
+                try:
+                    return future.result(timeout=30)
+                except concurrent.futures.TimeoutError:
+                    return {
+                        "success": False,
+                        "provider": "smtp",
+                        "sent": False,
+                        "message": "SMTP send timed out after 30s.",
+                        "to": to,
+                        "subject": subject,
+                    }
+            else:
+                return asyncio.run(provider.send_email(to, subject, body))
+        except Exception as exc:
+            import logging
+            _log = logging.getLogger(__name__)
+            _log.exception("_send_email: SMTP failed")
+            return {
+                "success": False,
+                "provider": "smtp",
+                "sent": False,
+                "message": f"SMTP send failed. Error: {exc}",
+                "to": to,
+                "subject": subject,
+            }
 
     # ── Local file tools ────────────────────────────────────────
     def _list_local_files(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:

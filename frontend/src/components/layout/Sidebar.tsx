@@ -96,8 +96,28 @@ export function Sidebar() {
     try {
       await agent.hardDeleteConversation(item.conversation_id)
       await loadConversations()
-    } catch {
-      // Refresh list on failure to undo optimistic removal
+    } catch (exc) {
+      const status = (exc as { status?: number }).status
+      const msg = exc instanceof Error ? exc.message : String(exc)
+      // CONVERSATION_HAS_PENDING_APPROVAL: prompt user to cancel+delete
+      if (status === 409 && msg.includes('CONVERSATION_HAS_PENDING_APPROVAL')) {
+        const confirmed = window.confirm(
+          '这个会话还有等待审批的操作。要取消这些操作并删除会话吗？\n\n注意：这会取消所有待审批操作，工具不会执行。'
+        )
+        if (confirmed) {
+          try {
+            await agent.hardDeleteConversationCancelPending(item.conversation_id)
+            await loadConversations()
+          } catch {
+            void loadConversations()
+          }
+        } else {
+          // User cancelled — re-add to list
+          void loadConversations()
+        }
+        return
+      }
+      // Other errors: refresh list to undo optimistic removal
       void loadConversations()
     }
   }

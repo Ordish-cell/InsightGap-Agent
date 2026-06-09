@@ -146,6 +146,22 @@ function looksLikeInternalJson(text: string): boolean {
   ].some(k => head.includes(k))
 }
 
+const _approvalPlaceholderPrefixes = [
+  'Approval required:',
+  'approval required:',
+  'Approval required（',
+  'approval required（',
+  'Approval required (',
+]
+
+function isApprovalPlaceholder(text: string): boolean {
+  if (!text) return false
+  const s = text.trim()
+  if (_approvalPlaceholderPrefixes.some(p => s.startsWith(p))) return true
+  if (s.startsWith('⏸') && s.includes('正在等待你的审批')) return true
+  return false
+}
+
 function responseMessages(response: AgentRun, fallbackUser: UiMessage, fallbackAssistant: UiMessage) {
   const answer = agent.extractRunAnswer(response)
   const runId = response.run_id || response.id || fallbackAssistant.run_id || null
@@ -494,9 +510,9 @@ function AgentMessageItem({
           <AgentThoughtStream message={message} locale={locale} onApprove={onApprove} onReject={onReject} />
         )}
         <div className="message-bubble answer-content">
-          {visibleContent ? (
+          {visibleContent && !isApprovalPlaceholder(visibleContent) ? (
             <MarkdownRenderer content={visibleContent} />
-          ) : message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running' ? null : (
+          ) : message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running' || message.status === 'waiting_approval' ? null : (
             text(locale, zh.noAnswer, 'No answer to display.')
           )}
         </div>
@@ -587,7 +603,7 @@ export function AgentChatPanel({
         )
       })
         .then((uploaded) => {
-          const isReady = uploaded.status === 'ready' && (uploaded.kind === 'image' || (uploaded.chunks_count ?? 0) > 0)
+          const isReady = uploaded.status === 'ready' && (uploaded.kind === 'image' || (((uploaded as unknown) as Record<string, unknown>).chunks_count as number ?? 0) > 0)
           setAttachments((prev) =>
             prev.map((item) =>
               item.localId === localId
@@ -739,20 +755,167 @@ export function AgentChatPanel({
 
   async function handleApproval(approvalId: number, approved: boolean) {
     try {
-      if (approved) await agent.approveRunApproval(approvalId, { decision: 'approved' })
-      else await agent.rejectRunApproval(approvalId, { decision: 'rejected' })
-      setMessages((items) =>
-        items.map((message) =>
-          message.role === 'assistant' && message.status === 'waiting_approval'
-            ? {
-                ...message,
-                trace_events: [...(message.trace_events || []), { event_type: approved ? 'approval_approved' : 'approval_rejected', payload: { approval_id: approvalId } }],
-              }
-            : message
+      // 1. Call approve/reject API
+      const result = (approved
+        ? await agent.approveRunApproval(approvalId, { decision: 'approved' })
+        : await agent.rejectRunApproval(approvalId, { decision: 'rejected' })) as Record<string, unknown>
+
+      const runId = result?.run_id as number | undefined
+      const resumeUrl = result?.resume_stream_url as string | undefined
+
+      // 2. Close current stream and open resume stream
+      if (runId && resumeUrl) {
+        streamRef.current?.close()
+        setRunning(true)
+
+        const resumeAssistantId = `resume-${runId}-${Date.now()}`
+        let resumeContent = ''
+        streamRef.current = agent.createRunResumeStream(runId, {
+          onMessage: (message) => {
+            const parsed = parseEvent(message.data)
+            if (!parsed) return
+            const payload = asRecord(parsed.payload)
+
+            // Feed events to the same assistant message
+            setMessages((items) =>
+              items.map((item) => {
+                // Find the waiting_approval assistant message for this run
+                const isTargetAssistant =
+                  item.role === 'assistant' &&
+                  (item.status === 'waiting_approval' ||
+                   item.status === 'resuming' ||
+                   item.run_id === runId)
+
+                if (!isTargetAssistant) return item
+
+                if (parsed.event_type === 'answer_delta') {
+                  const delta = typeof payload.text === 'string' ? payload.text : String(payload.text || '')
+                  // Defense: suppress stale approval_required text after approval granted
+                  if (delta.includes('Run failed: approval_required') || (resumeContent + delta).includes('Run failed: approval_required')) {
+                    console.warn('[AgentChatPanel resume] Suppressed answer_delta with approval_required:', delta.slice(0, 100))
+                    return { ...item, status: item.status === 'waiting_approval' ? 'resuming' : item.status }
+                  }
+                  if (delta.includes('Approval required:') || (resumeContent + delta).includes('Approval required:')) {
+                    console.warn('[AgentChatPanel resume] Suppressed answer_delta with Approval required')
+                    return { ...item, status: item.status === 'waiting_approval' ? 'resuming' : item.status }
+                  }
+                  resumeContent += delta
+                  return {
+                    ...item,
+                    status: 'streaming',
+                    content: resumeContent,
+                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                  }
+                }
+
+                if (parsed.event_type === 'answer_completed' || parsed.event_type === 'run_completed') {
+                  const finalAnswer = typeof payload.answer === 'string' ? payload.answer : resumeContent
+                  return {
+                    ...item,
+                    status: 'completed',
+                    content: finalAnswer || resumeContent,
+                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                  }
+                }
+
+                if (parsed.event_type === 'run_failed') {
+                  const failText = String(payload.error || payload.answer || '执行失败')
+                  const reason = String(payload.reason || '')
+
+                  // approval_context_gone: session was deleted, card shows expired
+                  if (reason === 'approval_context_gone') {
+                    return {
+                      ...item,
+                      status: 'cancelled',
+                      content: '该审批所属的会话或运行已经不存在，无法继续执行。',
+                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    }
+                  }
+
+                  // Defense: spurious approval_required run_failed after approval+tool
+                  const hasApprovalGranted = (item.trace_events || []).some(
+                    (e) => e.event_type === 'approval_granted' || e.event_type === 'approval_approved'
+                  )
+                  const hasToolEvent = (item.trace_events || []).some(
+                    (e) => e.event_type === 'tool_call_completed' || e.event_type === 'tool_call_failed'
+                  )
+                  if (hasApprovalGranted && hasToolEvent && failText.toLowerCase().includes('approval_required')) {
+                    console.warn('[AgentChatPanel] Suppressed spurious run_failed after approval+tool', failText)
+                    return { ...item, status: item.status, trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT) }
+                  }
+
+                  return {
+                    ...item,
+                    status: 'failed',
+                    content: failText,
+                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                  }
+                }
+
+                // approval_granted, approval_rejected, run_resumed, visible_thought_delta, tool_call_*
+                return {
+                  ...item,
+                  status: item.status === 'waiting_approval' ? 'resuming' : item.status,
+                  trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                }
+              })
+            )
+
+            if (parsed.event_type === 'run_completed' || parsed.event_type === 'run_failed') {
+              setRunning(false)
+              streamRef.current?.close()
+              streamRef.current = null
+            }
+          },
+          onError: () => {
+            setError(text(locale, zh.agentFailed, 'Agent run failed.'))
+            setRunning(false)
+          },
+        })
+      } else {
+        // Fallback: just update local state
+        setMessages((items) =>
+          items.map((message) =>
+            message.role === 'assistant' && message.status === 'waiting_approval'
+              ? {
+                  ...message,
+                  trace_events: [...(message.trace_events || []), { event_type: approved ? 'approval_approved' : 'approval_rejected', payload: { approval_id: approvalId } }],
+                }
+              : message
+          )
         )
-      )
+      }
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : text(locale, zh.approvalFailed, 'Approval action failed.'))
+      const errMsg = exc instanceof Error ? exc.message : String(exc)
+      const status = (exc as { status?: number }).status
+
+      // APPROVAL_CONTEXT_GONE (409): run/conversation/message was deleted
+      if (status === 409 && errMsg.includes('APPROVAL_CONTEXT_GONE')) {
+        setMessages((items) =>
+          items.map((message) =>
+            message.role === 'assistant' && message.status === 'waiting_approval'
+              ? {
+                  ...message,
+                  status: 'cancelled',
+                  content: '该审批所属的会话或运行已经不存在，无法继续执行。',
+                  trace_events: [...(message.trace_events || []), { event_type: 'approval_context_gone', payload: { approval_id: approvalId, approved } }],
+                }
+              : message
+          )
+        )
+        setRunning(false)
+        return
+      }
+
+      // CONVERSATION_HAS_PENDING_APPROVAL (409): delete-blocked, never reaches approve
+      // handler.  If it somehow does, show a toast — don't touch ApprovalCard.
+      if (status === 409 && errMsg.includes('CONVERSATION_HAS_PENDING_APPROVAL')) {
+        setError('当前会话有等待审批的操作，请先同意或拒绝后再删除。')
+        setRunning(false)
+        return
+      }
+
+      setError(errMsg || text(locale, zh.approvalFailed, 'Approval action failed.'))
     }
   }
 
@@ -869,7 +1032,7 @@ export function AgentChatPanel({
                   if (looksLikeInternalJson(streamedContent)) {
                     return {
                       ...assistantMessage,
-                      content: fallbackContent || getUserVisibleMessageContent(response),
+                      content: fallbackContent || getUserVisibleMessageContent(response as unknown as { content?: unknown }),
                       trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
                     }
                   }
@@ -909,6 +1072,19 @@ export function AgentChatPanel({
               setMessages((items) =>
                 items.map((item) => {
                   if (item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)) {
+                    // Defense: suppress stale approval_required answer text after approval granted
+                    const hasApprovalGranted = (item.trace_events || []).some(
+                      (e: { event_type?: string }) => e.event_type === 'approval_granted' || e.event_type === 'approval_approved'
+                    )
+                    if (hasApprovalGranted && delta.includes('Run failed: approval_required')) {
+                      console.warn('[AgentChatPanel] Suppressed answer_delta with approval_required after approval granted:', delta.slice(0, 100))
+                      return { ...item, status: item.status === 'waiting_approval' ? 'resuming' : item.status }
+                    }
+                    if (hasApprovalGranted && delta.includes('Approval required:')) {
+                      console.warn('[AgentChatPanel] Suppressed answer_delta with Approval required after approval granted')
+                      return { ...item, status: item.status === 'waiting_approval' ? 'resuming' : item.status }
+                    }
+
                     const candidateContent = `${item.content || ''}${delta}`
                     // Suppress streaming if the content starts to look like internal JSON
                     if (looksLikeInternalJson(candidateContent)) {
@@ -982,13 +1158,52 @@ export function AgentChatPanel({
             return
           }
 
+          if (parsed.event_type === 'approval_required') {
+            setMessages((items) =>
+              items.map((item) =>
+                item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
+                  ? {
+                      ...item,
+                      run_id: liveRunId || item.run_id,
+                      status: 'waiting_approval',
+                      metadata: {
+                        ...item.metadata,
+                        approval_required: true,
+                        approval_id: payload.approval_id,
+                        approval_payload: payload,
+                      },
+                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    }
+                  : item
+              )
+            )
+            return
+          }
+
+          if (parsed.event_type === 'run_paused') {
+            setMessages((items) =>
+              items.map((item) =>
+                item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
+                  ? {
+                      ...item,
+                      status: 'waiting_approval',
+                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    }
+                  : item
+              )
+            )
+            // Stop the loading state — run is paused waiting for user
+            setRunning(false)
+            return
+          }
+
           setMessages((items) =>
             items.map((item) =>
               item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
                 ? {
                     ...item,
                     run_id: liveRunId || item.run_id,
-                    status: (item.status === 'completed' || item.status === 'streaming') ? item.status : 'thinking',
+                    status: (item.status === 'completed' || item.status === 'streaming' || item.status === 'waiting_approval') ? item.status : 'thinking',
                     trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
                   }
                 : item

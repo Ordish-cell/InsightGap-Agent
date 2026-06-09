@@ -7,6 +7,7 @@ from src.web_app.agent.schemas import AgentRunRequest
 from src.web_app.db.session import get_db
 from src.web_app.schemas.common import ok
 from src.web_app.services.agent_service import (
+    PendingApprovalExistsError,
     archive_conversation,
     clear_conversation,
     create_conversation as create_conversation_service,
@@ -19,6 +20,7 @@ from src.web_app.services.agent_service import (
     list_steps,
     run_agent_async,
     stream_agent_run,
+    stream_resume_run,
     update_conversation,
 )
 from src.web_app.services.approval_service import update_approval_status
@@ -106,9 +108,19 @@ def clear_agent_conversation(conversation_id: str, user_id: int = Depends(get_cu
 
 
 @router.delete("/conversations/{conversation_id}/hard")
-def hard_delete_agent_conversation(conversation_id: str, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+def hard_delete_agent_conversation(
+    conversation_id: str,
+    cancel_pending: bool = False,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
     try:
-        return ok(hard_delete_conversation(db, user_id, conversation_id))
+        return ok(hard_delete_conversation(db, user_id, conversation_id, cancel_pending=cancel_pending))
+    except PendingApprovalExistsError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "CONVERSATION_HAS_PENDING_APPROVAL", "message": str(exc)},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -164,9 +176,42 @@ def run_events(run_id: int, user_id: int = Depends(get_current_user_id), db: Ses
 
 @router.post("/approvals/{approval_id}/approve")
 def approve_agent_approval(approval_id: int, payload: dict | None = None, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    return ok(update_approval_status(db, user_id, approval_id, "approved", payload or {}))
+    try:
+        return ok(update_approval_status(db, user_id, approval_id, "approved", payload or {}))
+    except ValueError as exc:
+        msg = str(exc)
+        if msg.startswith("APPROVAL_CONTEXT_GONE"):
+            raise HTTPException(status_code=409, detail={"code": "APPROVAL_CONTEXT_GONE", "message": msg.split(": ", 1)[1] if ": " in msg else msg}) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/approvals/{approval_id}/reject")
 def reject_agent_approval(approval_id: int, payload: dict | None = None, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    return ok(update_approval_status(db, user_id, approval_id, "rejected", payload or {}))
+    try:
+        return ok(update_approval_status(db, user_id, approval_id, "rejected", payload or {}))
+    except ValueError as exc:
+        msg = str(exc)
+        if msg.startswith("APPROVAL_CONTEXT_GONE"):
+            raise HTTPException(status_code=409, detail={"code": "APPROVAL_CONTEXT_GONE", "message": msg.split(": ", 1)[1] if ": " in msg else msg}) from exc
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/runs/{run_id}/resume/stream")
+async def resume_run_stream(run_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    """Resume a paused run after approval and stream subsequent events."""
+    from src.web_app.agent.runtime.events import to_sse as sse_encode
+
+    async def events():
+        async for event in stream_resume_run(db, user_id, run_id):
+            for chunk in sse_encode([event]):
+                yield chunk
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

@@ -14,6 +14,11 @@ export const archiveConversation = (conversationId: string) => apiRequest<AgentC
 export const deleteConversation = (conversationId: string) => apiRequest<AgentConversation>(`/agent/conversations/${conversationId}`, { method: 'DELETE' })
 export const clearConversation = (conversationId: string) => apiRequest<{ conversation: AgentConversation; cleared_messages: number }>(`/agent/conversations/${conversationId}/clear`, { method: 'POST' })
 export const hardDeleteConversation = (conversationId: string) => apiRequest<{ conversation_id: string; deleted_records: number }>(`/agent/conversations/${conversationId}/hard`, { method: 'DELETE' })
+export const hardDeleteConversationCancelPending = (conversationId: string) =>
+  apiRequest<{ conversation_id: string; deleted_records: number; cancelled_approvals?: number; cancelled_runs?: number }>(
+    `/agent/conversations/${conversationId}/hard?cancel_pending=true`,
+    { method: 'DELETE' }
+  )
 export const approveRunApproval = (approvalId: number | string, payload: Record<string, unknown> = {}) => apiRequest<unknown>(`/agent/approvals/${approvalId}/approve`, { method: 'POST', body: payload })
 export const rejectRunApproval = (approvalId: number | string, payload: Record<string, unknown> = {}) => apiRequest<unknown>(`/agent/approvals/${approvalId}/reject`, { method: 'POST', body: payload })
 export const getSteps = async (runId: number | string) => {
@@ -31,6 +36,10 @@ export function createRunEventStream(runId: number | string, handlers: { onMessa
 
 export function createRunLiveStream(payload: Record<string, unknown>, handlers: { onMessage?: (event: MessageEvent) => void; onError?: () => void }) {
   return createFetchStream('/agent/runs/stream', handlers, { method: 'POST', body: payload })
+}
+
+export function createRunResumeStream(runId: number | string, handlers: { onMessage?: (event: MessageEvent) => void; onError?: () => void }) {
+  return createFetchStream(`/agent/runs/${runId}/resume/stream`, handlers, { method: 'POST' })
 }
 
 export function extractRunAnswer(response: AgentRun) {

@@ -12,3 +12,6 @@ class ApprovalRepository(BaseRepository[Approval]):
 
     def get_by_user(self, user_id: int, approval_id: int) -> Approval | None:
         return self.db.execute(select(Approval).where(Approval.user_id == user_id, Approval.id == approval_id)).scalar_one_or_none()
+
+    def list_by_run(self, run_id: int) -> list[Approval]:
+        return list(self.db.execute(select(Approval).where(Approval.run_id == run_id)).scalars())

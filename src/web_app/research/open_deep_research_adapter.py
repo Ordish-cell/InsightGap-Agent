@@ -106,14 +106,14 @@ class OpenDeepResearchAdapter:
         """
         dashscope_key = self._settings.dashscope_api_key or self._settings.aliyun_bailian_api_key or self._settings.agent_llm_api_key or ""
         if dashscope_key:
-            os.environ.setdefault("OPENAI_API_KEY", dashscope_key)
+            os.environ["OPENAI_API_KEY"] = dashscope_key
 
         dashscope_url = self._settings.dashscope_base_url or self._settings.aliyun_bailian_base_url or self._settings.agent_llm_base_url or ""
         if dashscope_url:
-            os.environ.setdefault("OPENAI_BASE_URL", dashscope_url)
+            os.environ["OPENAI_BASE_URL"] = dashscope_url
 
         if self._settings.tavily_api_key:
-            os.environ.setdefault("TAVILY_API_KEY", self._settings.tavily_api_key)
+            os.environ["TAVILY_API_KEY"] = self._settings.tavily_api_key
 
     # Marker used to satisfy DashScope/Qwen JSON mode and later stripped
     # from the final report if it leaks through.

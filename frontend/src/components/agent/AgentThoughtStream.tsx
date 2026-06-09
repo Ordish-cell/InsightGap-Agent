@@ -78,16 +78,39 @@ function collectVisibleThoughts(message: AgentThoughtStreamProps['message']) {
   return items
 }
 
-function approvalFrom(message: AgentThoughtStreamProps['message']): { approvalId: number; cardData: ApprovalCardData } {
-  const event = (message.trace_events || []).find((item) => item.event_type === 'approval_required')
-  if (!event) return { approvalId: 0, cardData: {} }
+function approvalFrom(message: AgentThoughtStreamProps['message']): { approvalId: number; cardData: ApprovalCardData; currentStatus: string } {
+  const events = message.trace_events || []
 
-  const payload = asRecord(event.payload)
-  // The SSE approval_required payload has the data directly
+  // Find current approval state from event history (most recent wins)
+  let approvalStatus = 'pending'
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i]
+    if (!ev) continue
+    const et = ev.event_type
+    if (et === 'approval_granted' || et === 'approval_approved') { approvalStatus = 'approved'; break }
+    if (et === 'approval_rejected') { approvalStatus = 'rejected'; break }
+    if (et === 'tool_call_failed') { approvalStatus = 'approved'; break }
+    if (et === 'tool_call_completed') { approvalStatus = 'approved'; break }
+    if (et === 'run_completed') { approvalStatus = 'completed'; break }
+  }
+  if (message.status === 'completed') { approvalStatus = 'completed' }
+
+  // Find approval_required event for payload data
+  const event = events.find((item) => item.event_type === 'approval_required')
+  let payload: UnknownRecord = {}
+  if (event) {
+    payload = asRecord(event.payload)
+  } else {
+    const meta = asRecord(message.metadata)
+    const approvalPayload = asRecord(meta.approval_payload)
+    if (approvalPayload.approval_id) { payload = approvalPayload }
+  }
+  if (!payload.approval_id && !payload.tool_name) return { approvalId: 0, cardData: {}, currentStatus: approvalStatus }
+
   const approvalId = Number(payload.approval_id || 0)
   const cardData: ApprovalCardData = {
-    approval_id: payload.approval_id,
-    run_id: payload.run_id,
+    approval_id: payload.approval_id as string | number | undefined,
+    run_id: payload.run_id as string | number | undefined,
     risk_level: String(payload.risk_level || 'L3'),
     tool_name: String(payload.tool_name || ''),
     title: String(payload.title || '需要你确认'),
@@ -95,8 +118,9 @@ function approvalFrom(message: AgentThoughtStreamProps['message']): { approvalId
     tool_args: asRecord(payload.tool_args),
     safety_notes: Array.isArray(payload.safety_notes) ? payload.safety_notes : [],
     actions: Array.isArray(payload.actions) ? payload.actions : ['approve', 'reject'],
+    status: approvalStatus,
   }
-  return { approvalId, cardData }
+  return { approvalId, cardData, currentStatus: approvalStatus }
 }
 
 export function AgentThoughtStream({ message, locale, onApprove, onReject }: AgentThoughtStreamProps) {
@@ -104,6 +128,7 @@ export function AgentThoughtStream({ message, locale, onApprove, onReject }: Age
   const status = String(message.status || 'completed')
   const running = ['thinking', 'running', 'created', 'queued'].includes(status)
   const waitingApproval = status === 'waiting_approval'
+  const resuming = status === 'resuming'
   const answering = status === 'streaming'
   const failed = status === 'failed'
   const elapsed = seconds(message.elapsed_ms)
@@ -111,17 +136,19 @@ export function AgentThoughtStream({ message, locale, onApprove, onReject }: Age
     ? text(locale, zhText.answering, 'Answering')
     : waitingApproval
       ? '等待审批'
-      : running
-        ? text(locale, zhText.thinking, 'Thinking')
-        : failed
-          ? text(locale, zhText.failed, 'Thinking interrupted')
-          : text(locale, zhText.completed, 'Completed reasoning')
-  const { approvalId, cardData } = approvalFrom(message)
-  const [open, setOpen] = useState(running || failed || waitingApproval)
+      : resuming
+        ? '已批准，继续执行...'
+        : running
+          ? text(locale, zhText.thinking, 'Thinking')
+          : failed
+            ? text(locale, zhText.failed, 'Thinking interrupted')
+            : text(locale, zhText.completed, 'Completed reasoning')
+  const { approvalId, cardData, currentStatus } = approvalFrom(message)
+  const [open, setOpen] = useState(running || failed || waitingApproval || resuming)
 
   useEffect(() => {
-    setOpen(running || failed || waitingApproval)
-  }, [failed, running, waitingApproval, message.message_id])
+    setOpen(running || failed || waitingApproval || resuming)
+  }, [failed, running, waitingApproval, resuming, message.message_id])
 
   if (!thoughts.length && !running && !failed && !answering && !approvalId) return null
 

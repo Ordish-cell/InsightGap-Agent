@@ -521,10 +521,21 @@ class RuntimeNodes:
         return state
 
     async def evaluator(self, state: AgentRuntimeState) -> AgentRuntimeState:
+        is_resume = bool(state.get("_resume_context") or state.get("resolved_tool_call_ids"))
+        logger.info(
+            "[approval_resume_debug] node=evaluator before "
+            "status=%s route=%s error=%s approval_required=%s is_resume=%s",
+            state.get("status"), state.get("route"), state.get("error"),
+            state.get("approval_required"), is_resume,
+        )
         status = state.get("status") or ("failed" if state.get("error") else "completed")
-        if state.get("route") == "approval":
+        # Only set waiting_approval for the ORIGINAL pause flow, never on resume.
+        if not is_resume and state.get("route") == "approval":
             status = "waiting_approval"
         state["status"] = status
+        logger.info(
+            "[approval_resume_debug] node=evaluator after new_status=%s", status,
+        )
         state["evaluation"] = {
             "route": state.get("route"),
             "status": status,
@@ -814,10 +825,97 @@ class RuntimeNodes:
         return state
 
     async def tool_agent(self, state: AgentRuntimeState) -> AgentRuntimeState:
-        """MCP Tool Agent: infer and execute tools with approval guard."""
+        """MCP Tool Agent: infer and execute tools with approval guard.
+
+        On L3/L4 tools the executor returns waiting_approval WITHOUT executing.
+        This node saves pause context (pending_*), sets status=waiting_approval,
+        does NOT mark itself completed. The dispatcher detects waiting_approval
+        and routes to END — a true graph interrupt.
+
+        On resume (status=resuming), tool_agent checks resolved_tool_call_ids:
+        if the previously-pending tool is now resolved, it accepts the pre-executed
+        result, clears pending state, and marks itself completed so the dispatcher
+        continues to evaluator → final_response.
+        """
         if state.get("route") in {"approval", "blocked"}:
             mark_completed(state, "tool_agent")
             return state
+
+        # Debug: tool_agent entry
+        pending_tcid = state.get("pending_tool_call_id")
+        resolved_ids_debug = list(state.get("resolved_tool_call_ids") or [])
+        tc_debug = state.get("tool_call") or {}
+        logger.info(
+            "[approval_resume_debug] node=tool_agent status=%s approval_required=%s "
+            "pending_tcid=%s resolved_ids=%s _resume_context=%s "
+            "tool_call.error=%s tool_call.status=%s route=%s",
+            state.get("status"), state.get("approval_required"),
+            pending_tcid, resolved_ids_debug,
+            state.get("_resume_context"),
+            tc_debug.get("error") if isinstance(tc_debug, dict) else "N/A",
+            tc_debug.get("status") if isinstance(tc_debug, dict) else "N/A",
+            state.get("route"),
+        )
+
+        # ── Resume path: previously-pending tool was executed by resume runner ──
+        pending_tcid = state.get("pending_tool_call_id")
+        resolved_ids: list = list(state.get("resolved_tool_call_ids") or [])
+        if pending_tcid is not None and pending_tcid in resolved_ids:
+            # Accept the pre-executed tool result (already in state["tool_result"])
+            state["approval_required"] = False
+            state["approval_payload"] = None
+            state["pending_approval_id"] = None
+            state["pending_tool_name"] = None
+            state["pending_tool_args"] = None
+            state["pending_tool_call_id"] = None
+            state["resume_token"] = None
+            emit_visible_thought(self.db, state, "tool_agent")
+            mark_completed(state, "tool_agent")
+            return state
+
+        # ── Resume path: tool failed after approval ───────────────
+        # Detect tool failure: _resume_context starts with "failed:"
+        resume_ctx = str(state.get("_resume_context") or "")
+        if pending_tcid is not None and resume_ctx.startswith("failed:"):
+            state["approval_required"] = False
+            state["approval_payload"] = None
+            state["pending_approval_id"] = None
+            state["pending_tool_name"] = None
+            state["pending_tool_args"] = None
+            state["pending_tool_call_id"] = None
+            state["resume_token"] = None
+            emit_visible_thought(self.db, state, "tool_agent")
+            mark_completed(state, "tool_agent")
+            return state
+
+        # ── Resume path: user rejected ────────────────────────────
+        if pending_tcid is not None and resume_ctx.startswith("rejected:"):
+            state["tool_call"] = {**state.get("tool_call", {}), "status": "rejected"}
+            state["tool_result"] = {"status": "rejected", "message": "User rejected the approval"}
+            state["approval_required"] = False
+            state["approval_payload"] = None
+            state["pending_approval_id"] = None
+            state["pending_tool_name"] = None
+            state["pending_tool_args"] = None
+            state["pending_tool_call_id"] = None
+            state["resume_token"] = None
+            emit_visible_thought(self.db, state, "tool_agent")
+            mark_completed(state, "tool_agent")
+            return state
+
+        # ── Resume path (legacy): status=resuming without context ──
+        if pending_tcid is not None and state.get("status") == "resuming":
+            state["approval_required"] = False
+            state["approval_payload"] = None
+            state["pending_approval_id"] = None
+            state["pending_tool_name"] = None
+            state["pending_tool_args"] = None
+            state["pending_tool_call_id"] = None
+            state["resume_token"] = None
+            emit_visible_thought(self.db, state, "tool_agent")
+            mark_completed(state, "tool_agent")
+            return state
+
         try:
             route_plan = state.get("route_plan") or {}
             tool_name, tool_input = infer_tool(state.get("user_input", ""), {**self.payload, "intent": route_plan.get("intent")})
@@ -826,7 +924,6 @@ class RuntimeNodes:
                 mark_completed(state, "tool_agent")
                 return state
 
-            # Always go through mcp_service.call_tool — it handles approval creation internally
             result = mcp_service.call_tool(self.db, state["user_id"], tool_name, tool_input,
                                            agent_run_id=state["run_id"],
                                            dry_run=bool(self.payload.get("dry_run", False)))
@@ -837,11 +934,21 @@ class RuntimeNodes:
                 state["status"] = "waiting_approval"
                 state["approval_required"] = True
                 approval_id = result.get("approval_id") or (result.get("output", {}).get("_metadata", {}).get("approval_id"))
+                tool_call_id = result.get("id")
+                # ── Save pause context for resume ─────────────────
+                # pending_tool_args stores the REAL args (for resume execution).
+                # approval_payload gets sanitized args (for frontend).
+                state["pending_approval_id"] = str(approval_id) if approval_id else None
+                state["pending_tool_name"] = tool_name
+                state["pending_tool_args"] = dict(tool_input)
+                state["pending_tool_call_id"] = tool_call_id
+                state["route_plan_snapshot"] = dict(route_plan)
+                state["resume_token"] = f"approval:{approval_id}"
                 state["approval_payload"] = {
                     "approval_id": approval_id,
                     "tool_name": tool_name,
                     "risk_level": route_plan.get("risk_level", "L3"),
-                    "tool_args": tool_input,
+                    "tool_args": _sanitize_tool_args(tool_name, tool_input),
                     "preview": result.get("output", {}),
                     "run_id": state["run_id"],
                     "user_id": state["user_id"],
@@ -850,7 +957,7 @@ class RuntimeNodes:
                 }
                 append_output(state, "tool_agent", {"tool_name": tool_name, "status": "waiting_approval"})
                 record_step(self.db, state["run_id"], "tool_agent", "mcp_approval_required",
-                            {"tool_name": tool_name, "tool_input": tool_input},
+                            {"tool_name": tool_name, "tool_input": _sanitize_tool_args(tool_name, tool_input)},
                             {"status": "waiting_approval", "approval_id": approval_id})
                 append_status_step(
                     state,
@@ -860,6 +967,9 @@ class RuntimeNodes:
                     detail=f"工具动作需要审批，风险等级 {route_plan.get('risk_level', 'L3')}",
                     extra={"risk_level": route_plan.get("risk_level", "L3"), "tool_name": tool_name, "approval_required": True},
                 )
+                emit_visible_thought(self.db, state, "tool_agent")
+                # NOT marked completed → dispatcher routes to END (true interrupt)
+                return state
             elif result["status"] in {"failed", "blocked"}:
                 state["status"] = "failed"
                 state["error"] = result.get("error", "")
@@ -1043,9 +1153,24 @@ class RuntimeNodes:
         return state
 
     async def final_response(self, state: AgentRuntimeState) -> AgentRuntimeState:
-        """Final Response: use the configured final LLM to write the user-facing answer."""
+        """Final Response: use the configured final LLM to write the user-facing answer.
+
+        Only reached when all route nodes have completed (or on reject/resume).
+        Never reached during waiting_approval — the graph interrupts to END before
+        reaching this node.
+        """
         route_plan = state.get("route_plan") or {}
         intent = route_plan.get("intent", "chat")
+
+        logger.info(
+            "[approval_resume_debug] node=final_response before "
+            "status=%s error=%s approval_required=%s "
+            "_resume_context=%s tool_result.status=%s",
+            state.get("status"), state.get("error"),
+            state.get("approval_required"),
+            state.get("_resume_context"),
+            (state.get("tool_result") or {}).get("status", "N/A"),
+        )
 
         answer_parts = []
         research = state.get("research_result") or state.get("research") or {}
@@ -1065,9 +1190,7 @@ class RuntimeNodes:
 
         draft_answer = "\n\n".join(answer_parts)
         used_streaming_llm = False
-        if state.get("status") == "waiting_approval":
-            final_answer = state.get("final_output") or "Approval required（需要审批）：这个操作需要先通过审批。我还没有执行外部写入或不可逆动作。"
-        elif intent in ("document_qa",):
+        if intent in ("document_qa",):
             # Document Q&A: always use LLM to rewrite, never echo raw chunks
             final_answer = await self._generate_final_answer_with_llm(state, draft_answer)
             used_streaming_llm = True
@@ -1148,6 +1271,11 @@ class RuntimeNodes:
                      "gssc_selected_sources": gssc_debug.get("selected_sources", []),
                      "gssc_dropped_sources": gssc_debug.get("dropped_sources", []),
                      })
+        logger.info(
+            "[approval_resume_debug] node=final_response after "
+            "status=%s final_answer_preview=%s",
+            state.get("status"), (state.get("final_answer") or "")[:120],
+        )
         return state
 
     async def _enrich_visible_thoughts_with_llm(self, state: AgentRuntimeState) -> None:
@@ -1517,9 +1645,10 @@ class RuntimeNodes:
             system_instruction += "8. 你只能基于当前上传文档的内容回答。如果文档解析内容有限，请如实告知用户。\n"
         elif intent in ("research", "rag", "feed_research", "mixed"):
             system_instruction += "8. 如果证据不足，要明确说「当前相关材料中没有足够信息」。\n"
+        approval_line = _approval_context_line(state)
         system_instruction += (
             f"{(9 if intent in ('research', 'rag', 'feed_research', 'mixed', 'document_qa') else 8)}. 如果只是问候或闲聊，要像正常助手一样回答；如果是记忆写入类请求，直接确认已保存即可。\n"
-            f"{(10 if intent in ('research', 'rag', 'feed_research', 'mixed', 'document_qa') else 9)}. 如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
+            f"{(10 if intent in ('research', 'rag', 'feed_research', 'mixed', 'document_qa') else 9)}. {approval_line}\n"
             f"{(11 if intent in ('research', 'rag', 'feed_research', 'mixed', 'document_qa') else 10)}. 输出简洁、结构化、可执行。中文为主。\n"
             "\n"
             "[Output Rules — 必须严格遵守]\n"
@@ -1581,7 +1710,7 @@ class RuntimeNodes:
             "你可以用自然中文说明你正在或已经做了什么，但只能给用户可读的简短执行摘要，不能泄露私密推理。\n"
             "如果只是问候或闲聊，要像正常助手一样回答，不要说 Agent Run 完成。\n"
             "如果没有真实执行研究、生成 Artifact 或外部工具动作，必须诚实说明，不要假装已经完成。\n"
-            "如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。\n"
+            f"{_approval_context_line(state)}\n"
             "回答要贴合用户原话，优先给结论，然后给下一步可做什么。中文为主。\n"
             "\n"
             "[Output Rules — 必须严格遵守]\n"
@@ -1904,3 +2033,60 @@ class RuntimeNodes:
     def _draft_title(self, user_input: str) -> str:
         title = " ".join(str(user_input).strip().split())[:40]
         return f"Reusable Agent workflow: {title}" if title else "Reusable Agent workflow"
+
+
+# ── Module-level helpers ─────────────────────────────────────────
+
+_SENSITIVE_ARG_KEYS = {"password", "token", "secret", "api_key", "access_key", "smtp_password", "credential", "auth"}
+
+
+def _approval_context_line(state: dict[str, Any]) -> str:
+    """Return the approval-instruction line for the final LLM prompt.
+
+    On resume (after approve/reject), the LLM must NOT say "需要审批".
+    Instead it should describe what actually happened.
+    """
+    resume_context = str(state.get("_resume_context") or state.get("resume_token") or "")
+    tool_name = state.get("pending_tool_name") or (state.get("tool_call") or {}).get("tool_name") or ""
+    tool_status = (state.get("tool_call") or {}).get("status", "")
+    tool_error = state.get("_tool_error") or (state.get("tool_result") or {}).get("error", "")
+
+    if resume_context.startswith("rejected:") or tool_status == "rejected":
+        return "用户已取消该操作，没有执行。请用自然语言说明已取消，并给出替代建议（如有）。不要声称已经执行。"
+    if resume_context.startswith("approved:") and tool_status == "completed":
+        return "该操作已获得用户批准并已执行成功。请基于工具执行结果回答，不要声称需要审批。"
+    if resume_context.startswith("failed:") or tool_error:
+        disp_name = _tool_display_name_local(tool_name)
+        return f"该操作已获得用户批准但执行失败（{disp_name}: {tool_error[:200]}）。请用自然语言说明失败原因，不要声称已经执行成功，也不要声称需要审批。"
+    if state.get("status") == "resuming":
+        return "该操作已获得批准。请基于工具结果回答，不要声称需要审批。"
+    # Normal path (no resume context)
+    return "如果涉及 L3/L4 风险动作，说明需要审批，不能声称已经执行。"
+
+
+def _tool_display_name_local(tool_name: str) -> str:
+    names = {
+        "email.send": "发送邮件",
+        "local_file.write": "写入文件",
+        "local_file.append": "追加文件",
+        "local_file.delete": "删除文件",
+        "local_file.read": "读取文件",
+        "local_file.list": "列出文件",
+    }
+    return names.get(tool_name, tool_name)
+
+
+def _sanitize_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of tool_args with sensitive fields redacted."""
+    if not args:
+        return {}
+    safe: dict[str, Any] = {}
+    for key, value in args.items():
+        lower_key = key.lower()
+        if any(s in lower_key for s in _SENSITIVE_ARG_KEYS):
+            safe[key] = "[redacted]"
+        elif isinstance(value, str) and len(value) > 500:
+            safe[key] = value[:500] + "..."
+        else:
+            safe[key] = value
+    return safe

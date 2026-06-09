@@ -42,7 +42,14 @@ def build_visible_thought_step(step: str | dict[str, Any], state: dict[str, Any]
             return "正在识别你的文档问题类型，准备从文档中提取相关答案。"
     if key in {"tool_agent", "tool"}:
         if needs_approval or state.get("status") == "waiting_approval":
-            return "我已经识别到可能涉及外部动作，会先停在审批环节，避免直接执行高风险操作。"
+            tool_name = state.get("pending_tool_name") or (state.get("approval_payload") or {}).get("tool_name") or ""
+            tool_label = _tool_display_name_zh(tool_name)
+            risk_level = str((state.get("route_plan") or {}).get("risk_level") or (state.get("approval_payload") or {}).get("risk_level") or "L3")
+            if tool_label:
+                if risk_level == "L4":
+                    return f"准备执行 {tool_label}，这是一个破坏性操作，需要你批准后才能继续。"
+                return f"准备调用 {tool_label}，这个操作会向外部写入，需要你批准。"
+            return "这个操作需要你的批准后才能继续。"
         return "我正在确认是否需要调用工具，并只保留和这次请求直接相关的执行结果。"
     if key in {"artifact_agent", "artifact"}:
         return "我会把前面的结果整理成可保存、可复用的产物，而不是只停留在零散说明。"
@@ -169,6 +176,18 @@ def _thought_key(item: Any) -> str:
     if isinstance(item, dict):
         return str(item.get("key") or "").strip()
     return ""
+
+
+def _tool_display_name_zh(tool_name: str) -> str:
+    names = {
+        "email.send": "发送邮件",
+        "local_file.write": "写入文件",
+        "local_file.append": "追加文件",
+        "local_file.delete": "删除文件",
+        "local_file.read": "读取文件",
+        "local_file.list": "列出文件",
+    }
+    return names.get(tool_name, "")
 
 
 def _intent_label(intent: str) -> str:

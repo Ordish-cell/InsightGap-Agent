@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import type { UnknownRecord } from '../../api/types'
 
 export type ApprovalCardData = {
@@ -11,7 +11,7 @@ export type ApprovalCardData = {
   tool_args?: UnknownRecord
   safety_notes?: string[]
   actions?: string[]
-  status?: string
+  status?: string  // pending | approved | rejected | completed
 }
 
 type ApprovalCardProps = {
@@ -64,7 +64,15 @@ export function ApprovalCard({ data, onApprove, onReject, locale = 'zh' }: Appro
   const approvalId = Number(data.approval_id || 0)
   const riskLevel = String(data.risk_level || 'L3')
   const isL4 = riskLevel.includes('L4')
-  const [status, setStatus] = useState<'pending' | 'approving' | 'approved' | 'rejected'>(data.status === 'approved' ? 'approved' : data.status === 'rejected' ? 'rejected' : 'pending')
+  const [status, setStatus] = useState<'pending' | 'approving' | 'approved' | 'rejected' | 'completed'>(
+    data.status === 'approved' || data.status === 'completed' ? 'approved' : data.status === 'rejected' ? 'rejected' : 'pending'
+  )
+
+  // Sync status when data.status changes (e.g. after resume events arrive)
+  useEffect(() => {
+    if (data.status === 'approved' || data.status === 'completed') setStatus('approved')
+    else if (data.status === 'rejected') setStatus('rejected')
+  }, [data.status])
 
   const preview = asRecord(data.preview)
   const toolName = String(data.tool_name || '')
@@ -208,7 +216,7 @@ export function ApprovalCard({ data, onApprove, onReject, locale = 'zh' }: Appro
           </>
         ) : status === 'approving' ? (
           <span className="approval-status">{t(locale, zhMap.approving, 'Executing...')}</span>
-        ) : status === 'approved' ? (
+        ) : status === 'approved' || status === 'completed' ? (
           <span className="approval-status approved">{t(locale, zhMap.approved, 'Approved')}</span>
         ) : (
           <span className="approval-status rejected">{t(locale, zhMap.rejected, 'Rejected')}</span>

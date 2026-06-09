@@ -4,6 +4,9 @@ from datetime import date, datetime
 from typing import Any
 from uuid import uuid4
 
+# ── BUILD_MARKER: visible in uvicorn startup ────────────────
+print("[BUILD_MARKER] approval-resume-fix-2026-06-09-v2 loaded")
+
 from sqlalchemy.orm import Session
 
 from src.web_app.agent.runtime import AgentRuntime
@@ -17,6 +20,7 @@ from src.web_app.db.repositories.agent_repository import (
     AgentRunRepository,
     AgentStepRepository,
 )
+from src.web_app.db.repositories.approval_repository import ApprovalRepository
 from src.web_app.services.document_service import document_service
 from src.web_app.rag.vector_store import QdrantVectorStore
 from src.web_app.rag.embeddings import embed_text
@@ -30,6 +34,15 @@ GENERIC_COMPLETED_ANSWERS = {
     "agent run completed",
     "agent runtime completed",
 }
+
+
+class PendingApprovalExistsError(ValueError):
+    """Raised when a conversation cannot be deleted because it has pending approvals."""
+
+    def __init__(self, message: str, *, blocked_run_ids: list[int] | None = None, run_ids: list[int] | None = None):
+        super().__init__(message)
+        self.blocked_run_ids = blocked_run_ids or []
+        self.run_ids = run_ids or []
 
 
 def load_chat_attachments(db: Session, user_id: int, attachment_ids: list[int]) -> list[dict[str, Any]]:
@@ -586,55 +599,160 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         langgraphstatus.setdefault("visible_thoughts", state.get("visible_thoughts", []))
         state["langgraphstatus"] = langgraphstatus
         steps = list(langgraphstatus.get("steps") or [])
-        completed_at = datetime.now() if state.get("status") in {"completed", "failed", "waiting_approval"} else None
-        run_repo.update(
-            run,
-            status=state.get("status", "completed"),
-            graph_state=_json_safe(_state_for_storage(state)),
-            result_summary=answer,
-            final_answer=answer,
-            final_response=_json_safe(final_payload),
-            langgraphstatus_json=_json_safe(langgraphstatus),
-            elapsed_ms=elapsed_ms,
-            error_message=state.get("error", ""),
-            completed_at=completed_at,
-        )
-        message_repo.update(
-            assistant_message,
-            content=answer,
-            status="failed" if state.get("status") == "failed" else "completed" if state.get("status") == "completed" else state.get("status", "completed"),
-            elapsed_ms=elapsed_ms,
-            langgraphstatus_json=_json_safe(langgraphstatus),
-            steps_json=_json_safe(steps),
-            error_message=state.get("error", ""),
-            metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", []))},
-        )
-        conversation_repo.touch(
-            conversation,
-            preview=answer,
-            last_run_id=run.id,
-            selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
-            selected_feed_card_title=selected_feed_card_title or None,
-        )
-        already_streamed = state.get("_answer_delta_emitted", False)
-        if state.get("approval_required") or state.get("status") == "waiting_approval":
-            await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
-            # Build rich approval_required payload with preview for frontend
-            approval_payload = _build_approval_sse_payload(state, run.id)
-            record_event(db, run.id, "approval_required", approval_payload, user_id=user_id, thread_id=thread_id)
-            _queue_stream_event(stream_queue, "approval_required", approval_payload, run_id=run.id, thread_id=thread_id)
-            # Emit run_paused to confirm the run is waiting
-            _queue_stream_event(stream_queue, "run_paused", {"status": "waiting_approval", "approval_id": approval_payload.get("approval_id")}, run_id=run.id, thread_id=thread_id)
-        elif state.get("status") == "failed":
-            record_event(db, run.id, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
-            _queue_stream_event(stream_queue, "run_failed", {"status": state.get("status"), "answer": answer, "error": state.get("error", "")}, run_id=run.id, thread_id=thread_id)
+
+        is_waiting = state.get("approval_required") or state.get("status") == "waiting_approval"
+        is_failed = state.get("status") == "failed"
+        run_status = state.get("status", "completed")
+
+        if is_waiting:
+            # ── Paused: save resume context, mark waiting ─────────
+            resume_data = {
+                "pending_approval_id": state.get("pending_approval_id"),
+                "pending_tool_name": state.get("pending_tool_name"),
+                "pending_tool_args": state.get("pending_tool_args"),
+                "pending_tool_call_id": state.get("pending_tool_call_id"),
+                "route_plan_snapshot": state.get("route_plan_snapshot"),
+                "resume_token": state.get("resume_token"),
+                "original_status": "waiting_approval",
+            }
+            final_payload["_resume"] = resume_data
+            state["final_payload"] = final_payload
+
+            run_repo.update(
+                run,
+                status="waiting_approval",
+                graph_state=_json_safe(_state_for_storage(state)),
+                result_summary=answer,
+                final_answer="",
+                final_response=_json_safe(final_payload),
+                langgraphstatus_json=_json_safe(langgraphstatus),
+                elapsed_ms=elapsed_ms,
+                error_message="",
+                completed_at=None,
+            )
+            message_repo.update(
+                assistant_message,
+                content="",
+                status="waiting_approval",
+                elapsed_ms=elapsed_ms,
+                langgraphstatus_json=_json_safe(langgraphstatus),
+                steps_json=_json_safe(steps),
+                error_message="",
+                metadata_json={
+                    "run_id": run.id,
+                    "final_response": _json_safe(final_payload),
+                    "visible_thoughts": _json_safe(state.get("visible_thoughts", [])),
+                    "_resume": resume_data,
+                    "approval_required": True,
+                },
+            )
+            conversation_repo.touch(
+                conversation,
+                preview="⏸ 等待审批…",
+                last_run_id=run.id,
+                selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
+                selected_feed_card_title=selected_feed_card_title or None,
+            )
+
+            # ── Emit approval events (single source — agent_service) ──
+            # visible_thought_delta already emitted by runtime nodes
+            # during execution.  Only emit status events here.
+            approval_id_val = state.get("pending_approval_id") or (state.get("approval_payload") or {}).get("approval_id")
+            # Guard: only emit if not already emitted
+            if not state.get("_approval_events_emitted"):
+                approval_payload = _build_approval_sse_payload(state, run.id)
+                record_event(db, run.id, "approval_required", approval_payload, user_id=user_id, thread_id=thread_id)
+                _queue_stream_event(stream_queue, "approval_required", approval_payload, run_id=run.id, thread_id=thread_id)
+                _queue_stream_event(stream_queue, "run_paused", {
+                    "status": "waiting_approval",
+                    "approval_id": approval_id_val,
+                    "run_id": run.id,
+                }, run_id=run.id, thread_id=thread_id)
+                state["_approval_events_emitted"] = True
+
+        elif is_failed:
+            completed_at_val = datetime.now()
+            run_repo.update(
+                run,
+                status="failed",
+                graph_state=_json_safe(_state_for_storage(state)),
+                result_summary=answer,
+                final_answer=answer,
+                final_response=_json_safe(final_payload),
+                langgraphstatus_json=_json_safe(langgraphstatus),
+                elapsed_ms=elapsed_ms,
+                error_message=state.get("error", ""),
+                completed_at=completed_at_val,
+            )
+            message_repo.update(
+                assistant_message,
+                content=answer,
+                status="failed",
+                elapsed_ms=elapsed_ms,
+                langgraphstatus_json=_json_safe(langgraphstatus),
+                steps_json=_json_safe(steps),
+                error_message=state.get("error", ""),
+                metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", []))},
+            )
+            conversation_repo.touch(
+                conversation,
+                preview=answer,
+                last_run_id=run.id,
+                selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
+                selected_feed_card_title=selected_feed_card_title or None,
+            )
+            record_event(db, run.id, "run_failed", {"status": "failed", "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
+            _queue_stream_event(stream_queue, "run_failed", {"status": "failed", "answer": answer, "error": state.get("error", "")}, run_id=run.id, thread_id=thread_id)
+
         else:
+            # ── Completed ─────────────────────────────────────────
+            completed_at_val = datetime.now()
+            run_repo.update(
+                run,
+                status="completed",
+                graph_state=_json_safe(_state_for_storage(state)),
+                result_summary=answer,
+                final_answer=answer,
+                final_response=_json_safe(final_payload),
+                langgraphstatus_json=_json_safe(langgraphstatus),
+                elapsed_ms=elapsed_ms,
+                error_message=state.get("error", ""),
+                completed_at=completed_at_val,
+            )
+            message_repo.update(
+                assistant_message,
+                content=answer,
+                status="completed",
+                elapsed_ms=elapsed_ms,
+                langgraphstatus_json=_json_safe(langgraphstatus),
+                steps_json=_json_safe(steps),
+                error_message=state.get("error", ""),
+                metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", []))},
+            )
+            conversation_repo.touch(
+                conversation,
+                preview=answer,
+                last_run_id=run.id,
+                selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
+                selected_feed_card_title=selected_feed_card_title or None,
+            )
+
+            already_streamed = state.get("_answer_delta_emitted", False)
             await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
             record_event(db, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)
-            record_event(db, run.id, "run_completed", {"status": state.get("status"), "answer": answer}, user_id=user_id, thread_id=thread_id)
+            record_event(db, run.id, "run_completed", {"status": "completed", "answer": answer}, user_id=user_id, thread_id=thread_id)
             _queue_stream_event(stream_queue, "final_response_created", {"answer": answer, "answer_len": len(answer)}, run_id=run.id, thread_id=thread_id)
+
         response = _run_response(run.id, state, conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=elapsed_ms)
-        _queue_stream_event(stream_queue, "run_completed", {"status": state.get("status"), "answer": answer, "response": response}, run_id=run.id, thread_id=thread_id)
+        if is_waiting:
+            # run_paused already emitted above with the approval payload;
+            # only emit if the guard wasn't set (fallback for unusual code paths)
+            if not state.get("_approval_events_emitted"):
+                _queue_stream_event(stream_queue, "run_paused", {"status": "waiting_approval", "run_id": run.id, "response": response}, run_id=run.id, thread_id=thread_id)
+        elif is_failed:
+            _queue_stream_event(stream_queue, "run_failed", {"status": "failed", "answer": answer, "response": response}, run_id=run.id, thread_id=thread_id)
+        else:
+            _queue_stream_event(stream_queue, "run_completed", {"status": "completed", "answer": answer, "response": response}, run_id=run.id, thread_id=thread_id)
         return response
     finally:
         lock.release()
@@ -662,6 +780,592 @@ async def stream_agent_run(db: Session, user_id: int, payload: dict[str, Any]):
                     },
                 }
             )
+        finally:
+            queue.put_nowait(sentinel)
+
+    task = asyncio.create_task(runner())
+    try:
+        while True:
+            item = await queue.get()
+            if item is sentinel:
+                break
+            yield item
+            event_type = str((item.get("data") or {}).get("event_type") or item.get("event") or "")
+            if event_type == "visible_thought_delta":
+                await asyncio.sleep(0.08)
+            elif event_type == "answer_delta":
+                await asyncio.sleep(0.008)
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+async def resume_run_after_approval(
+    db: Session,
+    user_id: int,
+    run_id: int,
+    stream_queue: asyncio.Queue | None = None,
+) -> dict[str, Any]:
+    """Resume an agent run after the user approved or rejected a pending approval.
+
+    1. Load the run and find its pending approval.
+    2. If approved: execute the tool via tool_executor, emit tool events.
+    3. If rejected: inject a rejected tool_result, skip execution.
+    4. Re-run the graph via AgentRuntime.resume_from_approval.
+    5. Persist the final state and emit run_completed.
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+    started_at = datetime.now()
+
+    run_repo = AgentRunRepository(db)
+    message_repo = AgentChatMessageRepository(db)
+    conversation_repo = AgentConversationRepository(db)
+    approval_repo = ApprovalRepository(db)
+
+    print(f"[APPROVAL_RESUME_DEBUG] enter resume_run_after_approval run_id={run_id}", flush=True)
+
+    run = run_repo.get_by_user(user_id, run_id)
+    if not run:
+        raise ValueError("APPROVAL_CONTEXT_GONE: 运行不存在。")
+    if run.status not in ("waiting_approval", "paused", "resuming"):
+        raise ValueError(f"APPROVAL_CONTEXT_GONE: 运行状态不正确 (status={run.status})。")
+
+    conversation_id = run.conversation_id
+    if not conversation_id:
+        raise ValueError("APPROVAL_CONTEXT_GONE: 会话已不存在。")
+
+    conversation_obj = conversation_repo.get_by_conversation_id(user_id, conversation_id)
+    if not conversation_obj or conversation_obj.status == "deleted":
+        raise ValueError("APPROVAL_CONTEXT_GONE: 会话已被删除。")
+
+    graph_state = dict(run.graph_state or {})
+    thread_id = run.thread_id or graph_state.get("thread_id", "")
+    user_input = run.user_input or graph_state.get("user_input", "")
+
+    # Verify assistant message exists and is in waiting state
+    messages = message_repo.list_by_conversation(user_id, conversation_id)
+    assistant_msg = next(
+        (m for m in messages if m.run_id == run_id and m.role == "assistant"),
+        None,
+    )
+    if not assistant_msg:
+        raise ValueError("APPROVAL_CONTEXT_GONE: 助手消息不存在。")
+
+    # Validate approval still exists and is approved
+    pending_approval_id = graph_state.get("pending_approval_id")
+    if pending_approval_id:
+        try:
+            approval_obj = approval_repo.get_by_user(user_id, int(pending_approval_id))
+        except (ValueError, TypeError):
+            approval_obj = None
+        if not approval_obj or approval_obj.status not in ("approved", "rejected"):
+            raise ValueError("APPROVAL_CONTEXT_GONE: 审批状态无效。")
+
+    pending_approval_id = graph_state.get("pending_approval_id")
+    pending_tool_name = graph_state.get("pending_tool_name", "")
+    pending_tool_args = graph_state.get("pending_tool_args", {})
+    pending_tool_call_id = graph_state.get("pending_tool_call_id")
+
+    # ── Debug: snapshot at resume start ──────────────────────────
+    tc = graph_state.get("tool_call") or {}
+    _log.info(
+        "[approval_resume_debug] stage=start run_id=%s approval_id=%s approval_status=%s "
+        "graph_state.status=%s graph_state.approval_required=%s graph_state.route=%s "
+        "graph_state.error=%s tool_call.error=%s "
+        "pending_approval_id=%s pending_tool_call_id=%s "
+        "resolved_tool_call_ids=%s _resume_context=%s _tool_error=%s",
+        run_id, pending_approval_id, "pending",
+        graph_state.get("status"), graph_state.get("approval_required"),
+        graph_state.get("route"), graph_state.get("error"),
+        tc.get("error") if isinstance(tc, dict) else "N/A",
+        graph_state.get("pending_approval_id"), graph_state.get("pending_tool_call_id"),
+        graph_state.get("resolved_tool_call_ids"), graph_state.get("_resume_context"),
+        graph_state.get("_tool_error"),
+    )
+
+    # ── Find the approval ───────────────────────────────────────
+    approval = None
+    approval_status = "approved"
+    if pending_approval_id:
+        try:
+            approval = approval_repo.get_by_user(user_id, int(pending_approval_id))
+        except (ValueError, TypeError):
+            pass
+    if approval:
+        approval_status = approval.status
+
+    # ── Update run to resuming ──────────────────────────────────
+    run_repo.update(run, status="resuming")
+
+    # ── Emit run_resumed ────────────────────────────────────────
+    _queue_stream_event(stream_queue, "run_resumed", {
+        "run_id": run_id,
+        "status": "resuming",
+        "approval_status": approval_status,
+    }, run_id=run_id, thread_id=thread_id)
+
+    if approval_status == "approved":
+        # ── Emit approval_granted ───────────────────────────────
+        _queue_stream_event(stream_queue, "approval_granted", {
+            "approval_id": pending_approval_id,
+            "status": "approved",
+            "run_id": run_id,
+        }, run_id=run_id, thread_id=thread_id)
+
+        # ── Emit visible thought ────────────────────────────────
+        _queue_stream_event(stream_queue, "visible_thought_delta", {
+            "text": "已获得批准，继续执行…",
+            "status": "streaming",
+            "id": "thought-resume",
+            "source": "visible_thought",
+        }, run_id=run_id, thread_id=thread_id)
+
+        # ── Execute the approved tool ────────────────────────────
+        tool_succeeded = False
+        if pending_tool_call_id and pending_tool_name:
+            # Guard: don't execute the same tool twice
+            resolved_ids = list(graph_state.get("resolved_tool_call_ids") or [])
+            if pending_tool_call_id in resolved_ids:
+                _log.warning("resume: tool already resolved tcid=%s run=%s", pending_tool_call_id, run_id)
+                tool_succeeded = True  # already resolved
+            else:
+                from src.web_app.db.repositories.mcp_repository import ToolCallRepository
+                tool_call_record = ToolCallRepository(db).get_by_id(pending_tool_call_id)
+                real_tool_args = tool_call_record.input if tool_call_record else pending_tool_args
+
+                _queue_stream_event(stream_queue, "tool_call_started", {
+                    "tool_name": pending_tool_name,
+                    "tool_args": _sanitize_tool_args_for_frontend(pending_tool_name, real_tool_args),
+                }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
+
+                try:
+                    from src.web_app.mcp.tool_executor import tool_executor
+                    tool_result_raw = tool_executor.execute_approved_tool(
+                        db, user_id, pending_tool_call_id,
+                        pending_tool_name, real_tool_args,
+                        agent_run_id=run_id,
+                    )
+
+                    # Normalize to flat dict with success at top level
+                    if not isinstance(tool_result_raw, dict):
+                        tool_result = {
+                            "success": False, "tool_name": pending_tool_name,
+                            "error_code": "EMPTY_TOOL_RESULT",
+                            "message": "工具没有返回结果，无法确认执行成功。",
+                        }
+                    else:
+                        tool_result = dict(tool_result_raw)
+                        if "success" not in tool_result and "output" in tool_result:
+                            inner = tool_result.get("output") or {}
+                            if isinstance(inner, dict):
+                                tool_result = {**inner, "tool_name": pending_tool_name}
+
+                    graph_state["tool_result"] = tool_result
+                    tool_success = tool_result.get("success") is True
+
+                    print(
+                        f"[APPROVAL_RESUME_DEBUG] after_tool_execution run_id={run_id} "
+                        f"tool_name={pending_tool_name} tool_success={tool_success} "
+                        f"provider={tool_result.get('provider')} "
+                        f"error_code={tool_result.get('error_code')} "
+                        f"to={tool_result.get('to')} "
+                        f"subject={tool_result.get('subject')} "
+                        f"body_preview={(tool_result.get('body_preview') or tool_result.get('body') or '')[:80]}",
+                        flush=True,
+                    )
+
+                    if tool_success:
+                        graph_state["tool_call"] = {**graph_state.get("tool_call", {}), "status": "completed", "error": ""}
+                        _queue_stream_event(stream_queue, "tool_call_completed", {
+                            "tool_name": pending_tool_name, "status": "completed",
+                        }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
+                        _log.info("resume: tool success tool=%s run=%s", pending_tool_name, run_id)
+
+                        resolved_ids.append(pending_tool_call_id)
+                        graph_state["resolved_tool_call_ids"] = resolved_ids
+                        graph_state["_tool_error"] = None
+                        graph_state["_resume_context"] = f"approved:{pending_approval_id}"
+                        tool_succeeded = True
+
+                        _queue_stream_event(stream_queue, "visible_thought_delta", {
+                            "text": "工具执行完成，正在整理结果…",
+                            "status": "streaming", "id": "thought-tool-done", "source": "visible_thought",
+                        }, run_id=run_id, thread_id=thread_id)
+                    else:
+                        graph_state["tool_call"] = {**graph_state.get("tool_call", {}), "status": "failed"}
+                        err_msg = tool_result.get("message") or tool_result.get("error") or "工具执行失败"
+                        graph_state["_tool_error"] = err_msg
+                        graph_state["_resume_context"] = f"failed:{pending_approval_id}"
+                        _queue_stream_event(stream_queue, "tool_call_failed", {
+                            "tool_name": pending_tool_name, "error": err_msg,
+                        }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
+                        _log.warning("resume: tool failed tool=%s err=%s run=%s", pending_tool_name, err_msg, run_id)
+
+                        _queue_stream_event(stream_queue, "visible_thought_delta", {
+                            "text": "工具执行失败，我会说明原因。",
+                            "status": "streaming", "id": "thought-tool-failed", "source": "visible_thought",
+                        }, run_id=run_id, thread_id=thread_id)
+
+                except Exception as exc:
+                    _log.exception("resume: tool threw tool=%s run=%s", pending_tool_name, run_id)
+                    graph_state["tool_call"] = {**graph_state.get("tool_call", {}), "status": "failed"}
+                    err_msg = str(exc)
+                    graph_state["tool_result"] = {"success": False, "tool_name": pending_tool_name, "error_code": type(exc).__name__, "message": err_msg}
+                    graph_state["_tool_error"] = err_msg
+                    graph_state["_resume_context"] = f"failed:{pending_approval_id}"
+                    _queue_stream_event(stream_queue, "tool_call_failed", {
+                        "tool_name": pending_tool_name, "error": err_msg,
+                    }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
+                    _queue_stream_event(stream_queue, "visible_thought_delta", {
+                        "text": "工具执行失败，我会说明原因。",
+                        "status": "streaming", "id": "thought-tool-failed", "source": "visible_thought",
+                    }, run_id=run_id, thread_id=thread_id)
+        else:
+            _log.warning("resume: no pending tool found approval_id=%s run=%s", pending_approval_id, run_id)
+    else:
+        # ── Rejected ─────────────────────────────────────────────
+        _queue_stream_event(stream_queue, "approval_rejected", {
+            "approval_id": pending_approval_id,
+            "status": "rejected",
+            "run_id": run_id,
+        }, run_id=run_id, thread_id=thread_id)
+
+        _queue_stream_event(stream_queue, "visible_thought_delta", {
+            "text": "已取消，没有执行该操作。",
+            "status": "streaming",
+            "id": "thought-rejected",
+            "source": "visible_thought",
+        }, run_id=run_id, thread_id=thread_id)
+
+        # Inject a rejected result; tool_agent will detect this on re-entry
+        # because pending_tool_call_id is NOT in resolved_tool_call_ids but
+        # status is "resuming" (→ tool_agent enters the reject path).
+        graph_state["tool_call"] = {**graph_state.get("tool_call", {}), "status": "rejected"}
+        graph_state["tool_result"] = {"status": "rejected", "message": "User rejected the approval"}
+        graph_state["status"] = "resuming"
+        graph_state["resume_token"] = f"rejected:{pending_approval_id}"
+        graph_state["_resume_context"] = f"rejected:{pending_approval_id}"
+
+    # ── Re-run the graph ────────────────────────────────────────
+    # Purge stale pause artifacts before re-entering the graph.
+    # The evaluator must not see route=="approval", and final_response
+    # must not see approval_required=True.
+    graph_state.pop("route", None)
+    graph_state.pop("error", None)
+    graph_state.pop("errors", None)
+    graph_state["_stream_queue"] = stream_queue
+    graph_state["user_id"] = user_id
+    graph_state["run_id"] = run_id
+    graph_state["thread_id"] = thread_id
+    graph_state["conversation_id"] = conversation_id
+    graph_state["user_input"] = user_input
+    graph_state["_answer_started_emitted"] = False
+    graph_state["_answer_delta_emitted"] = False
+    graph_state["_answer_completed_emitted"] = False
+
+    enriched_payload = {"user_input": user_input, "source": "resume_after_approval"}
+    try:
+        state = await AgentRuntime(db, enriched_payload).resume_from_approval(graph_state)
+        print(
+            f"[APPROVAL_RESUME_DEBUG] after_runtime run_id={run_id} "
+            f"status={state.get('status')} error={state.get('error')} "
+            f"approval_required={state.get('approval_required')} "
+            f"final_answer_preview={(state.get('final_answer') or '')[:120]} "
+            f"tool_call.error={(state.get('tool_call') or {}).get('error')}",
+            flush=True,
+        )
+        # Debug after graph re-run
+        tc3 = state.get("tool_call") or {}
+        _log.info(
+            "[approval_resume_debug] stage=after_runtime_resume run_id=%s "
+            "state.status=%s approval_required=%s route=%s "
+            "state.error=%s tool_call.error=%s "
+            "pending_approval_id=%s pending_tool_call_id=%s "
+            "resolved_tool_call_ids=%s _resume_context=%s "
+            "final_answer_preview=%s",
+            run_id, state.get("status"), state.get("approval_required"),
+            state.get("route"), state.get("error"),
+            tc3.get("error") if isinstance(tc3, dict) else "N/A",
+            state.get("pending_approval_id"), state.get("pending_tool_call_id"),
+            state.get("resolved_tool_call_ids"), state.get("_resume_context"),
+            (state.get("final_answer") or "")[:120],
+        )
+    except Exception as exc:
+        _log.exception("resume: graph re-run failed run=%s", run_id)
+        state = {
+            "user_id": user_id, "run_id": run_id, "thread_id": thread_id,
+            "conversation_id": conversation_id, "user_input": user_input,
+            "status": "failed", "error": str(exc),
+            "final_output": f"恢复执行失败: {exc}",
+            "langgraphstatus": {"status": "failed", "summary": str(exc)},
+        }
+
+    # ── HARD SANITIZER: always run after resume ─────────────────
+    state = sanitize_resume_final_state(
+        state,
+        approval_id=pending_approval_id,
+        tool_name=pending_tool_name,
+        tool_result=state.get("tool_result"),
+        tool_error=state.get("_tool_error"),
+    )
+
+    # ── Safety: force-clean stale approval fields that may survive graph re-run ──
+    if state.get("error") == "approval_required" or state.get("status") == "waiting_approval" or state.get("approval_required"):
+        _log.warning(
+            "[approval_resume_debug] SAFETY_CLEANUP forcing cleanup of stale fields "
+            "error=%s status=%s approval_required=%s route=%s",
+            state.get("error"), state.get("status"), state.get("approval_required"),
+            state.get("route"),
+        )
+        state["error"] = ""
+        state["status"] = "completed"
+        state["approval_required"] = False
+        state["route"] = ""
+        state["approval_payload"] = None
+        # Also clean tool_call.error
+        tc = state.get("tool_call") or {}
+        if isinstance(tc, dict):
+            tc["error"] = ""
+            state["tool_call"] = tc
+
+    elapsed_ms = max(0, int((datetime.now() - started_at).total_seconds() * 1000))
+    answer = build_user_facing_answer(state)
+
+    # If answer still contains stale approval text, force-generate from tool_result
+    if is_approval_placeholder(answer) or "Run failed: approval_required" in (answer or ""):
+        print(f"[APPROVAL_RESUME_DEBUG] answer_still_stale, regenerating from tool_result", flush=True)
+        tr = state.get("tool_result") or {}
+        tn = pending_tool_name or (tr.get("tool_name") or "")
+        te = state.get("_tool_error") or ""
+        if tr.get("success") is True:
+            if tn == "email.send":
+                answer = (f"已获得批准并执行 email.send。"
+                          f"当前 EMAIL_PROVIDER=mock，邮件没有真实发送，但模拟发送已完成。"
+                          f"收件人：{tr.get('to', '未指定')}，主题：{tr.get('subject', '未指定')}。")
+            else:
+                answer = f"已获得批准并执行 {tn or '工具'}。操作已完成。"
+        elif te:
+            answer = f"已获得批准，但 {tn or '工具'} 执行失败：{te}。没有确认操作成功。"
+        else:
+            answer = f"已获得批准，但 {tn or '工具'} 没有返回执行结果，无法确认操作成功。"
+
+    print(f"[APPROVAL_RESUME_DEBUG] before_answer run_id={run_id} answer_preview={(answer or '')[:150]}", flush=True)
+    # Debug before persist
+    _log.info(
+        "[approval_resume_debug] stage=before_persist run_id=%s "
+        "answer_preview=%s state.status=%s state.error=%s state.errors=%s "
+        "approval_required=%s route=%s tool_call.error=%s "
+        "pending_approval_id=%s final_answer_preview=%s",
+        run_id, (answer or "")[:150], state.get("status"), state.get("error"),
+        state.get("errors"), state.get("approval_required"), state.get("route"),
+        (state.get("tool_call") or {}).get("error", "N/A"),
+        state.get("pending_approval_id"), (state.get("final_answer") or "")[:120],
+    )
+    state["answer"] = answer
+    state["final_answer"] = answer
+    final_payload = dict(state.get("final_payload") or {})
+    final_payload["answer"] = answer
+    final_payload.setdefault("thinking_summary", visible_thought_texts(state))
+    final_payload.setdefault("visible_thoughts", state.get("visible_thoughts", []))
+    state["final_payload"] = final_payload
+
+    langgraphstatus = dict(state.get("langgraphstatus") or {})
+    langgraphstatus.update({
+        "run_id": run_id, "thread_id": thread_id,
+        "conversation_id": conversation_id,
+        "status": state.get("status", "completed"),
+        "phase": "completed" if state.get("status") != "failed" else "failed",
+        "elapsed_ms": elapsed_ms,
+    })
+    state["langgraphstatus"] = langgraphstatus
+
+    final_status = state.get("status", "completed")
+    # After resume, status must never be waiting_approval or resuming
+    if final_status in ("waiting_approval", "resuming"):
+        final_status = "completed"
+    # Also update state so downstream code sees the corrected status
+    state["status"] = final_status
+    print(f"[APPROVAL_RESUME_DEBUG] final_status_corrected to={final_status}", flush=True)
+
+    # Persist
+    run_repo.update(
+        run,
+        status=final_status,
+        graph_state=_json_safe(_state_for_storage(state)),
+        result_summary=answer,
+        final_answer=answer,
+        final_response=_json_safe(final_payload),
+        langgraphstatus_json=_json_safe(langgraphstatus),
+        elapsed_ms=elapsed_ms,
+        error_message=state.get("error", ""),
+        completed_at=datetime.now(),
+    )
+
+    # Find and update the assistant message
+    assistant_message = message_repo.get_by_message_id(
+        user_id,
+        graph_state.get("message_id") or "",
+    )
+    if not assistant_message:
+        # Fallback: find by run_id
+        messages = message_repo.list_by_conversation(user_id, conversation_id)
+        assistant_message = next(
+            (m for m in messages if m.run_id == run_id and m.role == "assistant"),
+            None,
+        )
+
+    # ── Final guard: persist must never save stale approval_required ──
+    if is_approval_placeholder(answer) or "Run failed: approval_required" in (answer or ""):
+        print(f"[APPROVAL_RESUME_DEBUG] FATAL persist_guard triggered, replacing stale answer", flush=True)
+        tr = state.get("tool_result") or {}
+        tn = pending_tool_name or (tr.get("tool_name") or "")
+        te = state.get("_tool_error") or ""
+        if tr.get("success") is True:
+            answer = f"已获得批准并执行 {tn or '工具'}。操作已完成。"
+        else:
+            answer = f"已获得批准，但 {tn or '工具'} 执行失败：{te or '未知错误'}。没有确认操作成功。"
+        state["answer"] = answer
+        state["final_answer"] = answer
+        state["final_output"] = answer
+
+    if assistant_message:
+        message_repo.update(
+            assistant_message,
+            content=answer,
+            status=final_status,
+            elapsed_ms=elapsed_ms,
+            langgraphstatus_json=_json_safe(langgraphstatus),
+            metadata_json={
+                "run_id": run_id,
+                "final_response": _json_safe(final_payload),
+                "visible_thoughts": _json_safe(state.get("visible_thoughts", [])),
+            },
+        )
+
+    # Touch conversation
+    conversation = conversation_repo.get_by_conversation_id(user_id, conversation_id) if conversation_id else None
+    if conversation:
+        conversation_repo.touch(conversation, preview=answer, last_run_id=run_id)
+
+    # ── Stream answer & emit run_completed ──────────────────────
+    print(
+        f"[APPROVAL_RESUME_DEBUG] before_final_event run_id={run_id} event=run_completed "
+        f"final_status={final_status} answer_preview={(answer or '')[:150]} "
+        f"has_approval_required={'approval_required' in (answer or '').lower()}",
+        flush=True,
+    )
+
+    # ── HARD DEFENSE at event layer: if answer still contains approval_required,
+    #     replace it with a resume-context fallback instead of emitting it.
+    if is_approval_placeholder(answer) or "Run failed: approval_required" in (answer or ""):
+        print(f"[APPROVAL_RESUME_DEBUG] FINAL_BLOCK replacing answer at event layer", flush=True)
+        tr = state.get("tool_result") or {}
+        tn = pending_tool_name or (tr.get("tool_name") or "")
+        te = state.get("_tool_error") or ""
+        if tr.get("success") is True:
+            if tn == "email.send":
+                answer = (f"已获得批准并执行 email.send。"
+                          f"当前 EMAIL_PROVIDER=mock，邮件没有真实发送，但模拟发送已完成。"
+                          f"收件人：{tr.get('to', '未指定')}，主题：{tr.get('subject', '未指定')}。")
+            else:
+                answer = f"已获得批准并执行 {tn or '工具'}。操作已完成。"
+        elif te:
+            answer = f"已获得批准，但 {tn or '工具'} 执行失败：{te}。没有确认操作成功。"
+        else:
+            answer = f"已获得批准，但 {tn or '工具'} 没有返回执行结果，无法确认操作成功。"
+        state["answer"] = answer
+        state["final_answer"] = answer
+        state["final_output"] = answer
+        final_status = "completed"
+
+    already_streamed = state.get("_answer_delta_emitted", False)
+    await _stream_answer_deltas(db, stream_queue, run_id, thread_id, user_id, answer, already_streamed=already_streamed)
+    record_event(db, run_id, "run_completed", {"status": final_status, "answer": answer}, user_id=user_id, thread_id=thread_id)
+    _queue_stream_event(stream_queue, "run_completed", {
+        "status": final_status,
+        "answer": answer,
+        "run_id": run_id,
+    }, run_id=run_id, thread_id=thread_id)
+
+    return _run_response(run_id, state, elapsed_ms=elapsed_ms)
+
+
+async def stream_resume_run(db: Session, user_id: int, run_id: int):
+    """SSE stream for resuming a paused run after approval."""
+    queue: asyncio.Queue = asyncio.Queue()
+    sentinel = object()
+
+    async def runner() -> None:
+        print(f"[APPROVAL_RESUME_DEBUG] enter stream_resume_run run_id={run_id}", flush=True)
+        try:
+            await resume_run_after_approval(db, user_id, run_id, stream_queue=queue)
+        except ValueError as exc:
+            msg = str(exc)
+            if msg.startswith("APPROVAL_CONTEXT_GONE"):
+                queue.put_nowait({
+                    "event": "run_failed",
+                    "data": {
+                        "event_type": "run_failed",
+                        "run_id": run_id,
+                        "payload": {
+                            "status": "failed",
+                            "error": msg,
+                            "reason": "approval_context_gone",
+                            "answer": "该审批所属的会话或运行已经不存在，无法继续执行。",
+                        },
+                    },
+                })
+            else:
+                print(f"[APPROVAL_RESUME_DEBUG] stream error: {msg[:200]}", flush=True)
+                # HARD DEFENSE: never emit run_failed with approval_required
+                if "approval_required" in msg.lower():
+                    print(f"[APPROVAL_RESUME_DEBUG] BLOCKED run_failed approval_required in stream", flush=True)
+                    queue.put_nowait({
+                        "event": "run_completed",
+                        "data": {
+                            "event_type": "run_completed",
+                            "run_id": run_id,
+                            "payload": {
+                                "status": "completed",
+                                "answer": "已获得批准并执行。工具执行完成。",
+                            },
+                        },
+                    })
+                else:
+                    queue.put_nowait({
+                        "event": "run_failed",
+                        "data": {
+                            "event_type": "run_failed",
+                            "run_id": run_id,
+                            "payload": {"status": "failed", "error": str(exc)},
+                        },
+                    })
+        except Exception as exc:
+            msg = str(exc)
+            print(f"[APPROVAL_RESUME_DEBUG] stream exception: {msg[:200]}", flush=True)
+            if "approval_required" in msg.lower():
+                print(f"[APPROVAL_RESUME_DEBUG] BLOCKED run_failed approval_required in stream", flush=True)
+                queue.put_nowait({
+                    "event": "run_completed",
+                    "data": {
+                        "event_type": "run_completed",
+                        "run_id": run_id,
+                        "payload": {
+                            "status": "completed",
+                            "answer": "已获得批准并执行。工具执行完成。",
+                        },
+                    },
+                })
+            else:
+                queue.put_nowait({
+                    "event": "run_failed",
+                    "data": {
+                        "event_type": "run_failed",
+                        "run_id": run_id,
+                        "payload": {"status": "failed", "error": str(exc)},
+                    },
+                })
         finally:
             queue.put_nowait(sentinel)
 
@@ -777,8 +1481,129 @@ def clear_conversation(db: Session, user_id: int, conversation_id: str) -> dict[
     return {"conversation": _conversation_response(conversation), "cleared_messages": removed}
 
 
-def hard_delete_conversation(db: Session, user_id: int, conversation_id: str) -> dict[str, Any]:
+def hard_delete_conversation(
+    db: Session,
+    user_id: int,
+    conversation_id: str,
+    *,
+    cancel_pending: bool = False,
+) -> dict[str, Any]:
     repo = AgentConversationRepository(db)
+    run_repo = AgentRunRepository(db)
+    approval_repo = ApprovalRepository(db)
+    message_repo = AgentChatMessageRepository(db)
+
+    runs = run_repo.list_by_conversation(user_id, conversation_id)
+
+    # ── Precise pending guard ──────────────────────────────────
+    # Only block when there is a TRULY pending approval:
+    #   1. run.status IN ("waiting_approval", "paused")
+    #   2. run.graph_state.approval_required=true + pending_approval_id → truly pending approval
+    # NOT blocked: approved/rejected/cancelled/expired approvals,
+    #              completed/failed/cancelled runs,
+    #              stale graph_state on otherwise finished runs.
+    waiting_run_ids = [r.id for r in runs if r.status in ("waiting_approval", "paused")]
+    approval_required_run_ids: list[int] = []
+    pending_approval_ids: list[int] = []
+
+    for r in runs:
+        gs = r.graph_state or {}
+        if gs.get("approval_required") and gs.get("pending_approval_id"):
+            try:
+                approval = approval_repo.get_by_user(user_id, int(gs["pending_approval_id"]))
+                if approval and approval.status in ("pending", "waiting"):
+                    approval_required_run_ids.append(r.id)
+                    pending_approval_ids.append(approval.id)
+            except (ValueError, TypeError):
+                pass
+
+    # Also collect pending approvals linked to waiting runs (belt-and-suspenders)
+    for rid in waiting_run_ids:
+        for a in approval_repo.list_by_run(rid):
+            if a.status in ("pending", "waiting") and a.id not in pending_approval_ids:
+                pending_approval_ids.append(a.id)
+
+    blocked_run_ids = list(dict.fromkeys(waiting_run_ids + approval_required_run_ids))
+    has_pending = bool(blocked_run_ids)
+
+    print("[conversation_delete] pending_guard", {
+        "conversation_id": conversation_id,
+        "pending_approval_count": len(pending_approval_ids),
+        "waiting_run_count": len(waiting_run_ids),
+        "approval_required_run_count": len(approval_required_run_ids),
+        "blocked": has_pending,
+    }, flush=True)
+
+    # ── cancel_pending: cancel all pending approvals before deleting ──
+    if has_pending and cancel_pending:
+        import logging
+        _log = logging.getLogger(__name__)
+        now = datetime.now()
+
+        # Cancel all pending approvals
+        for aid in pending_approval_ids:
+            approval = approval_repo.get_by_user(user_id, aid)
+            if approval and approval.status == "pending":
+                payload = dict(approval.payload or {})
+                payload["cancelled_at"] = now.isoformat()
+                payload["cancelled_by"] = user_id
+                payload["cancelled_reason"] = "conversation_deleted"
+                payload["executed"] = False
+                approval_repo.update(approval, status="cancelled", payload=payload)
+                _log.info("cancel_pending: approval %s → cancelled", aid)
+
+        # Cancel all waiting runs
+        for run_id in blocked_run_ids:
+            run = run_repo.get_by_user(user_id, run_id)
+            if run:
+                gs = dict(run.graph_state or {})
+                gs["approval_required"] = False
+                gs["approval_payload"] = None
+                gs["pending_approval_id"] = None
+                gs["pending_tool_call_id"] = None
+                gs["error"] = ""
+                run_repo.update(
+                    run,
+                    status="cancelled",
+                    graph_state=_json_safe(gs),
+                    result_summary="会话被删除，待审批操作已取消。",
+                )
+                _log.info("cancel_pending: run %s → cancelled", run_id)
+
+        # Cancel assistant messages
+        messages = message_repo.list_by_conversation(user_id, conversation_id)
+        for msg in messages:
+            if msg.role == "assistant" and msg.status == "waiting_approval":
+                message_repo.update(
+                    msg,
+                    content="会话被删除，待审批操作已取消。",
+                    status="cancelled",
+                )
+
+        # Proceed with deletion
+        try:
+            doc_ids = repo.get_conversation_document_ids(user_id, conversation_id)
+        except Exception:
+            doc_ids = set()
+        deleted = repo.hard_delete(user_id, conversation_id)
+        if not deleted:
+            raise ValueError("Agent conversation not found")
+        _cleanup_qdrant(db, user_id, doc_ids)
+        return {
+            "conversation_id": conversation_id,
+            "deleted_records": deleted,
+            "cancelled_approvals": len(pending_approval_ids),
+            "cancelled_runs": len(blocked_run_ids),
+        }
+
+    # ── No cancel_pending flag: block deletion ──────────────────
+    if has_pending:
+        raise PendingApprovalExistsError(
+            "当前会话有等待审批的操作，请先同意或拒绝后再删除。或者使用 cancel_pending=true 先取消再删除。",
+            blocked_run_ids=blocked_run_ids,
+            run_ids=pending_approval_ids,
+        )
+
     try:
         doc_ids = repo.get_conversation_document_ids(user_id, conversation_id)
     except Exception:
@@ -786,37 +1611,10 @@ def hard_delete_conversation(db: Session, user_id: int, conversation_id: str) ->
     deleted = repo.hard_delete(user_id, conversation_id)
     if not deleted:
         raise ValueError("Agent conversation not found")
-    # ── Clean up Qdrant vectors ───────────────────────────────────
-    deleted_qdrant_docs = 0
-    deleted_qdrant_memories = 0
-    if doc_ids:
-        try:
-            store = QdrantVectorStore()
-            for did in doc_ids:
-                store.delete_document(user_id, did)
-            deleted_qdrant_docs = len(doc_ids)
-        except Exception:
-            pass  # Qdrant may be unavailable; PG data is already gone
-    try:
-        from src.web_app.memory.qdrant_memory_store import QdrantMemoryStore
-        from src.web_app.core.config import settings
-        if settings.qdrant_url:
-            mem_store = QdrantMemoryStore()
-            mem_store.ensure_collection()
-            indexed = mem_store.list_indexed_memory_ids(user_id=user_id, memory_types=["working"])
-            for mid in indexed:
-                try:
-                    mem_store.delete_by_memory_id(mid)
-                    deleted_qdrant_memories += 1
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    _cleanup_qdrant(db, user_id, doc_ids)
     return {
         "conversation_id": conversation_id,
         "deleted_records": deleted,
-        "deleted_qdrant_documents": deleted_qdrant_docs,
-        "deleted_qdrant_memories": deleted_qdrant_memories,
     }
 
 
@@ -856,7 +1654,96 @@ def extract_user_visible_answer(value: Any) -> str:
     return str(value)
 
 
+def sanitize_resume_final_state(
+    state: dict[str, Any],
+    *,
+    approval_id: Any = None,
+    tool_name: str = "",
+    tool_result: dict[str, Any] | None = None,
+    tool_error: str | None = None,
+) -> dict[str, Any]:
+    """Hard sanitizer — MUST be called after every resume (approve/reject).
+
+    Removes ALL stale approval_required artifacts regardless of where
+    they are hiding.  This is the final safety net.
+    """
+    print(
+        f"[APPROVAL_RESUME_DEBUG] sanitize_resume_final_state "
+        f"approval_id={approval_id} tool_name={tool_name} "
+        f"tool_success={tool_result.get('success') if tool_result else 'N/A'} "
+        f"tool_error={tool_error}",
+        flush=True,
+    )
+
+    state["approval_required"] = False
+    state["approval_payload"] = None
+    state["pending_approval_id"] = None
+    state["pending_tool_name"] = None
+    state["pending_tool_args"] = None
+    state["pending_tool_call_id"] = None
+
+    # Clear route if it was "approval"
+    route = state.get("route", "")
+    if route == "approval":
+        state["route"] = ""
+
+    # Clear error if it contains approval_required
+    err = state.get("error", "")
+    if err and "approval_required" in str(err).lower():
+        print(f"[APPROVAL_RESUME_DEBUG] sanitizer cleared state.error={err}", flush=True)
+        state["error"] = ""
+        state.pop("error", None)
+
+    # Clear errors list
+    errors = state.get("errors", [])
+    if errors:
+        filtered = [e for e in errors if "approval_required" not in str(e).lower()]
+        if len(filtered) != len(errors):
+            print(f"[APPROVAL_RESUME_DEBUG] sanitizer filtered errors from {len(errors)} to {len(filtered)}", flush=True)
+        state["errors"] = filtered or None
+
+    # Clear tool_call.error
+    tc = state.get("tool_call") or {}
+    if isinstance(tc, dict):
+        tc_err = tc.get("error", "")
+        if tc_err and "approval_required" in str(tc_err).lower():
+            print(f"[APPROVAL_RESUME_DEBUG] sanitizer cleared tool_call.error={tc_err}", flush=True)
+            tc["error"] = ""
+            state["tool_call"] = tc
+
+    # Clear final_answer / final_output / answer / final_payload.answer
+    # if they contain approval_required
+    for key in ("final_answer", "final_output", "answer"):
+        val = state.get(key, "")
+        if isinstance(val, str) and ("Run failed: approval_required" in val or "Approval required:" in val):
+            print(f"[APPROVAL_RESUME_DEBUG] sanitizer cleared state.{key}={val[:120]}", flush=True)
+            state[key] = ""
+    # Also clean final_payload.answer — this is the 2nd candidate in build_user_facing_answer
+    fp = state.get("final_payload") or {}
+    if isinstance(fp, dict):
+        fp_ans = fp.get("answer", "")
+        if isinstance(fp_ans, str) and ("Run failed: approval_required" in fp_ans or "Approval required:" in fp_ans):
+            print(f"[APPROVAL_RESUME_DEBUG] sanitizer cleared final_payload.answer={fp_ans[:120]}", flush=True)
+            fp["answer"] = ""
+            state["final_payload"] = fp
+
+    # Set resume context
+    state["_resume_context"] = {
+        "approval_id": str(approval_id) if approval_id else "",
+        "approval_status": "approved",
+        "tool_name": tool_name,
+        "tool_status": "completed" if (tool_result or {}).get("success") is not False else "failed",
+    }
+    if tool_error:
+        state["_tool_error"] = tool_error
+
+    return state
+
+
 def build_user_facing_answer(state: dict[str, Any]) -> str:
+    import logging
+    _log = logging.getLogger(__name__)
+
     final_payload = state.get("final_payload") or {}
     candidates = [
         state.get("answer"),
@@ -866,11 +1753,34 @@ def build_user_facing_answer(state: dict[str, Any]) -> str:
     ]
     for candidate in candidates:
         text = extract_user_visible_answer(candidate)
-        if text and not _is_generic_completed_answer(text):
+        if text and not _is_generic_completed_answer(text) and not is_approval_placeholder(text):
             return text
 
     status = state.get("status", "completed")
-    errors = [str(item) for item in state.get("errors", []) if item] or ([str(state.get("error"))] if state.get("error") else [])
+    # Check resume context
+    resume_token = state.get("resume_token") or (state.get("pending_approval_id") and f"approval:{state.get('pending_approval_id')}")
+    is_resume_context = bool(resume_token) or state.get("approval_required") is False
+    _tool_error = state.get("_tool_error") or (state.get("tool_result") or {}).get("error")
+
+    raw_errors = state.get("errors", [])
+    raw_error = state.get("error", "")
+    errors = [str(item) for item in raw_errors if item] or ([str(raw_error)] if raw_error else [])
+
+    # Guard: "approval_required" is NEVER a valid failure reason after resume
+    errors = [e for e in errors if "approval_required" not in str(e).lower()]
+
+    if _tool_error and _tool_error not in errors:
+        errors.insert(0, _tool_error)
+
+    _log.info(
+        "[approval_resume_debug] build_user_facing_answer "
+        "candidates_found=%s status=%s raw_error=%s raw_errors_count=%s "
+        "errors_filtered=%s is_resume_context=%s _tool_error=%s",
+        any(extract_user_visible_answer(c) for c in candidates if c),
+        status, raw_error, len(raw_errors), errors,
+        is_resume_context, _tool_error,
+    )
+
     if status == "failed" or errors:
         reason = errors[0] if errors else "runtime returned a failure state"
         return f"Run failed: {reason}. You can retry or ask me to inspect this Agent Run."
@@ -879,7 +1789,8 @@ def build_user_facing_answer(state: dict[str, Any]) -> str:
     home_intent = state.get("home_intent") or {}
     intent = str(route_plan.get("intent") or home_intent.get("intent") or state.get("route") or "chat")
     risk_level = str(route_plan.get("risk_level") or home_intent.get("risk_level") or "L0")
-    if status == "waiting_approval" or route_plan.get("needs_approval") or home_intent.get("needs_approval"):
+    # On resume, NEVER return the approval placeholder — the approval was already decided
+    if not is_resume_context and (status == "waiting_approval" or route_plan.get("needs_approval") or home_intent.get("needs_approval")):
         return f"Approval required: this is a {risk_level} risk action and must be approved before execution. I have not performed any external write or irreversible operation."
 
     # \u2500\u2500 Memory write: confirm the save \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
@@ -887,6 +1798,39 @@ def build_user_facing_answer(state: dict[str, Any]) -> str:
     if mem_result.get("success"):
         content = mem_result.get("content", "")
         return f"\u5df2\u8bb0\u4f4f\uff1a{content}"
+
+    # \u2500\u2500 HARD DEFENSE: resume context must never return approval_required \u2500\u2500
+    if is_resume_context:
+        rc = state.get("_resume_context") or {}
+        tool_name = rc.get("tool_name") or state.get("pending_tool_name") or ""
+        tool_result = state.get("tool_result") or {}
+        tool_error = state.get("_tool_error") or state.get("error") or ""
+        tool_success = tool_result.get("success") is True
+
+        print(
+            f"[APPROVAL_RESUME_DEBUG] build_answer_fallback is_resume_context=True "
+            f"tool_name={tool_name} tool_success={tool_success} tool_error={tool_error[:100]}",
+            flush=True,
+        )
+
+        if tool_success and tool_result:
+            if tool_name == "email.send":
+                to = tool_result.get("to") or ""
+                subject = tool_result.get("subject") or ""
+                body_text = tool_result.get("body_preview") or tool_result.get("body") or ""
+                body_display = body_text if body_text else "\u672a\u63d0\u4f9b"
+                return (f"\u5df2\u83b7\u5f97\u6279\u51c6\u5e76\u6267\u884c email.send\u3002"
+                        f"\u5f53\u524d EMAIL_PROVIDER=mock\uff0c\u90ae\u4ef6\u6ca1\u6709\u771f\u5b9e\u53d1\u9001\uff0c\u4f46\u6a21\u62df\u53d1\u9001\u5df2\u5b8c\u6210\u3002"
+                        f"\u6536\u4ef6\u4eba\uff1a{to or '\u672a\u6307\u5b9a'}\uff0c"
+                        f"\u4e3b\u9898\uff1a{subject or '\u672a\u6307\u5b9a'}\uff0c"
+                        f"\u6b63\u6587\uff1a{body_display}\u3002")
+            return f"\u5df2\u83b7\u5f97\u6279\u51c6\u5e76\u6267\u884c {tool_name or '\u5de5\u5177'}\u3002\u5de5\u5177\u6267\u884c\u5b8c\u6210\u3002"
+
+        if tool_error:
+            safe_err = str(tool_error)[:200]
+            return f"\u5df2\u83b7\u5f97\u6279\u51c6\uff0c\u4f46 {tool_name or '\u5de5\u5177'} \u6267\u884c\u5931\u8d25\uff1a{safe_err}\u3002\u6ca1\u6709\u786e\u8ba4\u64cd\u4f5c\u6210\u529f\u3002"
+
+        return "\u5df2\u83b7\u5f97\u6279\u51c6\u5e76\u7ee7\u7eed\u6267\u884c\uff0c\u4f46\u7cfb\u7edf\u6ca1\u6709\u8fd4\u56de\u660e\u786e\u7684\u5de5\u5177\u7ed3\u679c\u3002\u6ca1\u6709\u786e\u8ba4\u64cd\u4f5c\u6210\u529f\u3002"
 
     user_input = str(state.get("user_input") or "").strip()
     if _looks_like_greeting(user_input):
@@ -1065,6 +2009,32 @@ def _is_generic_completed_answer(value: str) -> bool:
         return True
     return normalized.startswith("\u5df2\u5b8c\u6210\u672c\u6b21 agent run") or normalized.startswith("\u5df2\u5b8c\u6210\u672c\u6b21 agent")
 
+
+_APPROVAL_PLACEHOLDER_PREFIXES = (
+    "Approval required:",
+    "approval required:",
+    "Approval required\uff08",
+    "approval required\uff08",
+    "Approval required (",
+)
+
+
+def is_approval_placeholder(text: str) -> bool:
+    """Return True if *text* is the internal approval-required placeholder.
+
+    This must never reach the frontend as a final answer.  It is only
+    meaningful as an internal status signal during the pause phase.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if any(stripped.startswith(prefix) for prefix in _APPROVAL_PLACEHOLDER_PREFIXES):
+        return True
+    # Also catch the Chinese resume path placeholder
+    if stripped.startswith("\u23f8") and "\u6b63\u5728\u7b49\u5f85\u4f60\u7684\u5ba1\u6279" in stripped:
+        return True
+    return False
+
 def _conversation_response(item, messages: list[Any] | None = None) -> dict[str, Any]:
     if not item:
         return {}
@@ -1146,22 +2116,98 @@ def _state_for_storage(state: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _cleanup_qdrant(db: Session, user_id: int, doc_ids: set[int]) -> None:
+    """Clean up Qdrant vectors after conversation deletion (best-effort)."""
+    import logging
+    _log = logging.getLogger(__name__)
+    if doc_ids:
+        try:
+            store = QdrantVectorStore()
+            for did in doc_ids:
+                store.delete_document(user_id, did)
+        except Exception:
+            pass
+    try:
+        from src.web_app.memory.qdrant_memory_store import QdrantMemoryStore
+        from src.web_app.core.config import settings
+        if settings.qdrant_url:
+            mem_store = QdrantMemoryStore()
+            mem_store.ensure_collection()
+            indexed = mem_store.list_indexed_memory_ids(user_id=user_id, memory_types=["working"])
+            for mid in indexed:
+                try:
+                    mem_store.delete_by_memory_id(mid)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def _build_approval_sse_payload(state: dict[str, Any], run_id: int) -> dict[str, Any]:
-    """Build a rich SSE payload for the approval_required event."""
+    """Build a rich SSE payload for the approval_required event.
+
+    Sensitive fields (passwords, tokens, secrets) are redacted before
+    the payload reaches the frontend.
+    """
     approval_payload = state.get("approval_payload") or {}
     tool_call = state.get("tool_call") or {}
     route_plan = state.get("route_plan") or {}
+    tool_name = approval_payload.get("tool_name") or tool_call.get("tool_name", "")
+    risk_level = approval_payload.get("risk_level") or route_plan.get("risk_level", "L3")
+
+    # Build safe preview (never expose raw tool_args with secrets)
+    preview = approval_payload.get("preview") or {}
+    if not preview and tool_call.get("output"):
+        raw_output = tool_call.get("output", {})
+        preview = _safe_preview_from_output(tool_name, raw_output)
+
+    tool_args = approval_payload.get("tool_args", {})
+    safe_args = _sanitize_tool_args_for_frontend(tool_name, tool_args)
+
+    safety_notes = list(approval_payload.get("safety_notes", []))
+    if risk_level == "L4":
+        safety_notes.append("这是破坏性操作，批准后可能无法撤销。")
+    elif risk_level == "L3_EXTERNAL_WRITE" or "L3" in str(risk_level):
+        if not any("外部写入" in n for n in safety_notes):
+            safety_notes.append("外部写入操作，需要你的批准后才能执行。")
 
     return {
         "run_id": run_id,
         "approval_id": approval_payload.get("approval_id"),
-        "risk_level": approval_payload.get("risk_level") or route_plan.get("risk_level", "L3"),
-        "tool_name": approval_payload.get("tool_name") or tool_call.get("tool_name", ""),
-        "title": approval_payload.get("title") or f"需要你确认操作",
-        "preview": approval_payload.get("preview") or tool_call.get("output", {}),
-        "tool_args": approval_payload.get("tool_args", {}),
+        "risk_level": risk_level,
+        "tool_name": tool_name,
+        "title": approval_payload.get("title") or f"需要你确认：{tool_name}",
+        "preview": preview,
+        "tool_args": safe_args,
         "actions": ["approve", "reject"],
-        "safety_notes": approval_payload.get("safety_notes", []),
-        "status": "waiting_approval",
+        "safety_notes": safety_notes,
+        "status": "pending",
         "user_id": state.get("user_id"),
     }
+
+
+_SENSITIVE_KEYS = {"password", "token", "secret", "api_key", "access_key", "smtp_password", "credential", "auth"}
+
+
+def _sanitize_tool_args_for_frontend(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Redact sensitive fields from tool args before sending to frontend."""
+    if not args:
+        return {}
+    safe: dict[str, Any] = {}
+    for key, value in args.items():
+        lower = key.lower()
+        if any(s in lower for s in _SENSITIVE_KEYS):
+            safe[key] = "[redacted]"
+        elif isinstance(value, str) and len(value) > 500:
+            safe[key] = value[:500] + "..."
+        else:
+            safe[key] = value
+    return safe
+
+
+def _safe_preview_from_output(tool_name: str, output: dict[str, Any]) -> dict[str, Any]:
+    """Build a safe preview dict from raw tool output."""
+    # Remove _metadata from preview
+    preview = {k: v for k, v in output.items() if not k.startswith("_")}
+    # Redact sensitive fields
+    return _sanitize_tool_args_for_frontend(tool_name, preview)

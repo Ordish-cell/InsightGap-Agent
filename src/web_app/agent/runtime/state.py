@@ -85,6 +85,20 @@ class AgentRuntimeState(TypedDict, total=False):
     events: list[dict[str, Any]]
     _stream_queue: Any
 
+    # ── Approval / pause-resume ────────────────────────────────────
+    pending_approval_id: str | None
+    pending_tool_name: str | None
+    pending_tool_args: dict[str, Any] | None
+    pending_tool_call_id: int | None
+    resume_token: str | None
+    route_plan_snapshot: dict[str, Any] | None
+    current_route_index: int
+    resolved_tool_call_ids: list[int]
+
+    # ── Event sequencing ───────────────────────────────────────────
+    _event_seq: int
+    message_id: str
+
     # ── Streaming guard flags ───────────────────────────────────────
     # Set by _generate_final_answer_with_llm during streaming;
     # read by agent_service to skip the fallback _stream_answer_deltas.
