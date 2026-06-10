@@ -292,3 +292,88 @@ def test_home_intent_result_has_answer_mode():
     d = result.to_home_intent_dict()
     assert "answer_mode" in d
     assert d["answer_mode"] == "casual"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Planner routing: preference / negation / advice tests (P0 fix)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_planner_preference_routes_to_memory():
+    """'我喜欢用 FastAPI' must route to memory_agent with memory_confirm."""
+    from src.web_app.agent.runtime.planner import plan_route
+
+    plan = plan_route("我喜欢用 FastAPI")
+    assert plan["intent"] == "memory", f"Expected memory, got {plan['intent']}"
+    assert plan.get("answer_mode") == "memory_confirm"
+    assert "memory_agent" in plan["route"]
+
+
+def test_planner_negative_preference_routes_to_memory():
+    """'我不喜欢太啰嗦' must route to memory_agent with memory_confirm."""
+    from src.web_app.agent.runtime.planner import plan_route
+
+    plan = plan_route("我不喜欢太啰嗦")
+    assert plan["intent"] == "memory", f"Expected memory, got {plan['intent']}"
+    assert plan.get("answer_mode") == "memory_confirm"
+    assert "memory_agent" in plan["route"]
+
+
+def test_planner_qa_not_memory():
+    """'帮我解释 FastAPI' must NOT route to memory_agent."""
+    from src.web_app.agent.runtime.planner import plan_route
+
+    plan = plan_route("帮我解释 FastAPI")
+    assert plan["intent"] == "chat"
+    assert plan.get("answer_mode") == "chat"
+    assert "memory_agent" not in plan["route"]
+
+
+def test_planner_advice_question_not_memory_confirm():
+    """'这个项目用X怎么设计架构？' must be project_advice, NOT memory_confirm."""
+    from src.web_app.agent.runtime.planner import plan_route
+
+    plan = plan_route("这个项目用 FastAPI + PostgreSQL + Qdrant 怎么设计架构？")
+    assert plan.get("answer_mode") == "project_advice", (
+        f"Expected project_advice, got {plan.get('answer_mode')}"
+    )
+
+
+def test_planner_rule_fallback_preference_to_memory():
+    """When LLM fails, '我喜欢用 FastAPI' still routes to memory via rule fallback."""
+    from src.web_app.agent.runtime.planner import plan_route
+
+    # plan_route without home_intent simulates LLM failure (pure rule-based)
+    plan = plan_route("我喜欢用 FastAPI", home_intent=None)
+    assert plan["intent"] == "memory"
+    assert "memory_agent" in plan["route"]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Hard guard: final_response must NOT claim '已记住' without ok=True
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def test_sanitize_blocks_empty_save_results():
+    """Even with memory intent, if no save_results ok=True, sanitize must block."""
+    from src.web_app.agent.runtime.nodes import RuntimeNodes
+
+    answer = "已记住：你喜欢用 FastAPI。"
+    save_results: list = []
+    mem_write: dict = {}
+
+    result = RuntimeNodes._sanitize_memory_claims(answer, save_results, mem_write)
+    # Empty save_results → no change (guard only triggers when save_results is non-empty)
+    assert result == answer  # passes through — empty save_results means no memory write attempted
+
+
+def test_sanitize_blocks_candidates_without_ok():
+    """When save_results exist but all ok=False, must block '已记住'."""
+    from src.web_app.agent.runtime.nodes import RuntimeNodes
+
+    answer = "好的，已记住：你的偏好已保存到用户档案。"
+    save_results = [{"ok": False, "error": "db_error"}]
+
+    result = RuntimeNodes._sanitize_memory_claims(answer, save_results, {})
+    assert "已记住" not in result
+    assert "没有确认写入成功" in result

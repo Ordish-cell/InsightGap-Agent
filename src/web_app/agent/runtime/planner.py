@@ -147,16 +147,24 @@ _CONVERSATION_RECALL_PATTERNS = [
 
 
 def _infer_answer_mode(intent: str, user_input: str, *, is_memory_write: bool = False,
-                        is_tech_stack: bool = False, is_name_pref: bool = False) -> str:
-    """Derive answer_mode from intent + input patterns.
+                        is_tech_stack: bool = False, is_name_pref: bool = False,
+                        is_advice_question: bool = False,
+                        home_intent: dict[str, Any] | None = None) -> str:
+    """Derive answer_mode from intent + input patterns + optional LLM hint.
 
     answer_mode controls:
     - How final_response phrases the answer (memory_confirm → "已记住")
     - Which memory categories ContextBuilder injects (MEMORY_CONTEXT_POLICY)
     """
-    if is_memory_write or is_tech_stack or is_name_pref:
+    if is_memory_write or is_name_pref:
+        return "memory_confirm"
+    if is_tech_stack and not is_advice_question:
         return "memory_confirm"
     if intent in ("research", "feed_research"):
+        # LLM hint: if LLM says memory_confirm, trust it for project_advice override
+        llm_am = str((home_intent or {}).get("answer_mode") or "")
+        if llm_am == "memory_confirm":
+            return "memory_confirm"
         return "project_advice"
     if intent == "rag" or str(intent).startswith("rag"):
         return "rag_qa"
@@ -165,6 +173,10 @@ def _infer_answer_mode(intent: str, user_input: str, *, is_memory_write: bool = 
     if intent == "artifact":
         return "project_advice"
     if intent == "chat":
+        # LLM hint: LLM may detect memory_confirm even when rules say chat
+        llm_am = str((home_intent or {}).get("answer_mode") or "")
+        if llm_am == "memory_confirm":
+            return "memory_confirm"
         _casual_greetings = ("你好", "您好", "hi", "hello", "hey", "早", "晚安", "再见", "谢谢")
         if any(user_input.strip().lower().startswith(g) for g in _casual_greetings):
             return "casual"
@@ -225,29 +237,52 @@ def plan_route(
         "这个项目用", "这个项目是", "项目技术栈", "项目用",
         "默认用", "默认使用", "不要再", "别再给我", "别再", "不要给我",
         "我偏好", "我的偏好", "我喜欢", "我习惯",
+        "我不喜欢", "我不想要", "我讨厌",
         "我的项目", "我的技术栈", "我在用", "我用的",
+        "我叫", "叫我", "我的名字", "我是",
+        # ── English ──
+        "i like", "i prefer", "i usually use", "i always use",
+        "i don't like", "don't recommend", "remember that",
+        "call me", "my name is",
     )
-    _is_memory_like = any(user_input.strip().startswith(p) for p in _memory_prefixes)
+    _is_memory_like = any(user_input.strip().lower().startswith(p) for p in _memory_prefixes)
     # Tech stack declarations: "这个项目用X+Y+Z", "我的技术栈是..."
     _is_tech_stack = any(
         kw in text for kw in _TECH_STACK_DECLARATION_PATTERNS
     ) and not any(t in text for t in ("发邮件", "发送邮件", "执行命令", "删除"))
     # Name/identity preference: "我叫C", "以后叫我C"
     _is_name_preference = any(kw in text for kw in _NAME_PREFERENCE_PATTERNS)
+    # Declaration + question: "这个项目用X怎么设计架构？"
+    _has_advice_question = any(
+        kw in text for kw in ("怎么", "如何", "设计架构", "架构设计", "方案建议", "帮我设计", "帮我看看")
+    )
     _has_explicit_action = any(t in text for t in (
         "发邮件", "发送邮件", "创建文件", "写入文件", "删除文件",
         "执行命令", "运行命令", "发给", "发一封", "帮我创建",
     )) or any(_has_english_term(text, kw) for kw in ("email", "send", "delete"))
     if _is_memory_like and not _has_explicit_action:
         is_tool = False
-        reasons.append("memory_like_suppress_tool")
+        if _has_advice_question:
+            is_research = True
+            reasons.append("memory_like_with_question")
+        else:
+            is_rag = False
+            is_research = False
+            is_artifact = False
+            is_memory = True
+            reasons.append("memory_like_declaration")
     # ── Tech stack / name declarations → memory, NOT rag/research ──
+    # EXCEPT when the user is ALSO asking a question ("怎么设计架构") → keep research
     if (_is_tech_stack or _is_name_preference) and not _has_explicit_action and not forced:
-        is_rag = False
-        is_research = False
-        is_artifact = False
-        is_memory = True
-        reasons.append("declaration_to_memory")
+        if _has_advice_question:
+            is_research = True
+            reasons.append("declaration_with_question")
+        else:
+            is_rag = False
+            is_research = False
+            is_artifact = False
+            is_memory = True
+            reasons.append("declaration_to_memory")
 
     # Conversation recall: "what did I just ask?" — must NOT trigger research/rag
     import re as _re
@@ -463,6 +498,8 @@ def plan_route(
         is_memory_write=is_memory_write,
         is_tech_stack=_is_tech_stack,
         is_name_pref=_is_name_preference,
+        is_advice_question=_has_advice_question,
+        home_intent=home_intent,
     )
     route_plan: RoutePlan = {
         "intent": intent,
