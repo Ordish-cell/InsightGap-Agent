@@ -111,7 +111,7 @@ class FeedCard(Base, TimestampMixin):
     final_score: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     exposure_bucket: Mapped[str] = mapped_column(String(32), default="explicit_related", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="new", nullable=False)
-    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     generated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 

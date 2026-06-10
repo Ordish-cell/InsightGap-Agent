@@ -170,6 +170,11 @@ class MemoryService:
             importance=updated_importance,
             metadata_json=updated_meta,
         )
+        store = self._get_qdrant_store()
+        if store is not None and existing.qdrant_point_id:
+            try:
+                store.upsert_memory(memory_id=existing.id, user_id=existing.user_id, content=existing.content, memory_type=existing.memory_type, importance=updated_importance, source_type=existing.source_type or "", metadata=updated_meta, point_id=existing.qdrant_point_id)
+            except Exception: pass
         return self._to_dict(existing)
 
     def search_memory(
@@ -184,9 +189,47 @@ class MemoryService:
         limit: int = 8,
     ) -> list[dict[str, Any]]:
         """Search long-term memory with Qdrant → ILIKE → recent-important fallback."""
+        from datetime import UTC, datetime as _dt
+        from src.web_app.services.user_growth_service import user_growth_service as _ugs
+
         if not db:
             query_lower = query.lower()
             return [item for item in self._items if item["user_id"] == user_id and query_lower in item["content"].lower()]
+
+        # ── Helper closures ─────────────────────────────────────────────
+        def _status_allowed(m) -> bool:
+            if hasattr(m, "metadata_json"):
+                s = (m.metadata_json or {}).get("status", "active")
+            else:
+                s = (m.get("metadata", {}) or {}).get("status", "active")
+            return s not in ("superseded", "archived")
+
+        def _effective_importance(mem_dict: dict) -> float:
+            imp = float(mem_dict.get("importance", 0) or 0)
+            meta = mem_dict.get("metadata", {}) or {}
+            status = meta.get("status", "active")
+            if status == "superseded":
+                imp *= 0.50
+            elif status == "archived":
+                imp *= 0.25
+            if meta.get("stability") == "temporary":
+                imp *= 0.80
+            return imp
+
+        def _recency_score(meta: dict) -> float:
+            now = _dt.now(UTC)
+            ts_str = meta.get("last_seen_at") or meta.get("updated_at") or meta.get("created_at") or ""
+            if not ts_str:
+                return 0.0
+            try:
+                if ts_str.endswith("Z"):
+                    ts_str = ts_str[:-1] + "+00:00"
+                ts = _dt.fromisoformat(ts_str)
+                age_days = (now - ts).total_seconds() / 86400.0
+                # Half-life of 30 days
+                return max(0.0, 1.0 / (1.0 + age_days / 30.0))
+            except Exception:
+                return 0.0
 
         # Determine which memory types to search
         types_for_search: list[str] | None = None
@@ -216,17 +259,19 @@ class MemoryService:
                     if qdrant_hits:
                         memory_ids = [int(h["memory_id"]) for h in qdrant_hits]
                         memories = repo.get_by_ids(user_id=user_id, ids=memory_ids)
-                        # Filter by min_importance and memory_type
+                        # Filter by min_importance, memory_type, and status
                         if min_importance > 0:
                             memories = [m for m in memories if m.importance >= min_importance]
                         if types_for_search:
                             memories = [m for m in memories if m.memory_type in types_for_search]
-                        # Sort: 75 % Qdrant score + 25 % importance
+                        memories = [m for m in memories if _status_allowed(m)]
+                        # Sort: 65% Qdrant + 25% effective importance + 10% recency
                         score_map = {int(h["memory_id"]): h["score"] for h in qdrant_hits}
                         memories.sort(
                             key=lambda m: (
-                                0.75 * score_map.get(m.id, 0)
-                                + 0.25 * float(m.importance or 0)
+                                0.65 * score_map.get(m.id, 0)
+                                + 0.25 * _effective_importance(self._to_dict(m))
+                                + 0.10 * _recency_score(m.metadata_json or {})
                             ),
                             reverse=True,
                         )
@@ -234,6 +279,9 @@ class MemoryService:
                         for m in memories[:limit]:
                             d = self._to_dict(m)
                             d["_qdrant_score"] = score_map.get(m.id, 0)
+                            meta = m.metadata_json or {}
+                            if meta.get("confidence", 0.95) < 0.55:
+                                d["_low_confidence"] = True
                             results.append(d)
                         return results
                 except Exception:
@@ -250,6 +298,7 @@ class MemoryService:
         if pg_memories:
             self._last_search_backend = "postgres_like"
             self._last_qdrant_hits = 0
+            pg_memories = [m for m in pg_memories if _status_allowed(m)]
             return [self._to_dict(m) for m in pg_memories[:limit]]
 
         # ── Tier 3: recent important semantic memories ─────────────────
@@ -262,6 +311,7 @@ class MemoryService:
         if fallback_memories:
             self._last_search_backend = "recent_important_fallback"
             self._last_qdrant_hits = 0
+            fallback_memories = [m for m in fallback_memories if _status_allowed(m)]
             return [self._to_dict(m) for m in fallback_memories]
 
         self._last_search_backend = "no_results"
@@ -282,18 +332,29 @@ class MemoryService:
         items = [item for item in self._items if item["user_id"] == user_id]
         return {"count": len(items), "summary": "; ".join(item["content"] for item in items[:5])}
 
+    _SEMANTIC_CATEGORIES = {"preference", "negative_preference", "project_goal", "tech_stack", "boundary", "answer_preference", "name_preference", "language_preference", "tone_preference", "workflow_pattern"}
+
     def consolidate_memory(self, user_id: int, db: Session | None = None) -> dict[str, Any]:
-        if db:
-            repo = MemoryRepository(db)
-            promoted = 0
-            for item in repo.search(user_id, memory_type="working", min_importance=0.7):
-                repo.update(item, memory_type="episodic")
-                promoted += 1
-            for item in repo.search(user_id, memory_type="episodic", min_importance=0.8):
-                repo.update(item, memory_type="semantic")
-                promoted += 1
-            return {"user_id": user_id, "promoted": promoted}
-        return {"user_id": user_id, "promoted": 0, "mode": "mock"}
+        if not db: return {"user_id": user_id, "promoted": 0, "mode": "mock"}
+        repo = MemoryRepository(db)
+        promoted_w_to_e = 0; promoted_e_to_s = 0
+        now_ts = datetime.now(UTC).isoformat()
+        # working→episodic: importance>=0.7
+        for item in repo.search(user_id, memory_type="working", min_importance=0.7):
+            updated_meta = dict(item.metadata_json or {})
+            updated_meta.update({"visible_in_long_term_memory": True, "status": "active", "stability": "medium_term", "consolidated_at": now_ts, "consolidated_from": "working"})
+            repo.update(item, memory_type="episodic", metadata_json=updated_meta)
+            promoted_w_to_e += 1
+        # episodic→semantic: importance>=0.8 AND stability!="temporary" AND evidence_count>=2 AND category in _SEMANTIC_CATEGORIES
+        for item in repo.search(user_id, memory_type="episodic", min_importance=0.8):
+            meta = item.metadata_json or {}
+            if meta.get("stability") == "temporary" or meta.get("evidence_count", 1) < 2: continue
+            if meta.get("category", "") not in self._SEMANTIC_CATEGORIES: continue
+            updated_meta = dict(meta)
+            updated_meta.update({"stability": "long_term", "consolidated_at": now_ts, "consolidated_from": "episodic"})
+            repo.update(item, memory_type="semantic", metadata_json=updated_meta)
+            promoted_e_to_s += 1
+        return {"user_id": user_id, "promoted_working_to_episodic": promoted_w_to_e, "promoted_episodic_to_semantic": promoted_e_to_s, "total_promoted": promoted_w_to_e + promoted_e_to_s}
 
     def forget_memory(self, user_id: int, memory_id: int | None = None, db: Session | None = None) -> dict[str, Any]:
         if db:
@@ -309,65 +370,193 @@ class MemoryService:
         self._items = [item for item in self._items if not (item["user_id"] == user_id and (memory_id is None or item["id"] == memory_id))]
         return {"deleted": before - len(self._items)}
 
-    def extract_and_save(
-        self,
-        user_id: int,
-        user_input: str,
-        agent_output: str = "",
-        page_context: dict[str, Any] | None = None,
-        feed_card_context: dict[str, Any] | None = None,
-        matched_skill: dict[str, Any] | None = None,
-        created_skill_draft: dict[str, Any] | None = None,
-        db: Session | None = None,
-    ) -> dict[str, Any]:
-        extraction = memory_extractor.extract(
-            user_input=user_input,
-            agent_output=agent_output,
-            page_context=page_context,
-            feed_card_context=feed_card_context,
-            matched_skill=matched_skill,
-            created_skill_draft=created_skill_draft,
-        )
-        saved: dict[str, list[dict[str, Any]]] = {"working": [], "episodic": [], "semantic": []}
+    @staticmethod
+    def _is_protected_memory(memory: Any) -> bool:
+        """Returns True if memory is protected and should not be archived by forgetting strategies."""
+        meta = memory.metadata_json if hasattr(memory, "metadata_json") else memory.get("metadata", {}) if isinstance(memory, dict) else {}
+        status = meta.get("status", "active") if meta else "active"
+        is_protected = meta.get("protected", False) if meta else False
+        importance = memory.importance if hasattr(memory, "importance") else memory.get("importance", 0)
+        return status == "superseded" or is_protected or (status == "active" and importance >= 0.8)
 
+    def _archive_memory(self, memory: Any, reason: str, db: Session) -> dict[str, Any]:
+        repo = MemoryRepository(db)
+        now_ts = datetime.now(UTC).isoformat()
+        current_meta = dict(memory.metadata_json if hasattr(memory, "metadata_json") else memory.get("metadata", {}))
+        current_meta["status"] = "archived"
+        current_meta["archived_at"] = now_ts
+        current_meta["archive_reason"] = reason
+        repo.update(memory, metadata_json=current_meta)
+        return self._to_dict(memory)
+
+    def forget_by_importance(self, user_id: int, threshold: float = 0.2, memory_type: str | None = None, db: Session | None = None) -> dict[str, Any]:
+        """Archive memories with importance below threshold. Skips protected memories."""
+        if not db: return {"archived": 0, "skipped_protected": 0, "strategy": "importance", "details": []}
+        repo = MemoryRepository(db)
+        archived = 0; skipped = 0; details: list[dict[str, Any]] = []
+        types_to_check = [memory_type] if memory_type else ["semantic", "episodic"]
+        for mtype in types_to_check:
+            for item in repo.search(user_id, memory_type=mtype, min_importance=0.0):
+                if item.importance >= threshold: continue
+                if self._is_protected_memory(item):
+                    skipped += 1; continue
+                self._archive_memory(item, f"forget_by_importance: importance {item.importance:.2f} < {threshold}", db)
+                archived += 1
+                details.append({"id": item.id, "content": item.content[:80], "importance": item.importance, "type": mtype})
+        return {"archived": archived, "skipped_protected": skipped, "strategy": "importance", "threshold": threshold, "details": details}
+
+    def forget_by_time(self, user_id: int, max_age_days: int = 90, memory_type: str | None = None, db: Session | None = None) -> dict[str, Any]:
+        """Archive memories not seen within max_age_days. Skips protected memories."""
+        if not db: return {"archived": 0, "skipped_protected": 0, "strategy": "time", "details": []}
+        repo = MemoryRepository(db)
+        archived = 0; skipped = 0; details: list[dict[str, Any]] = []
+        now = datetime.now(UTC)
+        types_to_check = [memory_type] if memory_type else ["semantic", "episodic"]
+        for mtype in types_to_check:
+            for item in repo.search(user_id, memory_type=mtype, min_importance=0.0):
+                meta = item.metadata_json or {}
+                last_ts_str = meta.get("last_seen_at") or meta.get("updated_at") or str(item.created_at) if hasattr(item, "created_at") else ""
+                try:
+                    if last_ts_str and last_ts_str.endswith("Z"):
+                        last_ts_str = last_ts_str[:-1] + "+00:00"
+                    last_ts = datetime.fromisoformat(str(last_ts_str)) if last_ts_str else None
+                except Exception:
+                    last_ts = None
+                if last_ts is None:
+                    continue
+                age_days = (now - last_ts.replace(tzinfo=UTC)).total_seconds() / 86400.0 if last_ts.tzinfo else (now - last_ts).total_seconds() / 86400.0
+                if age_days <= max_age_days: continue
+                if self._is_protected_memory(item):
+                    skipped += 1; continue
+                self._archive_memory(item, f"forget_by_time: last seen {age_days:.0f} days ago > {max_age_days}", db)
+                archived += 1
+                details.append({"id": item.id, "content": item.content[:80], "age_days": round(age_days, 1), "type": mtype})
+        return {"archived": archived, "skipped_protected": skipped, "strategy": "time", "max_age_days": max_age_days, "details": details}
+
+    def forget_by_capacity(self, user_id: int, memory_type: str = "semantic", max_capacity: int = 500, db: Session | None = None) -> dict[str, Any]:
+        """Archive lowest effective_importance memories when count exceeds max_capacity. Skips protected."""
+        if not db: return {"archived": 0, "skipped_protected": 0, "strategy": "capacity", "details": []}
+        repo = MemoryRepository(db)
+        all_items = repo.search(user_id, memory_type=memory_type, min_importance=0.0)
+        if len(all_items) <= max_capacity:
+            return {"archived": 0, "skipped_protected": 0, "strategy": "capacity", "count": len(all_items), "max_capacity": max_capacity, "details": []}
+        # Sort by effective importance (lowest first), protected go last
+        def eff_imp(item):
+            return float(item.importance or 0) * (0.25 if (item.metadata_json or {}).get("status") == "archived" else 0.5 if (item.metadata_json or {}).get("status") == "superseded" else 1.0)
+        sorted_items = sorted(all_items, key=lambda x: (1 if self._is_protected_memory(x) else 0, eff_imp(x)))
+        to_remove = len(all_items) - max_capacity
+        archived = 0; skipped = 0; details: list[dict[str, Any]] = []
+        for item in sorted_items:
+            if archived >= to_remove: break
+            if self._is_protected_memory(item):
+                skipped += 1; continue
+            self._archive_memory(item, f"forget_by_capacity: exceeded max {max_capacity}", db)
+            archived += 1
+            details.append({"id": item.id, "content": item.content[:80], "importance": item.importance, "effective_importance": eff_imp(item)})
+        return {"archived": archived, "skipped_protected": skipped, "strategy": "capacity", "max_capacity": max_capacity, "original_count": len(all_items), "details": details}
+
+    def extract_and_save(self, user_id, user_input, agent_output="", page_context=None, feed_card_context=None, matched_skill=None, created_skill_draft=None, db=None, run_id="") -> dict:
+        """Sync extraction using regex only."""
+        extraction = memory_extractor.extract(
+            user_input=user_input, agent_output=agent_output, page_context=page_context,
+            feed_card_context=feed_card_context, matched_skill=matched_skill, created_skill_draft=created_skill_draft)
+        return self._save_extracted(user_id, extraction, db, run_id)
+
+    async def async_extract_and_save(self, user_id, user_input, agent_output="", page_context=None, feed_card_context=None, matched_skill=None, created_skill_draft=None, db=None, run_id="", use_llm=True, thread_id="") -> dict:
+        """Async extraction with LLM primary + regex fallback."""
+        extraction = None
+        llm_used = False
+        if use_llm and db:
+            try:
+                from src.web_app.memory.extractor import LlmMemoryExtractor
+                llm_extractor = LlmMemoryExtractor()
+                extraction = await llm_extractor.extract(
+                    db=db, run_id=run_id, thread_id=thread_id, user_id=user_id,
+                    user_input=user_input, agent_output=agent_output,
+                    page_context=page_context, feed_card_context=feed_card_context,
+                    matched_skill=matched_skill, created_skill_draft=created_skill_draft)
+                llm_used = True
+            except Exception:
+                logger.warning("memory.async_extract_and_save: LLM failed, using regex fallback", exc_info=True)
+        if extraction is None:
+            extraction = memory_extractor.extract(
+                user_input=user_input, agent_output=agent_output, page_context=page_context,
+                feed_card_context=feed_card_context, matched_skill=matched_skill, created_skill_draft=created_skill_draft)
+        result = self._save_extracted(user_id, extraction, db, run_id)
+        result["llm_used"] = llm_used
+        return result
+
+    def _save_extracted(self, user_id, extraction, db, run_id) -> dict:
+        saved = {"working": [], "episodic": [], "semantic": []}
+        filtered_out = {"episodic": 0, "semantic": 0}
+        now_ts = datetime.now(UTC).isoformat()
+
+        # working: low-barrier, visible_in_long_term_memory=False
         for mem in extraction.get("working_memories", []):
-            result = self.add_memory(
-                user_id, mem["content"], memory_type="working",
+            result = self.add_memory(user_id, mem["content"], memory_type="working",
                 importance=mem.get("importance", 0.3),
-                metadata={"category": mem.get("category", ""), "source": mem.get("source", "")},
-                db=db,
-            )
+                metadata={"category": mem.get("category", ""), "source": mem.get("source", ""),
+                          "visible_in_long_term_memory": False, "stability": "temporary",
+                          "status": "active", "confidence": mem.get("confidence", 0.95)}, db=db)
             saved["working"].append(result)
 
+        # episodic: importance>=0.65 AND confidence>=0.65
         for mem in extraction.get("episodic_memories", []):
-            result = self.add_memory(
-                user_id, mem["content"], memory_type="episodic",
-                importance=mem.get("importance", 0.5),
-                metadata={"category": mem.get("category", ""), "source": mem.get("source", "")},
-                db=db,
-            )
-            saved["episodic"].append(result)
+            importance = mem.get("importance", 0.5)
+            confidence = mem.get("confidence", 0.80)
+            if importance < 0.65 or confidence < 0.65:
+                filtered_out["episodic"] += 1; continue
+            result = self.add_with_dedup(user_id, mem["content"], memory_type="episodic",
+                importance=importance,
+                metadata={"category": mem.get("category", ""), "source": mem.get("source", ""),
+                          "visible_in_long_term_memory": True, "stability": mem.get("stability", "medium_term"),
+                          "status": "active", "evidence_count": 1, "last_seen_at": now_ts, "confidence": confidence}, db=db)
+            if result: saved["episodic"].append(result)
 
+        # semantic: importance>=0.70 AND confidence>=0.65
         for mem in extraction.get("semantic_memories", []):
-            result = self.add_with_dedup(
-                user_id, mem["content"], memory_type="semantic",
-                importance=mem.get("importance", 0.8),
-                metadata={
-                    "category": mem.get("category", ""),
-                    "source": mem.get("source", "home_chat"),
-                    "confidence": mem.get("confidence", 0.8),
-                    "evidence_count": 1,
-                    "last_seen_at": datetime.now(UTC).isoformat(),
-                },
-                db=db,
-            )
-            if result:
-                saved["semantic"].append(result)
+            importance = mem.get("importance", 0.8)
+            confidence = mem.get("confidence", 0.80)
+            if importance < 0.70 or confidence < 0.65:
+                filtered_out["semantic"] += 1; continue
+            result = self.add_with_dedup(user_id, mem["content"], memory_type="semantic",
+                importance=importance,
+                metadata={"category": mem.get("category", ""), "source": mem.get("source", "home_chat"),
+                          "visible_in_long_term_memory": True, "stability": mem.get("stability", "long_term"),
+                          "status": "active", "evidence_count": 1, "last_seen_at": now_ts, "confidence": confidence}, db=db)
+            if result: saved["semantic"].append(result)
 
-        if extraction.get("should_consolidate") and db:
-            self.consolidate_memory(user_id, db)
+        # Auto consolidate + reflect triggers
+        if db:
+            should_consolidate = extraction.get("should_consolidate", False)
+            saved_sem_count = len(saved["semantic"])
+            has_high_episodic = any(m.get("importance", 0) >= 0.75 for m in extraction.get("episodic_memories", []) if m.get("importance", 0) >= 0.65)
+            if saved_sem_count > 0 or has_high_episodic: should_consolidate = True
+            if should_consolidate:
+                try:
+                    self.consolidate_memory(user_id, db)
+                except Exception:
+                    logger.warning("memory.auto_consolidate_failed", exc_info=True)
+            try:
+                from collections import Counter
+                repo = MemoryRepository(db)
+                all_sem, _ = repo.list_long_term(user_id, memory_type="semantic", page=1, page_size=500)
+                cat_counts = Counter()
+                for m in all_sem:
+                    if (m.metadata_json or {}).get("status", "active") == "active":
+                        cat = (m.metadata_json or {}).get("category", "")
+                        if cat: cat_counts[cat] += 1
+                if any(c >= 4 for c in cat_counts.values()):
+                    from src.web_app.services.user_growth_service import user_growth_service as _ugs
+                    _ugs.reflect_user_profile(user_id, db)
+            except Exception:
+                logger.warning("memory.auto_reflect_failed", exc_info=True)
 
-        return {"extraction": extraction, "saved": saved}
+        total_saved = len(saved["working"]) + len(saved["episodic"]) + len(saved["semantic"])
+        logger.info("memory.extract_and_save: run_id=%s working=%d episodic=%d semantic=%d filtered_episodic=%d filtered_semantic=%d",
+                    run_id, len(saved["working"]), len(saved["episodic"]), len(saved["semantic"]),
+                    filtered_out["episodic"], filtered_out["semantic"])
+        return {"extraction": extraction, "saved": saved, "filtered_out": filtered_out, "total_saved": total_saved}
 
     def _to_dict(self, item) -> dict[str, Any]:
         return {

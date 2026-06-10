@@ -1,5 +1,295 @@
+import json
+import logging
 import re
-from typing import Any
+import time
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from src.web_app.agent.llm.factory import get_chat_model
+from src.web_app.agent.llm.router import resolve_model_name
+from src.web_app.agent.llm.usage import record_llm_call
+
+logger = logging.getLogger(__name__)
+
+
+# ── Pydantic schemas for LLM memory extraction ─────────────────────────
+
+
+class LongTermMemoryItem(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    memory_type: Literal["episodic", "semantic"] = "semantic"
+    content: str = ""
+    category: str = ""
+    importance: float = Field(0.0, ge=0.0, le=1.0)
+    confidence: float = Field(0.0, ge=0.0, le=1.0)
+    stability: Literal["session", "medium_term", "long_term"] = "medium_term"
+    source: str = "home_chat"
+    status: Literal["active", "low_confidence"] = "active"
+    reason: str = ""
+
+
+class MemoryExtractionResult(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    long_term_memories: list[LongTermMemoryItem] = Field(default_factory=list)
+    working_memories: list[dict[str, Any]] = Field(default_factory=list)
+    should_consolidate: bool = False
+    reason: str = ""
+
+
+# ── LLM Memory Extractor ────────────────────────────────────────────────
+
+
+class LlmMemoryExtractor:
+    """LLM-based memory extraction that falls back to regex extraction."""
+
+    async def extract(
+        self,
+        db,
+        run_id: str = "",
+        thread_id: str = "",
+        user_id: int = 0,
+        user_input: str = "",
+        agent_output: str = "",
+        page_context=None,
+        feed_card_context=None,
+        matched_skill=None,
+        created_skill_draft=None,
+    ) -> dict[str, Any]:
+        """Extract memories — casual chat uses regex, otherwise tries LLM with fallback."""
+        if memory_extractor._is_casual_chat(user_input):
+            return memory_extractor.extract(
+                user_input=user_input,
+                agent_output=agent_output,
+                page_context=page_context,
+                feed_card_context=feed_card_context,
+                matched_skill=matched_skill,
+                created_skill_draft=created_skill_draft,
+            )
+
+        try:
+            llm_result = await self._extract_with_llm(
+                db=db,
+                run_id=run_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                user_input=user_input,
+                agent_output=agent_output,
+                page_context=page_context,
+                feed_card_context=feed_card_context,
+                matched_skill=matched_skill,
+                created_skill_draft=created_skill_draft,
+            )
+            return self._convert_llm_result(llm_result, page_context, feed_card_context)
+        except Exception:
+            logger.exception("LLM memory extraction failed, falling back to regex")
+            return memory_extractor.extract(
+                user_input=user_input,
+                agent_output=agent_output,
+                page_context=page_context,
+                feed_card_context=feed_card_context,
+                matched_skill=matched_skill,
+                created_skill_draft=created_skill_draft,
+            )
+
+    async def _extract_with_llm(
+        self,
+        db,
+        run_id: str,
+        thread_id: str,
+        user_id: int,
+        user_input: str,
+        agent_output: str,
+        page_context=None,
+        feed_card_context=None,
+        matched_skill=None,
+        created_skill_draft=None,
+    ) -> MemoryExtractionResult:
+        resolution = resolve_model_name("memory", complexity="low")
+        started = time.perf_counter()
+        output_text = ""
+        try:
+            model = get_chat_model("memory", complexity="low", temperature=0.15)
+            prompt = _build_memory_extraction_prompt(
+                user_input=user_input,
+                agent_output=agent_output,
+                page_context=page_context,
+                feed_card_context=feed_card_context,
+                matched_skill=matched_skill,
+                created_skill_draft=created_skill_draft,
+            )
+            message = model.invoke(prompt)
+            output_text = _llm_message_content(message)
+            payload = _llm_parse_json(output_text)
+            result = MemoryExtractionResult.model_validate(payload)
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            record_llm_call(
+                db,
+                run_id=run_id,
+                thread_id=thread_id,
+                user_id=user_id,
+                node_name="memory_extraction",
+                purpose="memory",
+                provider=resolution.provider,
+                model=resolution.model,
+                tier=resolution.tier,
+                latency_ms=latency_ms,
+                status="completed",
+                estimated_input_chars=len(prompt),
+                estimated_output_chars=len(output_text),
+                metadata={"input_preview": user_input[:200]},
+            )
+            return result
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            try:
+                record_llm_call(
+                    db,
+                    run_id=run_id,
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    node_name="memory_extraction",
+                    purpose="memory",
+                    provider=resolution.provider,
+                    model=resolution.model,
+                    tier=resolution.tier,
+                    latency_ms=latency_ms,
+                    status="failed",
+                    error_message=str(exc),
+                    estimated_input_chars=len(user_input),
+                    estimated_output_chars=len(output_text),
+                    metadata={"input_preview": user_input[:200]},
+                )
+            except Exception:
+                pass
+            raise
+
+    def _convert_llm_result(
+        self,
+        result: MemoryExtractionResult,
+        page_context=None,
+        feed_card_context=None,
+    ) -> dict[str, Any]:
+        """Convert MemoryExtractionResult to dict format expected by extract_and_save.
+
+        Filters: confidence < 0.65 discarded; semantic importance < 0.70 skipped;
+        episodic importance < 0.65 skipped. Also includes regex working memory.
+        """
+        episodic: list[dict[str, Any]] = []
+        semantic: list[dict[str, Any]] = []
+
+        for mem in result.long_term_memories:
+            if mem.confidence < 0.65:
+                continue
+            entry = {
+                "content": mem.content,
+                "importance": mem.importance,
+                "category": mem.category,
+                "source": mem.source,
+                "confidence": mem.confidence,
+                "stability": mem.stability,
+                "status": mem.status,
+                "reason": mem.reason,
+            }
+            if mem.memory_type == "semantic":
+                if mem.importance < 0.70:
+                    continue
+                semantic.append(entry)
+            elif mem.memory_type == "episodic":
+                if mem.importance < 0.65:
+                    continue
+                episodic.append(entry)
+
+        # Merge regex working memories with LLM working memories
+        working = memory_extractor._extract_working(page_context, feed_card_context)
+        llm_working = result.working_memories or []
+        if isinstance(llm_working, list):
+            working = working + [w for w in llm_working if isinstance(w, dict)]
+
+        return {
+            "working_memories": working,
+            "episodic_memories": episodic,
+            "semantic_memories": semantic,
+            "should_consolidate": result.should_consolidate,
+        }
+
+
+# ── LLM prompt builder ──────────────────────────────────────────────────
+
+
+def _build_memory_extraction_prompt(
+    user_input: str,
+    agent_output: str,
+    page_context=None,
+    feed_card_context=None,
+    matched_skill=None,
+    created_skill_draft=None,
+) -> str:
+    ctx = {
+        "user_input": user_input,
+        "agent_output": agent_output,
+        "page_context": page_context,
+        "feed_card_context": feed_card_context,
+        "matched_skill": matched_skill,
+        "created_skill_draft": created_skill_draft,
+    }
+    return (
+        "你是 Agent OS 的记忆提取器。你的任务是从对话中提取长期记忆和短期工作记忆，并输出严格 JSON。\n\n"
+        "提取规则：\n"
+        "1. 长期偏好/习惯表达 → memory_type=\"semantic\"（如：用户正在开发的项目、技术栈偏好、长期目标、边界约束、风格偏好）\n"
+        "2. 项目目标/技术栈 → memory_type=\"semantic\"（如：使用 LangGraph、React、MySQL 等具体技术）\n"
+        "3. 重要事件/动作 → memory_type=\"episodic\"（如：用户启动了深度研究、创建/匹配了 Skill、反馈了性能/UI 问题）\n"
+        "4. 随意聊天（打招呼、感谢、道别、问候）→ 不提取任何 long_term_memories\n"
+        "5. 低置信度（confidence < 0.65）→ 不要输出该记忆项；如果不确定 status 应为 \"low_confidence\"\n"
+        "6. working_memories：仅提取当前聚焦的页面、选中的卡片等短期工作上下文；不把长期内容放入 working_memories\n"
+        "7. 每条记忆必须包含完整字段：memory_type, content, category, importance, confidence, stability, source, status, reason\n"
+        "8. 不要编造事实，只从对话中提取实际提到的内容；不要臆测用户没有表达的信息\n\n"
+        "输出 JSON schema：\n"
+        "{\n"
+        '  "long_term_memories": [\n'
+        '    {"memory_type": "semantic|episodic", "content": "...", "category": "...",\n'
+        '     "importance": 0.0-1.0, "confidence": 0.0-1.0, "stability": "session|medium_term|long_term",\n'
+        '     "source": "home_chat", "status": "active|low_confidence", "reason": "..."}\n'
+        "  ],\n"
+        '  "working_memories": [],\n'
+        '  "should_consolidate": true|false,\n'
+        '  "reason": "..."\n'
+        "}\n\n"
+        f"输入：{json.dumps(ctx, ensure_ascii=False)}"
+    )
+
+
+# ── LLM output helpers (same pattern as intent_llm.py) ─────────────────
+
+
+def _llm_message_content(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, list):
+        return "\n".join(
+            str(item.get("text", item)) if isinstance(item, dict) else str(item)
+            for item in content
+        )
+    return str(content)
+
+
+def _llm_parse_json(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        stripped = stripped.strip("`")
+        if stripped.lower().startswith("json"):
+            stripped = stripped[4:].strip()
+    if not stripped.startswith("{"):
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start >= 0 and end > start:
+            stripped = stripped[start : end + 1]
+    data = json.loads(stripped)
+    if not isinstance(data, dict):
+        raise ValueError("Memory extraction LLM output must be a JSON object")
+    return data
+
+
+# ── Deterministic Memory Extractor (existing, unchanged below) ────────────
 
 
 class MemoryExtractor:

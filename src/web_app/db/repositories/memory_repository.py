@@ -61,6 +61,29 @@ class MemoryRepository(BaseRepository[Memory]):
         )
         return list(self.db.execute(stmt).scalars())
 
+    def list_long_term(self, user_id, memory_type=None, category=None, status=None, query=None, page=1, page_size=20) -> tuple:
+        """Paginated long-term memories (semantic+episodic, visible, not superseded by default)."""
+        types = ["semantic", "episodic"]
+        stmt = select(Memory).where(Memory.user_id == user_id, Memory.memory_type.in_(types)).order_by(Memory.updated_at.desc(), Memory.importance.desc())
+        if memory_type and memory_type in types: stmt = stmt.where(Memory.memory_type == memory_type)
+        if query: stmt = stmt.where(Memory.content.ilike(f"%{query}%"))
+        rows = list(self.db.execute(stmt).scalars())
+        show_superseded = status == "superseded"
+        explicit_status = status
+        filtered = []
+        for m in rows:
+            meta = m.metadata_json or {}
+            if not meta.get("visible_in_long_term_memory", False): continue
+            mem_status = meta.get("status", "active")
+            if mem_status == "superseded" and not show_superseded: continue
+            if not explicit_status and mem_status != "active": continue
+            if explicit_status and mem_status != explicit_status: continue
+            if category and meta.get("category") != category: continue
+            filtered.append(m)
+        total = len(filtered)
+        offset = (max(1, page) - 1) * page_size
+        return filtered[offset:offset + page_size], total
+
     def list_for_vector_backfill(
         self,
         user_id: int | None = None,

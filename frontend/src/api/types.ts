@@ -339,3 +339,19 @@ export interface HealthResponse {
   mcp?: UnknownRecord
   [key: string]: unknown
 }
+
+export type LongTermMemoryType = 'semantic' | 'episodic'
+export type LongTermMemoryStatus = 'active' | 'archived' | 'low_confidence' | 'superseded'
+
+export interface LongTermMemoryItem {
+  id: number; memory_type: LongTermMemoryType; content: string
+  category?: string; importance: number; effective_importance?: number
+  confidence?: number; status: LongTermMemoryStatus; stability?: string
+  evidence_count?: number; last_seen_at?: string; created_at?: string
+  updated_at?: string; metadata?: UnknownRecord
+  [key: string]: unknown
+}
+
+export interface LongTermMemoryListResponse {
+  items: LongTermMemoryItem[]; total: number; page: number; page_size: number
+}

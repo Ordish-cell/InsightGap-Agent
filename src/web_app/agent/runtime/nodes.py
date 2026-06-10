@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from typing import Any
 
@@ -37,27 +38,49 @@ from src.web_app.services.skill_service import skill_service
 from src.web_app.services.mcp_service import mcp_service
 from src.web_app.services.user_growth_service import user_growth_service
 
-EXTERNAL_WRITE_TERMS = ("发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "email", "send", "post", "submit")
+EXTERNAL_WRITE_TERMS = ("发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单")
+_EN_EXTERNAL_WRITE_KEYWORDS = ("email", "send", "post", "submit")
 HIGH_RISK_TERMS = ("删除", "支付", "付款", "转账", "delete", "payment")
 
 logger = logging.getLogger(__name__)
 
+
+def _is_memory_like_input(user_text: str) -> bool:
+    text = user_text.strip()
+    memory_prefixes = (
+        "以后", "从此", "从今", "记住", "帮我记", "记一下",
+        "这个项目用", "这个项目是", "项目技术栈", "项目用",
+        "默认用", "默认使用", "默认",
+        "不要再", "别再给我", "别再", "不要给我",
+        "我偏好", "我的偏好", "我喜欢", "我习惯",
+        "我的项目", "我的技术栈", "我在用", "我用的",
+        "长期", "永远", "一直",
+    )
+    for prefix in memory_prefixes:
+        if text.startswith(prefix): return True
+    return False
+
+def _has_explicit_email_send_intent(user_text: str) -> bool:
+    text = user_text.lower()
+    has_send_keyword = any(kw in text for kw in (
+        "发邮件", "发送邮件", "send email", "send mail", "寄邮件",
+        "发给", "发一封给", "通知邮箱",
+    )) or bool(re.search(r'\bsend\b.*\bemail\b', text)) or bool(re.search(r'\bemail\b.*\bsend\b', text))
+    if not has_send_keyword: return False
+    has_recipient = bool(re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', user_text)) or any(kw in user_text for kw in ("发给", "给…发", "给某某"))
+    return has_recipient
 
 def _is_obvious_email_intent(db: Session, user_text: str, route_plan: dict[str, Any]) -> bool:
     """Check if user clearly wants to send email — prevents false tool_not_found.
 
     Conditions: email.send is registered AND (user has email address in text OR clear email keywords).
     """
-    import re
     from src.web_app.mcp.registry import registry as mcp_registry
     if mcp_registry.get_tool(db, "email.send") is None:
         return False
     text = user_text.lower()
     has_address = bool(re.search(r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}', user_text))
-    has_email_semantics = any(kw in text for kw in (
-        "发邮件", "发送邮件", "send email", "send mail", "mail", "寄邮件",
-        "给", "发给", "发一封",
-    ))
+    has_email_semantics = any(kw in text for kw in ("发邮件", "发送邮件", "send email", "send mail", "寄邮件", "发给", "发一封", "通知邮箱")) or (re.search(r'\b' + re.escape("email") + r'\b', text) is not None)
     return has_address or has_email_semantics
 
 
@@ -115,7 +138,7 @@ class RuntimeNodes:
         permission_level = "L0_READ_ONLY"
         if any(term in text for term in HIGH_RISK_TERMS) or any(term in text for term in ("删除", "支付", "付款", "转账")):
             permission_level = L4_HIGH_RISK
-        elif any(term in text for term in EXTERNAL_WRITE_TERMS) or any(term in text for term in ("发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单")):
+        elif any(term in text for term in EXTERNAL_WRITE_TERMS) or any(term in text for term in ("发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单")) or any(re.search(r'\b' + re.escape(kw) + r'\b', text, re.IGNORECASE) for kw in _EN_EXTERNAL_WRITE_KEYWORDS):
             permission_level = L3_EXTERNAL_WRITE
 
         decision = PermissionGuard().check_tool_call("agent_runtime_task", permission_level)
@@ -428,6 +451,14 @@ class RuntimeNodes:
         if state.get("route") != "rag":
             return state
         result = rag_service.ask(state["user_id"], state.get("user_input", ""), top_k=int(self.payload.get("top_k", 5)))
+        if result.get("needs_general_fallback"):
+            from src.web_app.services.rag_service import _answer_from_general_llm
+            try:
+                fallback_answer = await _answer_from_general_llm(state.get("user_input", ""))
+                result["answer"] = fallback_answer
+                result["answer_mode"] = "general_knowledge_fallback"
+                result["_fallback_used"] = True
+            except Exception: pass
         state["rag"] = result
         state["final_output"] = result.get("answer", "")
         record_step(self.db, state["run_id"], "rag", "rag_ask", {"query": state.get("user_input", "")}, {"answer_mode": result.get("answer_mode"), "evidence_count": len(result.get("evidence", []))})
@@ -505,7 +536,7 @@ class RuntimeNodes:
         created_skill_draft = state.get("created_skill_draft")
 
         try:
-            result = memory_service.extract_and_save(
+            result = await memory_service.async_extract_and_save(
                 user_id=state["user_id"],
                 user_input=user_input,
                 agent_output=agent_output,
@@ -514,6 +545,9 @@ class RuntimeNodes:
                 matched_skill=matched_skill,
                 created_skill_draft=created_skill_draft,
                 db=self.db,
+                run_id=str(state["run_id"]),
+                use_llm=True,
+                thread_id=state.get("thread_id", ""),
             )
             saved = result.get("saved", {})
             all_saved = saved.get("working", []) + saved.get("episodic", []) + saved.get("semantic", [])
@@ -801,6 +835,14 @@ class RuntimeNodes:
                     top_k=int(self.payload.get("top_k", 5)),
                     document_ids=doc_ids_for_search,
                 )
+            if result.get("needs_general_fallback"):
+                from src.web_app.services.rag_service import _answer_from_general_llm
+                try:
+                    fallback_answer = await _answer_from_general_llm(user_input_str)
+                    result["answer"] = fallback_answer
+                    result["answer_mode"] = "general_knowledge_fallback"
+                    result["_fallback_used"] = True
+                except Exception: pass
             state["rag"] = result
             state["rag_result"] = result
             append_output(state, "rag_agent", {"answer": result.get("answer", ""),
@@ -1035,8 +1077,14 @@ class RuntimeNodes:
                 llm_result=llm_selection,
             )
 
+            # ── Memory-guard: memory-like input must never trigger email.send ──
+            if _is_memory_like_input(user_text) and tool_name == "email.send":
+                logger.warning("[MEMORY_GUARD] Blocked false-positive email.send for memory-like input")
+                tool_name = None
+                tool_input = {}
+
             # ── Hard fallback guard: obvious email intent must never become tool_not_found ──
-            if not tool_name and _is_obvious_email_intent(self.db, user_text, route_plan):
+            if not tool_name and _is_obvious_email_intent(self.db, user_text, route_plan) and not _is_memory_like_input(user_text):
                 logger.warning(
                     "[TOOL_NOT_FOUND_DEBUG] requested_tool=email.send normalized_tool=email.send "
                     "registered_tools=[email.send,...] user_text=%.200s — forcing email.send fallback",
@@ -1220,13 +1268,16 @@ class RuntimeNodes:
             matched_skill = state.get("matched_skill")
             created_skill_draft = state.get("created_skill_draft")
 
-            result = memory_service.extract_and_save(
+            result = await memory_service.async_extract_and_save(
                 user_id=state["user_id"], user_input=user_input,
                 agent_output=agent_output, page_context=page_context,
                 feed_card_context=feed_card_context,
                 matched_skill=matched_skill,
                 created_skill_draft=created_skill_draft,
                 db=self.db,
+                run_id=str(state["run_id"]),
+                use_llm=True,
+                thread_id=state.get("thread_id", ""),
             )
             saved = result.get("saved", {})
             all_saved = saved.get("working", []) + saved.get("episodic", []) + saved.get("semantic", [])

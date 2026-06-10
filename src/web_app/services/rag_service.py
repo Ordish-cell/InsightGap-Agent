@@ -1,4 +1,7 @@
 from typing import Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -27,6 +30,40 @@ _DOCUMENT_OVERVIEW_KEYWORDS = [
 def is_document_overview_query(query: str) -> bool:
     text = (query or "").lower()
     return any(kw in text for kw in _DOCUMENT_OVERVIEW_KEYWORDS)
+
+
+_GENERAL_KNOWLEDGE_PATTERNS = ["是什么", "什么是", "解释一下", "帮我解释", "介绍一下", "讲讲", "原理", "区别", "怎么理解", "概念", "作用", "用途", "优缺点", "特点", "是什么意思", "定义", "怎么用", "如何使用"]
+
+_DOCUMENT_SPECIFIC_PATTERNS = ["我上传的文档", "我的文档里", "根据文档", "根据我的文档", "根据知识库", "知识库里", "这个文档", "这份文件", "这个PDF", "这个附件", "上传的资料", "上传的文件", "根据上传", "根据资料", "我的资料", "资料库里", "帮我看看这个", "帮我读一下"]
+
+
+def is_general_knowledge_question(text: str) -> bool:
+    return any(p in text for p in _GENERAL_KNOWLEDGE_PATTERNS)
+
+
+def is_document_specific_question(text: str) -> bool:
+    return any(p in text for p in _DOCUMENT_SPECIFIC_PATTERNS)
+
+
+async def _answer_from_general_llm(question: str) -> str:
+    from src.web_app.agent.llm.factory import get_chat_model
+    try:
+        model = get_chat_model("rag", complexity="normal", temperature=0.35)
+        prompt = ("你是 Agent OS 的知识助手。请基于你的通用知识回答用户问题。"
+                  "如果问题超出你的知识范围，请诚实说明。"
+                  "用简洁清晰的中文回答，不要编造信息。"
+                  f"\n\n用户问题：{question}")
+        message = await model.ainvoke(prompt)
+        content = getattr(message, "content", str(message))
+        if isinstance(content, list):
+            content = "\n".join(
+                str(item.get("text", item)) if isinstance(item, dict) else str(item)
+                for item in content
+            )
+        return str(content)
+    except Exception:
+        logger.warning("general_llm_fallback_failed", exc_info=True)
+        return "抱歉，我在尝试回答这个问题时遇到了技术问题。"
 
 
 class RAGService:
@@ -88,10 +125,13 @@ class RAGService:
         search_result = self.search(user_id, question, top_k, min_score, document_ids)
         results = search_result.get("results", [])
         if not results:
+            is_general = is_general_knowledge_question(question)
+            is_doc_specific = is_document_specific_question(question)
             return {
                 "answer": "我查看了知识库，没有找到与这个问题直接相关的记录。",
-                "answer_mode": "no_evidence",
+                "answer_mode": "general_knowledge_fallback" if (is_general and not is_doc_specific) else "no_evidence",
                 "evidence": [],
+                "needs_general_fallback": is_general and not is_doc_specific,
                 "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0, "embedding_model": resolve_model_name("embedding").model, "answer_model": resolve_model_name("rag").model},
             }
         evidence = [

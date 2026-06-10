@@ -5,9 +5,16 @@ Supervisor graph uses for conditional routing.
 """
 
 from typing import Any
+import re
 
 from src.web_app.agent.runtime.intent_schema import normalize_agent_name
 from src.web_app.agent.runtime.state import AgentIntent, AgentRuntimeState, RiskLevel, RoutePlan
+
+
+def _has_english_term(text: str, term: str) -> bool:
+    """Word-boundary match for English keywords to avoid false positives
+    like 'post' matching 'PostgreSQL' or 'send' matching 'send_async'."""
+    return bool(re.search(r'\b' + re.escape(term) + r'\b', text, re.IGNORECASE))
 
 # ── Keyword sets for intent detection ──────────────────────────────
 
@@ -47,7 +54,6 @@ _ARTIFACT_TERMS = [
 _TOOL_TERMS = [
     "发邮件", "发送邮件", "邮件", "评论", "操作", "打开", "点击",
     "提交", "发布", "删除", "修改外部系统", "付款", "支付", "转账",
-    "email", "send", "post", "submit", "delete", "payment",
     "执行", "运行命令",
     # ── Local file operations ──
     "创建文件", "写入文件", "修改文件", "保存到本地", "读取文件",
@@ -55,11 +61,16 @@ _TOOL_TERMS = [
     "写一个文件", "帮我创建", "帮我写", "写到本地", "写入本地",
     "保存文件", "本地文件", "读写文件",
     # ── Shell commands ──
-    "运行命令", "执行脚本", "shell", "terminal", "cmd", "powershell",
+    "运行命令", "执行脚本",
     "命令行", "终端", "执行命令", "跑命令",
     # ── Browser / form ──
     "打开网页", "填写表单",
     "发评论", "发布评论",
+]
+
+_EN_TOOL_KEYWORDS = [
+    "email", "send", "post", "submit", "delete", "payment",
+    "shell", "terminal", "cmd", "powershell",
 ]
 
 _MEMORY_TERMS = [
@@ -157,9 +168,27 @@ def plan_route(
     is_research = any(term in text for term in _RESEARCH_TERMS) and not is_document_qa
     is_rag = any(term in text for term in _RAG_TERMS) or is_document_qa
     is_artifact = any(term in text for term in _ARTIFACT_TERMS)
-    is_tool = any(term in text for term in _TOOL_TERMS) or any(term in text for term in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "打开网页", "删除", "支付", "付款", "转账"])
+    is_tool = any(term in text for term in _TOOL_TERMS) or any(term in text for term in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "打开网页", "删除", "支付", "付款", "转账"]) or any(_has_english_term(text, kw) for kw in _EN_TOOL_KEYWORDS)
     is_memory = any(term in text for term in _MEMORY_TERMS)
     is_skill = any(term in text for term in _SKILL_TERMS)
+
+    # ── Memory-guard: suppress tool detection for memory/context declarations ──
+    _memory_prefixes = (
+        "以后", "从此", "从今", "记住", "帮我记", "记一下",
+        "这个项目用", "这个项目是", "项目技术栈", "项目用",
+        "默认用", "默认使用", "不要再", "别再给我", "别再", "不要给我",
+        "我偏好", "我的偏好", "我喜欢", "我习惯",
+        "我的项目", "我的技术栈", "我在用", "我用的",
+    )
+    _is_memory_like = any(user_input.strip().startswith(p) for p in _memory_prefixes)
+    _has_explicit_action = any(t in text for t in (
+        "发邮件", "发送邮件", "创建文件", "写入文件", "删除文件",
+        "执行命令", "运行命令", "发给", "发一封", "帮我创建",
+    )) or any(_has_english_term(text, kw) for kw in ("email", "send", "delete"))
+    if _is_memory_like and not _has_explicit_action:
+        is_tool = False
+        reasons.append("memory_like_suppress_tool")
+
     # Conversation recall: "what did I just ask?" — must NOT trigger research/rag
     import re as _re
     is_conversation_recall = any(
@@ -277,13 +306,13 @@ def plan_route(
     if is_tool:
         # ── Detect sub-intents for finer risk ───────────────────
         text = user_input.lower()
-        _is_email = any(t in text for t in ["发邮件", "发送邮件", "邮件", "email", "send", "mail", "给", "发一封"])
+        _is_email = any(t in text for t in ["发邮件", "发送邮件", "邮件", "发一封"]) or _has_english_term(text, "email") or _has_english_term(text, "send")
         _is_local_write = any(t in text for t in ["创建文件", "写入文件", "修改文件", "保存到本地", "写文件", "写一个文件", "帮我创建", "帮我写", "写到本地", "写入本地", "保存文件", "新建文件", "写入"])
         _is_local_read = any(t in text for t in ["读取文件", "列出目录", "打开文件", "查看文件", "帮我看看", "看看本地", "列出文件", "查看目录", "看看文件", "列出"])
-        _is_delete = any(t in text for t in ["删除", "delete", "remove", "rm "])
+        _is_delete = any(t in text for t in ["删除", "remove", "rm "]) or _has_english_term(text, "delete")
         _is_shell = any(t in text for t in ["运行命令", "执行脚本", "shell", "terminal", "cmd", "powershell", "命令行", "终端", "执行命令", "跑命令"])
         _is_browser = any(t in text for t in ["打开网页", "填写表单", "browser", "浏览器"])
-        _is_form = any(t in text for t in ["提交", "submit", "post", "发布评论", "发评论", "评论"])
+        _is_form = any(t in text for t in ["提交", "发布评论", "发评论", "评论"]) or _has_english_term(text, "submit") or _has_english_term(text, "post")
         _is_high_risk = any(t in text for t in ["删除全部", "删除数据库", "支付", "付款", "转账", "删除项目", "删除所有", "全部删除",
                                                   "payment", "transfer", "drop database", "format", "shutdown",
                                                   "rm -rf", "sudo ", "chmod 777", "chown"])
@@ -308,7 +337,7 @@ def plan_route(
             risk_level = "L2"
             intent = "tool.shell_readonly"
             reasons.append("shell_readonly_l2")
-        elif _is_email and any(t in text for t in ["发邮件", "发送邮件", "send", "mail", "发一封"]):
+        elif _is_email and (any(t in text for t in ["发邮件", "发送邮件", "发一封"]) or _has_english_term(text, "send") or _has_english_term(text, "mail")):
             risk_level = "L3"
             needs_approval = True
             intent = "tool.email"
