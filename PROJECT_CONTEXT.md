@@ -1,6 +1,6 @@
 # Open Deep Research — Agent OS 项目全量上下文
 
-> 本文档供 AI 助手快速建立对该项目的完整理解。最后更新: 2026-06-09。
+> 本文档供 AI 助手快速建立对该项目的完整理解。最后更新: 2026-06-10。
 
 ---
 
@@ -51,7 +51,7 @@ open_deep_research/
 │   │   │   │
 │   │   │   ├── api/v1/              # 12 个 API 路由模块
 │   │   │   │   ├── router.py        # APIRouter 汇总
-│   │   │   │   ├── agent.py         # Agent运行 (SSE流式/非流式)
+│   │   │   │   ├── agent.py         # Agent运行 (SSE流式/非流式, 含审批恢复端点)
 │   │   │   │   ├── research.py      # 深度研究 (异步后台任务)
 │   │   │   │   ├── memory.py        # 记忆增删查改+固化
 │   │   │   │   ├── documents.py     # 文档上传+RAG搜索
@@ -65,10 +65,10 @@ open_deep_research/
 │   │   │   │   └── health.py        # 健康检查 /api/health
 │   │   │   │
 │   │   │   ├── services/            # ★ 业务逻辑层 (单例模式, 20+ services)
-│   │   │   │   ├── agent_service.py     # 【核心】Agent运行主流程 (含图片快速通道)
+│   │   │   │   ├── agent_service.py     # 【核心】Agent运行主流程 (含图片快速通道、审批暂停/恢复)
 │   │   │   │   ├── research_service.py  # 深度研究编排 (adapter/fallback)
-│   │   │   │   ├── memory_service.py    # 记忆提取+存储+检索 (三级回退)
-│   │   │   │   ├── rag_service.py       # RAG检索问答
+│   │   │   │   ├── memory_service.py    # 记忆提取+存储+检索 (三级回退, Jaccard去重)
+│   │   │   │   ├── rag_service.py       # RAG检索问答 (含轻量证据检索)
 │   │   │   │   ├── document_service.py  # 文档上传/解析/摄入
 │   │   │   │   ├── qwen_multimodal_service.py # 图片分析 (Qwen多模态)
 │   │   │   │   ├── feed_service.py      # Feed刷新/混排
@@ -87,21 +87,22 @@ open_deep_research/
 │   │   │   │   └── conversation_lock.py # 会话并发锁 (防止同一会话并发执行)
 │   │   │   │
 │   │   │   ├── agent/                # Agent运行时 (LangGraph多智能体)
-│   │   │   │   ├── state.py          # AgentState TypedDict (20字段)
+│   │   │   │   ├── state.py          # AgentState TypedDict (20+字段)
 │   │   │   │   ├── schemas.py        # AgentRunRequest Pydantic模型
 │   │   │   │   ├── graph.py          # 简单函数管道 (备用)
 │   │   │   │   ├── runtime/          # 【核心运行时】
 │   │   │   │   │   ├── __init__.py   # 导出AgentRuntime
-│   │   │   │   │   ├── graph.py      # ★ LangGraph图定义 (AgentRuntime._build_langgraph)
-│   │   │   │   │   ├── nodes.py      # ★ RuntimeNodes类 (15个节点方法)
-│   │   │   │   │   ├── router.py     # 条件路由 dispatch_next_route_node
+│   │   │   │   │   ├── graph.py      # ★ LangGraph图定义 (含 true interrupt: approval→END)
+│   │   │   │   │   ├── nodes.py      # ★ RuntimeNodes类 (15个节点方法, 含LLM意图/知识库关键词匹配)
+│   │   │   │   │   ├── router.py     # 条件路由 dispatch_next_route_node (支持 END sentinel)
 │   │   │   │   │   ├── planner.py    # 确定性关键字路由 plan_route() + 强制路由
-│   │   │   │   │   ├── state.py      # AgentRuntimeState TypedDict + AgentIntent枚举
+│   │   │   │   │   ├── state.py      # AgentRuntimeState TypedDict + AgentIntent枚举 (17种)
+│   │   │   │   │   ├── emitter.py    # ★ RuntimeEventEmitter — 统一SSE事件发射器 (273行)
 │   │   │   │   │   ├── events.py     # SSE事件类型 + display_channel定义
 │   │   │   │   │   ├── visible_thoughts.py # 用户可见思考进度
 │   │   │   │   │   ├── visibility.py # 可见性检查
-│   │   │   │   │   ├── intent_llm.py # ★ 基于LLM的意图识别 (当前开发焦点)
-│   │   │   │   │   ├── intent_schema.py  # 意图结构定义 (HomeIntentResult)
+│   │   │   │   │   ├── intent_llm.py # ★ 基于LLM的意图识别 (LLM+规则双引擎, 124行)
+│   │   │   │   │   ├── intent_schema.py  # 意图结构定义 (HomeIntentResult + LLMToolSelectionResult, 143行)
 │   │   │   │   │   ├── fallback.py   # 兜底逻辑 (无LangGraph时)
 │   │   │   │   │   ├── checkpoint.py # 事件记录
 │   │   │   │   │   ├── checkpointers.py # LangGraph checkpoint
@@ -131,7 +132,7 @@ open_deep_research/
 │   │   │   │   ├── base.py           # SQLAlchemy Base声明
 │   │   │   │   ├── session.py        # DB session工厂 (SessionLocal)
 │   │   │   │   ├── init_db.py        # 建表脚本
-│   │   │   │   └── repositories/     # 12+ Repository (数据访问层)
+│   │   │   │   └── repositories/     # 13+ Repository (数据访问层)
 │   │   │   │       ├── base_repository.py
 │   │   │   │       ├── agent_repository.py, approval_repository.py
 │   │   │   │       ├── artifact_repository.py, document_repository.py
@@ -140,13 +141,13 @@ open_deep_research/
 │   │   │   │       ├── profile_repository.py, research_repository.py
 │   │   │   │       ├── skill_repository.py, user_repository.py
 │   │   │   │
-│   │   │   ├── memory/               # 记忆子系统 (三层架构)
+│   │   │   ├── memory/               # 记忆子系统 (三层架构 + LLM提取)
 │   │   │   │   ├── base.py           # BaseMemoryStore抽象类
 │   │   │   │   ├── working.py        # 工作记忆 (Redis TTL=3600s)
 │   │   │   │   ├── episodic.py       # 情景记忆 (具体事件)
 │   │   │   │   ├── semantic.py       # 语义记忆 (长期偏好/知识)
 │   │   │   │   ├── perceptual.py     # 感知记忆 (原始感知数据)
-│   │   │   │   ├── extractor.py      # ★ 确定性记忆提取器 (纯正则规则, 无LLM)
+│   │   │   │   ├── extractor.py      # ★ 双重记忆提取器 — MemoryExtractor (正则) + LlmMemoryExtractor (LLM, 使用qwen3.6-max-preview)
 │   │   │   │   ├── consolidation.py  # 记忆固化 (importance阈值判断)
 │   │   │   │   └── qdrant_memory_store.py # Qdrant向量存储 (memory_vectors集合, 384维)
 │   │   │   │
@@ -167,17 +168,21 @@ open_deep_research/
 │   │   │   │   ├── vector_store.py   # QdrantVectorStore (Qdrant Cloud API)
 │   │   │   │   ├── embeddings.py     # 嵌入生成 (DashScope/SentenceTransformer, 384维)
 │   │   │   │   ├── chunker.py        # Markdown语义分块 (~500 tokens/chunk)
-│   │   │   │   └── document_parser.py # PDF/DOCX/TXT/CSV/XLSX/HTML解析
+│   │   │   │   ├── chunking.py       # 简单文本分块
+│   │   │   │   ├── document_parser.py # PDF/DOCX/TXT/MD/CSV/XLSX/HTML解析 (markitdown + fallback)
+│   │   │   │   ├── document_loader.py # 简单文本加载器
+│   │   │   │   ├── retriever.py      # 检索器存根
+│   │   │   │   └── qdrant_client.py  # Qdrant连接配置/健康检查
 │   │   │   │
 │   │   │   ├── mcp/                  # MCP工具系统
 │   │   │   │   ├── registry.py       # 工具注册中心
 │   │   │   │   ├── tool_executor.py  # 工具执行 (含审批检查)
-│   │   │   │   ├── tool_router.py    # 工具路由 (匹配工具→执行)
-│   │   │   │   ├── local_provider.py # 本地工具Provider
-│   │   │   │   ├── email_provider.py # ★ 邮件工具Provider (当前开发焦点)
-│   │   │   │   ├── local_file_tools.py # ★ 本地文件操作工具 (当前开发焦点)
+│   │   │   │   ├── tool_router.py    # ★ 工具路由 (LLM+关键词双引擎匹配, 292行+)
+│   │   │   │   ├── local_provider.py # ★ 本地工具Provider (本地文件+邮件+记忆+成果物, 119行+)
+│   │   │   │   ├── email_provider.py # ★ 邮件工具Provider (Mock + SMTP, 中英文别名)
+│   │   │   │   ├── local_file_tools.py # ★ 本地文件操作工具 (workspace沙箱, 敏感文件阻断, 198行+)
 │   │   │   │   ├── permissions.py    # 权限控制
-│   │   │   │   ├── schemas.py        # 数据结构
+│   │   │   │   ├── schemas.py        # 数据结构 (含工具注册schema)
 │   │   │   │   └── audit.py          # 审计日志
 │   │   │   │
 │   │   │   ├── context/              # 上下文系统 (GSSC)
@@ -191,9 +196,16 @@ open_deep_research/
 │   │   │   │   ├── fallback_researcher.py        # 兜底研究员
 │   │   │   │   ├── report_builder.py, evidence_builder.py, schemas.py
 │   │   │   │
-│   │   │   └── artifacts/            # 成果物
-│   │   │       ├── generators.py     # ArtifactGenerator
-│   │   │       └── storage.py        # 文件存储 (本地磁盘)
+│   │   │   ├── artifacts/            # 成果物
+│   │   │   │   ├── generators.py     # ArtifactGenerator
+│   │   │   │   └── storage.py        # 文件存储 (本地磁盘)
+│   │   │   │
+│   │   │   ├── schemas/              # 通用schema
+│   │   │   │   └── common.py         # 通用响应模型
+│   │   │   │
+│   │   │   └── tests/                # ★ 单元测试 (新增)
+│   │   │       ├── test_memory_system.py  # 记忆系统综合测试 (560行)
+│   │   │       └── db_test_utils.py       # 测试数据库工具
 │   │   │
 │   │   ├── security/
 │   │   │   └── auth.py               # LangGraph部署认证 (Supabase JWT)
@@ -202,14 +214,17 @@ open_deep_research/
 │   │       ├── graph.py              # Plan-and-execute + human-in-the-loop
 │   │       └── multi_agent.py        # Supervisor-researcher多Agent
 │   │
-│   ├── tests/                        # 评估框架 + 单元测试
+│   ├── tests/                        # 评估框架 + 集成测试
 │   │   ├── run_evaluate.py           # LangSmith评估主脚本
 │   │   ├── evaluators.py             # 6个评估器
 │   │   ├── prompts.py                # 评估提示词
 │   │   ├── pairwise_evaluation.py    # 配对比较评估
 │   │   ├── supervisor_parallel_evaluation.py  # 多线程并行评估
 │   │   ├── extract_langsmith_data.py # LangSmith数据导出
-│   │   ├── test_approval_workflow.py # ★ 审批工作流测试
+│   │   ├── test_approval_workflow.py # ★ 审批工作流集成测试 (1148行)
+│   │   ├── test_llm_tool_selection.py    # ★ LLM工具选择测试 (302行)
+│   │   ├── test_tool_input_validation.py # ★ 工具输入验证测试 (99行)
+│   │   ├── test_tool_name_normalization.py # ★ 工具名规范化测试 (73行)
 │   │   └── expt_results/             # 实验结果 (JSONL)
 │   │
 │   ├── examples/                     # 研究示例 (arxiv, pubmed, inference-market)
@@ -240,10 +255,12 @@ open_deep_research/
 │   │   │   │   ├── ArtifactsPage.tsx, SkillsPage.tsx, McpToolCallsPage.tsx
 │   │   │   │   ├── ApprovalsPage.tsx, LoginPage.tsx, ProfilePage.tsx
 │   │   │   │   └── SettingsPage.tsx
-│   │   │   └── components/
-│   │   │       ├── agent/  (AgentChatPanel, AgentThoughtStream, ApprovalCard)
-│   │   │       ├── common/ (MarkdownRenderer, JsonBlock, StatusPill, 等)
-│   │   │       └── layout/ (AppShell, Sidebar, Topbar)
+│   │   │   ├── components/
+│   │   │   │   ├── agent/  (AgentChatPanel, AgentThoughtStream, ApprovalCard)
+│   │   │   │   ├── common/ (MarkdownRenderer, JsonBlock, StatusPill, 等)
+│   │   │   │   └── layout/ (AppShell, Sidebar, Topbar)
+│   │   │   └── styles/
+│   │   │       └── global.css        # 全局样式 (219行+)
 │   │   └── package.json              # React 19, react-markdown, react-router-dom
 │   │
 │   ├── langgraph.json                # LangGraph部署配置 (入口: deep_researcher)
@@ -268,7 +285,13 @@ HTTP POST /api/v1/agent/runs/stream (SSE流式)
         ├── 3. 处理附件 (图片→多模态分析, 文档→RAG摄入)
         ├── 4. 判断是否直接图片问答 ★ (fast path, 跳过LangGraph)
         ├── 5. → AgentRuntime.run() 启动LangGraph多智能体图
+        │     └── [审批触发时] → 图中断(END sentinel) → 等待用户审批 → resume_from_approval()
         └── 6. 持久化结果 + 推送SSE events (agent_events表)
+
+审批恢复流程:
+HTTP POST /api/v1/agent/runs/{id}/resume
+  └── agent_service.resume_agent_run()
+        └── AgentRuntime.resume_from_approval(state) → 清理挂起状态 → 重新执行图
 ```
 
 ### 3.2 LangGraph 多智能体图结构
@@ -284,7 +307,7 @@ START
       ├── research_agent   (深度研究: 调用ResearchService)
       ├── rag_agent        (知识库检索问答: RAGService)
       ├── artifact_agent   (成果物生成保存)
-      ├── tool_agent       (MCP工具推断+调用, L3/L4需审批)
+      ├── tool_agent       (MCP工具推断+调用, L3/L4→触发审批→true interrupt→END)
       ├── memory_agent     (记忆提取+保存, 三层记忆)
       └── skill_agent      (Skill检测+自动创建草稿)
   → evaluator              (质量评估, 完整性检查)
@@ -292,30 +315,67 @@ START
   → END
 ```
 
-多路由支持: route_plan.route 是列表，agent按序执行，每个agent完成后router决定下一步(下一个agent/评估/最终回答)
+**True Interrupt 机制 (新增)**:
+- `tool_agent` 执行 L3/L4 操作时, 设置 `status=waiting_approval`
+- `dispatch_next_route_node` 检测到此状态, 直接返回 `__end__` 映射到 `END`
+- 图干净终止, 不经过 evaluator / final_response
+- `agent_service` 检测暂停状态, 发射 `approval_required` / `run_paused` 事件
+- 用户审批后, `resume_from_approval()` 清理挂起状态, 重新调用 `run(state)`
 
-### 3.3 14个运行时节点
+多路由支持: route_plan.route 是列表, agent按序执行, 每个agent完成后router决定下一步(下一个agent/评估/最终回答/中断)
+
+### 3.3 RuntimeEventEmitter (新增核心组件)
+
+文件: `src/web_app/agent/runtime/emitter.py` (273行)
+
+统一事件发射器,所有运行时节点使用同一个 emitter 实例,自动:
+- 递增 event_seq
+- 附加 run_id / conversation_id / message_id / created_at
+- 推送到 SSE 队列 (queue_stream_event)
+- 持久化到 agent_events 表 (record_event)
+
+**便捷方法**:
+
+| 方法 | display_channel | 事件类型 |
+|------|-----------------|---------|
+| `thought(text)` | thinking | visible_thought_delta |
+| `answer_delta(text)` | answer | answer_delta |
+| `answer_started()` | answer | answer_started |
+| `answer_completed(answer)` | answer | answer_completed |
+| `tool(event_type, payload)` | tool | tool_call_started/completed/failed |
+| `status(event_type, payload)` | status | 通用状态事件 |
+| `run_created(...)` | status | run_created |
+| `run_completed(answer)` | status | run_completed |
+| `run_failed(error)` | status | run_failed |
+| `run_paused(approval_id)` | status | run_paused |
+| `run_resumed()` | status | run_resumed |
+| `approval_required(...)` | status | approval_required (含前端就绪payload) |
+| `approval_granted(id)` | status | approval_granted |
+| `approval_rejected(id)` | status | approval_rejected |
+
+### 3.4 14个运行时节点
 
 | 节点 | 核心逻辑 |
 |------|---------|
 | **permission_guard** | 关键词检测风险等级(L0-L4), L3+触发审批, blocked→final_response |
-| **home_intent_react** | LLM意图分类 + 规则引擎兜底, 输出AgentIntent枚举 |
-| **planner** | `plan_route()`: 基于100+中英文关键词+强制路由+LLM意图+FeedCard, 输出RoutePlan |
+| **home_intent_react** | ★ LLM意图分类 (`intent_llm.infer_home_intent_with_llm`) + 规则引擎兜底, 输出AgentIntent枚举 (17种) |
+| **planner** | `plan_route()`: 基于100+中英文关键词+强制路由+LLM意图+FeedCard+知识库关键词匹配, 输出RoutePlan |
 | **context_builder** | GSSC四阶段: 收集→选择→结构化→压缩, 14种ContextPacket来源 |
 | **skill_matcher** | 检索已批准Skill, 向量+关键词匹配, score≥0.75自动触发 |
 | **research_agent** | 调用ResearchService, 搜索+分析+证据构建+Report+Skill草稿 |
 | **rag_agent** | RAG检索用户知识库, 提取证据 |
 | **artifact_agent** | 将research/rag结果保存为Markdown成果物 |
-| **tool_agent** | MCP工具名推断(ToolRouter)→工具执行(L3/L4需审批)→结果注入上下文 |
-| **memory_agent** | MemoryExtractor提取→去重→保存(working/episodic/semantic)→同步Qdrant |
+| **tool_agent** | ★ MCP工具名推断(ToolRouter: LLM+关键词双引擎)→工具执行(L3/L4→true interrupt→END)→结果注入上下文 |
+| **memory_agent** | MemoryExtractor + LlmMemoryExtractor提取→去重(Jaccard)→保存(working/episodic/semantic)→同步Qdrant |
 | **skill_agent** | 评估可复用性, 自动创建Skill草稿(status=draft) |
 | **skill_draft_detector** | 检测是否需要创建Skill草稿 |
 | **evaluator** | 评估执行结果完整性, 设置run最终状态 |
 | **final_response** | LLM流式生成用户可读回答, 防护内部JSON泄露, 推送SSE answer_delta |
 
-### 3.4 路由规划详细逻辑 (planner.py: plan_route())
+### 3.5 路由规划详细逻辑 (planner.py: plan_route())
 
-**12种意图类型**: `chat`, `research`, `feed_research`, `rag`, `artifact`, `tool`, `memory`, `skill`, `mixed`, `tool.email`, `tool.browser`, `tool.comment`, `tool.form_submit`
+**17种意图类型** (增补: `tool.local_file`, `tool.shell_readonly`, `tool.shell_write`, `tool.dangerous`):
+`chat`, `research`, `feed_research`, `rag`, `artifact`, `tool`, `memory`, `skill`, `mixed`, `tool.email`, `tool.local_file`, `tool.browser`, `tool.comment`, `tool.form_submit`, `tool.shell_readonly`, `tool.shell_write`, `tool.dangerous`
 
 **优先级体系**:
 1. forced_route (payload中显式指定) → 最高优先
@@ -323,8 +383,9 @@ START
 3. FeedCard附带 → `feed_research`
 4. 显式记忆写入关键词 ("记住"/"以后"/"别忘了") → `memory`, 覆盖 research/rag/artifact
 5. 对话回忆检测 ("之前"/"上次"/"说过") → `chat` (不回退到研究)
-6. 规则关键词匹配 (100+中英文关键词) → 按意图优先级排列
-7. 默认 → `chat`
+6. 知识库关键词匹配 (知识库/文档/资料) → `rag`
+7. 规则关键词匹配 (100+中英文关键词) → 按意图优先级排列
+8. 默认 → `chat`
 
 **风险等级**:
 | 等级 | 说明 | 示例 | 行为 |
@@ -332,8 +393,8 @@ START
 | L0 | 只读闲聊 | 对话, 解释 | 直接放行 |
 | L1 | 搜索 | 搜索, RAG | 直接放行 |
 | L2 | 生成 | 研究, 生成Artifact | 直接放行 |
-| L3 | 外部写入 | 发送邮件, 评论, 文件操作 | 需要审批 |
-| L4 | 破坏性 | 删除, 支付, 转账 | 需要审批 |
+| L3 | 外部写入 | 发送邮件, 评论, 文件操作 | 需要审批 → true interrupt |
+| L4 | 破坏性 | 删除, 支付, 转账 | 需要审批 → true interrupt |
 
 ---
 
@@ -371,18 +432,23 @@ START
 | **semantic** | PostgreSQL + Qdrant | 永久 | 长期偏好/知识 (用户设定, 项目目标, 技术栈, 兴趣) |
 | **perceptual** | - | - | 原始感知数据缓存 |
 
-### 5.2 记忆提取器 (MemoryExtractor)
+### 5.2 记忆提取器 — 双重引擎
 
-文件: `src/web_app/memory/extractor.py` — **无LLM, 纯正则规则引擎**
+文件: `src/web_app/memory/extractor.py`
 
-提取类型:
-- **working**: 当前页面, 选中的FeedCard ID
-- **episodic**: Skill匹配/创建, 研究行为, 用户反馈 (正面/负面)
-- **semantic**: 项目目标, 技术栈, 边界约束, 产品偏好, 信息兴趣
+**MemoryExtractor** (确定性, 纯正则规则):
+- working: 当前页面, 选中的FeedCard ID
+- episodic: Skill匹配/创建, 研究行为, 用户反馈 (正面/负面)
+- semantic: 项目目标, 技术栈, 边界约束, 产品偏好, 信息兴趣
 
-关键规则:
-- 对话性质的闲谈 (问候/感谢/道别) 只保留 importance≥0.80 的语义记忆, 且降权至 ≤0.50
-- 语义记忆写前去重: Jaccard相似度 ≥0.55 视为重复, 合并+更新importance
+**LlmMemoryExtractor** (LLM驱动, 使用 qwen3.6-max-preview):
+- 使用 Pydantic 结构化输出 (`MemoryExtractionResult`, `LongTermMemoryItem`)
+- LLM 失败时自动回退到 MemoryExtractor 正则规则
+- 中文提示词, 提取维度: project_goals, tech_stack, boundaries, preferences, feed_interests, feedback, skill_*, research_action, working_context
+
+**去重规则**:
+- 语义记忆写前检查: Jaccard相似度 ≥0.55 (字符+ngram双重) 视为重复, 合并+更新importance
+- 对话闲谈 (问候/感谢/道别) 只保留 importance≥0.80 的语义记忆, 降权至 ≤0.50
 
 ### 5.3 记忆固化 (consolidation.py)
 
@@ -396,7 +462,14 @@ START
 2. **PostgreSQL ILIKE** — 关键词模糊匹配 (fallback)
 3. **最近重要记忆** — importance≥0.7的semantic记忆, top 5 (final fallback)
 
-### 5.5 Qdrant 记忆存储
+### 5.5 记忆遗忘策略
+
+- `forget_memory()`: 按ID删除 (立即)
+- `forget_by_importance()`: 删除低于阈值的非受保护记忆
+- `forget_by_time()`: 删除超过 retention_days 的非受保护记忆
+- `forget_by_capacity()`: 超容量时按分数删除最不重要的记忆
+
+### 5.6 Qdrant 记忆存储
 
 - 集合: `memory_vectors` (可配置), 维度: 384, 距离: Cosine
 - 内容截断: 最多嵌入前4000字符
@@ -446,8 +519,8 @@ START
 
 ```
 上传文件 (PDF/DOCX/TXT/MD/CSV/XLSX/HTML, ≤20MB)
-  → parse_document (转Markdown)
-  → chunk_markdown (语义分块, ~500 tokens/chunk)
+  → parse_document (markitdown → fallback专用解析器)
+  → chunk_markdown (语义分块, ~500 tokens/chunk, 跟踪heading_path)
   → embed_texts (384维, DashScope text-embedding-v4)
   → QdrantVectorStore.upsert_chunks (集合: agent_os_documents)
   → 写入 document_chunks 表 (chunk_index, content, qdrant_point_id)
@@ -455,8 +528,9 @@ START
 
 ### 7.2 检索接口
 
-- `rag_service.search()`: 纯向量检索, user_id过滤
-- `rag_service.ask()`: 检索 + 提取式回答 (无LLM, 拼接前3条chunk内容)
+- `rag_service.search()`: 纯向量检索, user_id过滤, 可选document_ids范围
+- `rag_service.ask()`: 检索 + 提取式回答 (含ContextBuilder增强, 无证据时提取式fallback)
+- `rag_service.ask_document()`: 文档特定Q&A (overview chunks + vector search混合)
 - `rag_service.search_evidence()`: 轻量证据检索 (供context_builder注入GSSC)
 
 ### 7.3 Qdrant 文档存储
@@ -467,11 +541,54 @@ START
 
 ---
 
-## 8. 图片识别系统 (已完成)
+## 8. MCP 工具系统 (含新增本地文件 + 邮件)
+
+### 8.1 工具路由 (ToolRouter — LLM+关键词双引擎)
+
+文件: `src/web_app/mcp/tool_router.py` (292行+)
+
+1. **LLM 引擎** (`LLMToolSelectionResult`): 结构化输出, 同时选择多个工具
+2. **关键词回退**: `_simple_tool_name_match()` — 中英文关键词覆盖所有已注册工具
+3. **工具名规范化**: 40+ 别名映射 (send_email→email.send, 发邮件→email.send, etc.)
+4. **参数推断**: `_infer_arguments()` — LLM提取 + 正则fallback
+5. **缺失字段检测**: 工具参数不完整时返回 question 提示用户补充
+
+### 8.2 本地文件操作 (新增)
+
+文件: `src/web_app/mcp/local_file_tools.py` (198行+)
+
+**工具列表**:
+
+| 工具 | 风险 | 说明 |
+|------|------|------|
+| `local_file.read` | L1 | 读取文件内容, 限制 max_size_bytes |
+| `local_file.write` | L3 | 写入文件 (需审批) |
+| `local_file.append` | L3 | 追加到文件 (需审批) |
+| `local_file.list` | L1 | 列出目录内容 |
+| `local_file.delete` | L3/L4 | 删除文件 (高风险, 需审批) |
+
+**安全措施**:
+- 所有操作限制在 `LOCAL_TOOLS_WORKSPACE_DIR` 沙箱内
+- 敏感文件模式阻断 (.env, .git, id_rsa, *.pem, *.key, *secret*, *token*, *password*, *credential*, *.pfx 等)
+- 路径穿越检测 (`..` 和绝对路径)
+- 读写大小限制
+
+### 8.3 邮件工具 (新增)
+
+文件: `src/web_app/mcp/email_provider.py` (108行+)
+
+- **MockEmailProvider**: 仅写审计日志, 不实际发送 (默认)
+- **SMTPProvider**: 真实SMTP发送 (需配置 SMTP_HOST/PORT/USER/PASSWORD)
+- **中英文别名**: `email.send` ↔ `发送邮件`/`发邮件`/`send_email`/`sendEmail`/`寄邮件` 等15+种
+- **安全**: SMTP密码绝不记录到日志
+
+---
+
+## 9. 图片识别系统
 
 文件: `src/web_app/services/qwen_multimodal_service.py`
 
-### 8.1 触发条件
+### 9.1 触发条件
 
 在 `agent_service.run_agent_async()` 中最先检查。判断标准 (优先级):
 1. 附件中有 kind=image 的文件
@@ -479,7 +596,7 @@ START
 3. 短消息 (≤30字) + 有图片 → 自动视为图片问题
 4. 但同时有文档附件+用户提到文档关键词 → 走正常Agent流程
 
-### 8.2 执行路径
+### 9.2 执行路径
 
 如果是直接图片问题 → **快速通道 (跳过整个Agent Runtime)**:
 - 直接调用 `qwen_multimodal_service.answer_image_question()`
@@ -487,7 +604,7 @@ START
 
 如果非直接图片问题 → 正常Agent流程, 图片分析结果注入 attachment_context
 
-### 8.3 多模态配置
+### 9.3 多模态配置
 
 - 模型: `qwen_vision_model` (默认 qwen3.6-plus)
 - 限制: 单图 ≤10MB, 每次最多5张, 总base64 ≤40MB
@@ -495,11 +612,11 @@ START
 
 ---
 
-## 9. SSE 事件系统
+## 10. SSE 事件系统
 
-文件: `src/web_app/agent/runtime/events.py`
+文件: `src/web_app/agent/runtime/events.py` + `emitter.py`
 
-### 9.1 Channels
+### 10.1 Channels
 
 | display_channel | 事件 | UI区域 |
 |-----------------|------|--------|
@@ -508,7 +625,7 @@ START
 | **tool** | tool_call_started/delta/completed/failed | 工具面板 |
 | **status** | approval_*, run_* | 状态栏 |
 
-### 9.2 SSE 格式
+### 10.2 SSE 格式
 
 ```
 event: {event_type}
@@ -516,11 +633,18 @@ data: {json_string}
 
 ```
 
+### 10.3 统一发射器模式
+
+所有节点使用 `RuntimeEventEmitter` 单实例, 不再在每个节点中手写 `queue_stream_event` + `record_event`, 确保:
+- 事件序列号全局递增
+- 所有事件附带 run_id/conversation_id/message_id/created_at
+- DB持久化+SSE推送一步完成
+
 ---
 
-## 10. LLM 配置体系
+## 11. LLM 配置体系
 
-### 10.1 模型分层 (按 purpose)
+### 11.1 模型分层 (按 purpose)
 
 | Purpose | 默认模型 | 用途 |
 |---------|---------|------|
@@ -537,7 +661,7 @@ data: {json_string}
 | vision | qwen3.6-plus | 多模态图片理解 |
 | embedding | text-embedding-v4 | 文本嵌入 (384维) |
 
-### 10.2 Provider 架构
+### 11.2 Provider 架构
 
 - `aliyun` (默认): DashScope API → `https://dashscope.aliyuncs.com/compatible-mode/v1`
   - 通过 `langchain-openai` 的 `ChatOpenAI` 兼容接口调用
@@ -546,9 +670,9 @@ data: {json_string}
 
 ---
 
-## 11. 数据库架构 (PostgreSQL)
+## 12. 数据库架构 (PostgreSQL)
 
-### 11.1 核心表
+### 12.1 核心表
 
 | 表名 | 说明 | 关键字段 |
 |------|------|---------|
@@ -576,40 +700,44 @@ data: {json_string}
 
 ---
 
-## 12. 关键设计模式
+## 13. 关键设计模式
 
-### 12.1 Repository 模式
+### 13.1 Repository 模式
 所有数据库操作通过 `db/repositories/` 封装, BaseRepository提供通用CRUD
 
-### 12.2 Service 单例模式
+### 13.2 Service 单例模式
 业务逻辑Service在模块级别实例化: `xxx_service = XxxService()`
 
-### 12.3 多层降级策略 (Fallback Chain)
-- **意图识别**: LLM → 规则引擎 (100+关键词)
+### 13.3 多层降级策略 (Fallback Chain)
+- **意图识别**: LLM (`intent_llm.py`) → 规则引擎 (100+关键词)
 - **LangGraph加载**: 正常图 → fallback顺序节点执行
 - **记忆检索**: Qdrant语义搜索 → PostgreSQL ILIKE → 最近重要记忆
 - **研究执行**: 上游ODR Adapter → FallbackResearcher
 - **最终回答**: LLM流式生成 → 规则兜底文案
 - **Feed**: 7个真实源 → BucketSeed → ManualSeed
+- **记忆提取**: LlmMemoryExtractor (LLM) → MemoryExtractor (正则)
+- **工具选择**: ToolRouter LLM引擎 → 关键词匹配
 
-### 12.4 非阻塞设计
+### 13.4 非阻塞设计
 - RAG搜索失败不阻断Agent流水线
 - 记忆提取失败不阻断Agent Run
 - 图片分析失败返回友好错误信息
 - Feed刷新单个源超时/失败不影响其他源
 
-### 12.5 安全防护
+### 13.5 安全防护
 - 权限守卫节点在所有处理之前执行
-- L3/L4操作需要审批 (含完整审批工作流)
+- L3/L4操作需要审批 (含 true graph interrupt → 等待 → resume 完整流程)
 - final_response 防护内部JSON泄露
 - JWT认证 (python-jose) + bcrypt密码哈希
 - 会话并发锁 (conversation_lock.py)
+- 本地文件操作沙箱隔离 (workspace目录 + 敏感文件阻断 + 路径穿越检测)
+- SMTP密码不记录到日志
 
 ---
 
-## 13. 上游开源项目 (src/open_deep_research/) 架构
+## 14. 上游开源项目 (src/open_deep_research/) 架构
 
-### 13.1 主工作流
+### 14.1 主工作流
 
 ```
 START → clarify_with_user ──(need_clarification?)──→ END (返回问题)
@@ -626,7 +754,7 @@ START → clarify_with_user ──(need_clarification?)──→ END (返回问�
       final_report_generation (综合报告生成) → END
 ```
 
-### 13.2 Researcher 子图 (每个并行实例)
+### 14.2 Researcher 子图 (每个并行实例)
 
 ```
 START → researcher ⇄ researcher_tools → compress_research → END
@@ -636,23 +764,9 @@ START → researcher ⇄ researcher_tools → compress_research → END
 - **researcher_tools**: 并行执行所有tool_call, 支持Tavily/OpenAI/Anthropic/MCP
 - **compress_research**: 压缩研究成果, 去重+整理, 保留全部信息来源
 
-### 13.3 配置要点 (configuration.py)
+### 14.3 Agent OS 适配配置 (覆盖上游默认值)
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| search_api | tavily | 搜索API |
-| max_concurrent_research_units | 5 | 最大并行Researcher数 |
-| max_researcher_iterations | 6 | Supervisor最大反思轮次 |
-| max_react_tool_calls | 10 | 单个Researcher最大工具调用数 |
-| allow_clarification | True | 是否启用用户澄清环节 |
-| summarization_model | openai:gpt-4.1-mini | 网页摘要模型 |
-| research_model | openai:gpt-4.1 | 研究执行模型 |
-| compression_model | openai:gpt-4.1 | 研究压缩模型 |
-| final_report_model | openai:gpt-4.1 | 最终报告模型 |
-
-### 13.4 ODR 适配器设置 (Agent OS 覆盖)
-
-通过 Settings 中的 `odr_*` 前缀配置覆盖上游默认值:
+通过 Settings 中的 `odr_*` 前缀配置:
 - `odr_research_model`: `openai:qwen-plus`
 - `odr_allow_clarification`: `False`
 - `odr_max_concurrent_research_units`: `2`
@@ -662,13 +776,13 @@ START → researcher ⇄ researcher_tools → compress_research → END
 
 ---
 
-## 14. API 端点总览
+## 15. API 端点总览
 
 | 前缀 | 关键端点 |
 |------|---------|
-| /api/v1/agent | `POST /runs/stream` (SSE), CRUD conversations/messages |
+| /api/v1/agent | `POST /runs/stream` (SSE), `POST /runs/{id}/resume` (审批恢复), CRUD conversations/messages |
 | /api/v1/research | `POST /runs` (异步后台), `GET /runs/:id` |
-| /api/v1/documents | `POST /upload`, `POST /ingest`, `POST /rag/search`, `POST /rag/ask` |
+| /api/v1/documents | `POST /upload`, `POST /ingest`, `POST /rag/search`, `POST /rag/ask`, `POST /documents/:id/ask` |
 | /api/v1/memory | `POST /add`, `POST /search`, `POST /consolidate`, `POST /forget` |
 | /api/v1/artifacts | CRUD + download |
 | /api/v1/skills | CRUD + approve/disable |
@@ -681,10 +795,30 @@ START → researcher ⇄ researcher_tools → compress_research → END
 
 ---
 
-## 15. 提交历史 (完整)
+## 16. 测试覆盖
+
+### 16.1 集成测试 (tests/)
+| 文件 | 行数 | 覆盖范围 |
+|------|------|---------|
+| `test_approval_workflow.py` | 1148 | 完整审批工作流 (创建→暂停→审批→恢复→完成) |
+| `test_llm_tool_selection.py` | 302 | LLM工具选择引擎 |
+| `test_tool_input_validation.py` | 99 | 工具输入参数校验 |
+| `test_tool_name_normalization.py` | 73 | 工具名规范化 + 中英文别名映射 |
+
+### 16.2 单元测试 (src/web_app/tests/)
+| 文件 | 行数 | 覆盖范围 |
+|------|------|---------|
+| `test_memory_system.py` | 560 | 记忆系统综合测试 (CRUD, 搜索, 固化, 遗忘, 提取, LLM/正则双引擎, 去重) |
+
+---
+
+## 17. 提交历史 (完整, 截至 2026-06-10)
 
 ```
-4ed9500 ← HEAD (feature/bendicaozuo): 完成了邮件的发送，下一步LLM接入识别意图
+08f5874 ← HEAD (feature/bendicaozuo): 下一步rdrant
+422d7ec: 下一步，多智能体协作
+85aa336: 下一步LLM识别
+4ed9500: 完成了邮件的发送，下一步LLM接入识别意图
 24cebd9: 下一步修思考过程中的出现审阅bug
 31571e3: 完成了深度研究，下一步本地电脑操作
 2406e69: 完成了信息差卡片基本情况，下一步操作电脑
@@ -711,30 +845,37 @@ eff3b0b: 完成信息接入
 
 ---
 
-## 16. 当前状态总结
+## 18. 当前状态总结
 
 ### 已完成
-- 基础Agent框架 (LangGraph 14节点多智能体图)
+- 基础Agent框架 (LangGraph 14+节点多智能体图 + true interrupt审批)
+- RuntimeEventEmitter 统一事件发射器 (SSE推送+DB持久化一步完成)
+- LLM意图识别 (intent_llm.py, 17种意图类型, LLM+规则双引擎)
 - 会话管理 (多轮对话, agent_conversations/agent_chat_messages)
 - Feed系统 (7+1源聚合, 评分, 混排30/40/30, 信息差卡片)
-- 记忆系统 (三层架构 + Qdrant语义检索 + 确定性提取器 + 向量回填)
-- RAG系统 (文档上传/解析/分块/摄入/检索问答)
+- 记忆系统 (三层架构 + Qdrant语义检索 + 双重提取器 + 向量回填 + Jaccard去重)
+- RAG系统 (文档上传/解析/分块/摄入/检索问答/文档Q&A)
 - 图片识别 (Qwen多模态, 直接问答快速通道, 混合附件处理)
 - SSE流式输出 (4 channel: thinking/answer/tool/status)
 - Skill系统 (匹配/创建/审批/自动草稿)
-- MCP工具系统 (注册/执行/审批/审计, email_provider + local_file_tools)
-- 审批工作流 (完整ApprovalCard前端 + approval_service后端 + 测试)
+- MCP工具系统 (工具注册/LLM+关键词双引擎路由/审批/审计)
+- 邮件工具 (Mock + SMTP, 中英文别名)
+- 本地文件操作 (workspace沙箱, 敏感文件阻断, 路径穿越检测)
+- 审批工作流 (完整ApprovalCard前端 + true graph interrupt + resume + 测试)
 - LLM配置体系 (3 tier × 12 purpose, aliyun DashScope为主)
 - 多层降级策略 (LLM→规则, Qdrant→PostgreSQL→recent, 上游→fallback)
 - 深度研究 (上游ODR Adapter + ResearchService编排 + 前端ResearchRunDetailPage)
 - 前端Markdown渲染 (react-markdown + remark-gfm)
 - 会话并发锁 (conversation_lock.py)
-- 邮件发送 (email_provider, SMTP/Mock)
+- 前端ApprovalCard组件
+- 全局CSS样式
+- 测试覆盖 (5个测试文件, 共2182行)
 
 ### 当前开发焦点 (feature/bendicaozuo)
-1. **LLM意图识别完善** — home_intent_react 节点的 LLM 判断器，解析用户输入输出结构化意图
-2. **本地电脑操作** — local_file_tools (workspace目录读写), local_tools_enabled 配置
-3. **审阅/思考过程 bug 修复** — AgentThoughtStream 中的审阅展示问题
+1. **Qdrant完善** — 向量存储优化, 索引完善
+2. **多智能体协作** — Agent间协调机制
+3. **LLM识别完善** — home_intent_react 节点的 LLM 判断器, 结构化意图输出
+4. **本地电脑操作完善** — local_file_tools 功能增强
 
 ### 已知待优化
 - 思考过程中出现的审阅bug
@@ -751,7 +892,7 @@ eff3b0b: 完成信息接入
 
 ---
 
-## 17. 开发命令
+## 19. 开发命令
 
 ```bash
 # 环境准备
@@ -777,7 +918,7 @@ ruff check                                # linting (E, F, I, D, UP规则)
 mypy                                      # type checking
 
 # 测试
+pytest src/web_app/tests/                 # 单元测试 (记忆系统)
+pytest tests/                             # 集成测试 (审批/工具)
 python tests/run_evaluate.py              # LangSmith评估
-python tests/test_approval_workflow.py    # 审批工作流测试
-pytest                                    # 单元测试
 ```

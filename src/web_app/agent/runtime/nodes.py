@@ -307,6 +307,17 @@ class RuntimeNodes:
         except Exception:
             pass  # RAG failure must not block the pipeline
 
+        # ── Apply MEMORY_CONTEXT_POLICY: filter by answer_mode ──────
+        from src.web_app.context.builder import MEMORY_CONTEXT_POLICY as _MCP
+        answer_mode = (state.get("route_plan") or {}).get("answer_mode", "chat")
+        allowed_categories = _MCP.get(answer_mode, _MCP.get("chat", set()))
+        if allowed_categories and memories:
+            memories = [
+                m for m in memories
+                if (m.get("metadata") or {}).get("category", "") in allowed_categories
+                or (m.get("metadata") or {}).get("category", "") == ""  # uncategorized passes through
+            ]
+
         # ── Format memories as readable text blocks ─────────────────
         memory_text = self._format_memories_for_context(memories)
 
@@ -1215,6 +1226,13 @@ class RuntimeNodes:
             # ── Explicit memory write: user says "记住" / "帮我记" etc. ──
             if self._is_explicit_memory_write(user_input):
                 memory_content = self._extract_memory_from_user_input(user_input)
+                # Store candidates BEFORE writing
+                state["memory_candidates"] = [{
+                    "content": memory_content,
+                    "memory_type": "semantic",
+                    "importance": 0.9,
+                    "source": "explicit_user_request",
+                }]
                 mem = memory_service.add_memory(
                     user_id=state["user_id"],
                     content=memory_content,
@@ -1224,16 +1242,51 @@ class RuntimeNodes:
                               "raw_user_input": user_input, "explicit": True, "run_id": str(state["run_id"])},
                     db=self.db,
                 )
-                state.setdefault("memory_updates", []).append(mem)
-                state["memory_write_result"] = {
-                    "success": True,
-                    "content": memory_content,
-                    "memory_type": "semantic",
+                # ── Build structured MemorySaveResult ──
+                write_ok = mem.get("ok", False)
+                save_result = {
+                    "ok": write_ok,
                     "memory_id": mem.get("id"),
+                    "qdrant_point_id": mem.get("qdrant_point_id"),
+                    "memory_type": "semantic",
+                    "content": memory_content,
+                    "category": mem.get("category", ""),
+                    "status": "active",
+                    "qdrant_indexed": mem.get("qdrant_indexed", False),
+                    "error": mem.get("error"),
+                    "deduped": mem.get("deduped", False),
+                    "updated_existing": mem.get("updated_existing", False),
                 }
-                state["memory_result"] = {"saved_count": 1, "semantic": 1, "episodic": 0}
-                state["final_output"] = f"已记住：{memory_content}"
-                append_output(state, "memory_agent", state["memory_write_result"])
+                state.setdefault("memory_save_results", []).append(save_result)
+
+                # Only append to memory_updates if write actually succeeded
+                if write_ok:
+                    state.setdefault("memory_updates", []).append(mem)
+                    state["memory_write_result"] = {
+                        "success": True,
+                        "content": memory_content,
+                        "memory_type": "semantic",
+                        "memory_id": mem.get("id"),
+                        "qdrant_indexed": mem.get("qdrant_indexed", False),
+                    }
+                    state["memory_result"] = {"saved_count": 1, "semantic": 1, "episodic": 0}
+                    # ── ONLY set final_output if write CONFIRMED ok ──
+                    if mem.get("qdrant_indexed"):
+                        state["final_output"] = f"已记住：{memory_content}"
+                    else:
+                        state["final_output"] = f"已记录：{memory_content}（向量索引暂不可用，搜索可能受限）"
+                else:
+                    # Write failed — do NOT claim success
+                    append_error(state, "memory_agent",
+                                 f"Memory write failed: {mem.get('error', 'unknown')}")
+                    state["memory_write_result"] = {
+                        "success": False,
+                        "content": memory_content,
+                        "error": mem.get("error", "unknown"),
+                    }
+                    # Do NOT set final_output — let final_response handle it
+
+                append_output(state, "memory_agent", state.get("memory_write_result", {}))
                 record_step(self.db, state["run_id"], "memory_agent", "write_memory_explicit",
                             {"user_input": user_input},
                             {"memory_write_result": state["memory_write_result"]})
@@ -1241,9 +1294,9 @@ class RuntimeNodes:
                     state,
                     key="memory_agent",
                     node_name="memory_agent",
-                    detail=f"已明确写入 semantic 记忆 1 条",
+                    detail=f"已明确写入 semantic 记忆 1 条, ok={write_ok}",
                     model=resolve_model_name("memory", complexity="low").model,
-                    extra={"memory_writes": 1, "explicit": True},
+                    extra={"memory_writes": 1, "explicit": True, "ok": write_ok},
                 )
                 emit_visible_thought(self.db, state, "memory_agent")
                 mark_completed(state, "memory_agent")
@@ -1282,9 +1335,16 @@ class RuntimeNodes:
             saved = result.get("saved", {})
             all_saved = saved.get("working", []) + saved.get("episodic", []) + saved.get("semantic", [])
             state.setdefault("memory_updates", []).extend(all_saved)
-            state["memory_result"] = {"saved_count": len(all_saved),
-                                       "semantic": len(saved.get("semantic", [])),
-                                       "episodic": len(saved.get("episodic", []))}
+            # ── Populate memory_save_results from structured results ──
+            save_results = result.get("save_results", [])
+            state.setdefault("memory_save_results", []).extend(save_results)
+            state["memory_result"] = {
+                "saved_count": len(all_saved),
+                "semantic": len(saved.get("semantic", [])),
+                "episodic": len(saved.get("episodic", [])),
+                "ok_count": sum(1 for r in save_results if r.get("ok")),
+                "qdrant_indexed_count": sum(1 for r in save_results if r.get("qdrant_indexed")),
+            }
             append_output(state, "memory_agent", state["memory_result"])
             record_step(self.db, state["run_id"], "memory_agent", "write_memory", {},
                         {"memory_result": state["memory_result"]})
@@ -1292,7 +1352,7 @@ class RuntimeNodes:
                 state,
                 key="memory_agent",
                 node_name="memory_agent",
-                detail=f"写入记忆 {state['memory_result']['saved_count']} 条",
+                detail=f"写入记忆 {state['memory_result']['saved_count']} 条, ok={state['memory_result']['ok_count']}",
                 model=resolve_model_name("memory", complexity="low").model,
                 extra={"memory_writes": state["memory_result"]["saved_count"]},
             )
@@ -1410,6 +1470,15 @@ class RuntimeNodes:
         if used_streaming_llm:
             state["_answer_delta_emitted"] = True
             state["_answer_completed_emitted"] = True
+
+        # ── Memory-confirmation guard ──
+        # Only allow '已记住' when memory_save_results has ok=True entries.
+        # Never trust memory_candidates or LLM self-inference.
+        final_answer = self._sanitize_memory_claims(
+            final_answer,
+            state.get("memory_save_results", []),
+            state.get("memory_write_result") or {},
+        )
 
         state["final_answer"] = final_answer
         state["final_output"] = final_answer
@@ -1970,12 +2039,16 @@ class RuntimeNodes:
         user_input = str(state.get("user_input") or "").strip()
         route_plan = state.get("route_plan") or {}
         intent = route_plan.get("intent", "chat")
-        # ── Memory write: confirm the save ─────────────────────────
+        # ── Memory write: confirm the save ONLY if actually written ──
         mem_result = state.get("memory_write_result") or {}
-        if mem_result.get("success"):
+        save_results = state.get("memory_save_results", [])
+        has_ok = any(r.get("ok") for r in save_results)
+        if mem_result.get("success") and has_ok:
             content = mem_result.get("content", "")
             return f"已记住：{content}"
-        if intent == "memory" or self._is_explicit_memory_write(user_input):
+        if mem_result.get("success") is False:
+            return f"未能保存：{mem_result.get('error', '写入失败')}"
+        if (intent == "memory" or self._is_explicit_memory_write(user_input)) and has_ok:
             return f"已记住：{user_input}"
         if any(token in user_input for token in ("你好", "您好", "你是谁", "你是誰")) or user_input.lower() in {"hi", "hello", "hey"}:
             return "你好，我是你的信息差 Agent OS 助手。你可以让我分析首页信息差、做深度研究、生成报告或代码成果，也可以把反复使用的流程沉淀成长期记忆和 Skill。"
@@ -2010,6 +2083,7 @@ class RuntimeNodes:
             expected_output=route_plan.get("expected_output", "answer"),
             reason_summary=route_plan.get("reason", "default_chat_route"),
             suggested_route_hints=route_plan.get("route", []),
+            answer_mode=route_plan.get("answer_mode", "chat"),
             fallback_used=False,
             raw_intent_source="rule",
         )
@@ -2232,6 +2306,43 @@ class RuntimeNodes:
         if content.startswith("我"):
             content = "用户" + content[1:]
         return content
+
+    @staticmethod
+    def _sanitize_memory_claims(answer: str, save_results: list[dict[str, Any]],
+                                 memory_write_result: dict[str, Any]) -> str:
+        """Remove or correct false memory-save claims from the final answer.
+
+        Hard rule: '已记住' / '已记录' is ONLY allowed when at least one
+        entry in memory_save_results has ok=True.  Never trust memory_candidates
+        or LLM self-inference.
+        """
+        has_ok = any(r.get("ok") for r in save_results)
+        explicit_failed = memory_write_result.get("success") is False
+
+        if explicit_failed:
+            # Explicit memory write failed — strip false claims
+            import re as _re
+            answer = _re.sub(r'已记住[：:]\s*[^\n。.]+', '未能保存该信息，请稍后重试', answer)
+            answer = _re.sub(r'已记录[：:]\s*[^\n。.]+', '未能保存该信息，请稍后重试', answer)
+            answer = answer.replace("已记住", "未能保存")
+            answer = answer.replace("已记录", "未能保存")
+            answer = answer.replace("已保存", "未能保存")
+            return answer
+
+        if not has_ok and save_results:
+            # Candidates exist but none confirmed ok
+            return (
+                "我识别到这可能是长期记忆，但当前没有确认写入成功，"
+                "所以不能说已经记住。请检查记忆写入链路。"
+            )
+
+        if has_ok and not any(r.get("qdrant_indexed") for r in save_results if r.get("ok")):
+            # PG succeeded but Qdrant failed — append note to answer
+            if "已记住" in answer or "已记录" in answer:
+                if "向量索引暂不可用" not in answer and "搜索可能受限" not in answer:
+                    answer += "\n\n（注：向量索引暂不可用，语义搜索可能受限。）"
+
+        return answer
 
     def _draft_title(self, user_input: str) -> str:
         title = " ".join(str(user_input).strip().split())[:40]

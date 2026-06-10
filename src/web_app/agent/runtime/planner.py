@@ -105,6 +105,25 @@ _STRONG_MEMORY_WRITE_PREFIXES = [
     "从今",
 ]
 
+# ── Tech stack / self-intro declarations → memory_confirm ──────────
+# These are user statements ABOUT themselves/the project, not queries.
+# Must be checked BEFORE _RAG_TERMS to prevent "Qdrant"/"PostgreSQL"
+# from routing tech-stack declarations to RAG.
+_TECH_STACK_DECLARATION_PATTERNS = [
+    "这个项目用", "这个项目是", "项目技术栈", "项目用",
+    "技术栈是", "技术栈：", "用的技术栈",
+    "我的技术栈", "我的项目用", "我的项目是",
+    "默认用", "默认使用",
+    "我在用", "我用的", "我用的是",
+    "我叫", "叫我", "我的名字", "我是",
+]
+
+# Name / identity preference patterns — "我叫C", "以后叫我C"
+_NAME_PREFERENCE_PATTERNS = [
+    "我叫", "叫我", "我的名字", "我是", "称呼我",
+    "以后叫我", "称呼", "你可以叫我",
+]
+
 _SKILL_TERMS = [
     "复用", "下次复用", "工作流", "skill", "技能", "自动化流程",
     "沉淀", "做成模板", "标准化", "重复做", "自动化",
@@ -125,6 +144,34 @@ _CONVERSATION_RECALL_PATTERNS = [
 ]
 
 # ── Public entry point ──────────────────────────────────────────────
+
+
+def _infer_answer_mode(intent: str, user_input: str, *, is_memory_write: bool = False,
+                        is_tech_stack: bool = False, is_name_pref: bool = False) -> str:
+    """Derive answer_mode from intent + input patterns.
+
+    answer_mode controls:
+    - How final_response phrases the answer (memory_confirm → "已记住")
+    - Which memory categories ContextBuilder injects (MEMORY_CONTEXT_POLICY)
+    """
+    if is_memory_write or is_tech_stack or is_name_pref:
+        return "memory_confirm"
+    if intent in ("research", "feed_research"):
+        return "project_advice"
+    if intent == "rag" or str(intent).startswith("rag"):
+        return "rag_qa"
+    if str(intent).startswith("tool.") or intent == "tool":
+        return "tool_action"
+    if intent == "artifact":
+        return "project_advice"
+    if intent == "chat":
+        _casual_greetings = ("你好", "您好", "hi", "hello", "hey", "早", "晚安", "再见", "谢谢")
+        if any(user_input.strip().lower().startswith(g) for g in _casual_greetings):
+            return "casual"
+        return "chat"
+    if intent == "memory" or intent == "memory_confirm":
+        return "memory_confirm"
+    return "chat"
 
 
 def plan_route(
@@ -181,6 +228,12 @@ def plan_route(
         "我的项目", "我的技术栈", "我在用", "我用的",
     )
     _is_memory_like = any(user_input.strip().startswith(p) for p in _memory_prefixes)
+    # Tech stack declarations: "这个项目用X+Y+Z", "我的技术栈是..."
+    _is_tech_stack = any(
+        kw in text for kw in _TECH_STACK_DECLARATION_PATTERNS
+    ) and not any(t in text for t in ("发邮件", "发送邮件", "执行命令", "删除"))
+    # Name/identity preference: "我叫C", "以后叫我C"
+    _is_name_preference = any(kw in text for kw in _NAME_PREFERENCE_PATTERNS)
     _has_explicit_action = any(t in text for t in (
         "发邮件", "发送邮件", "创建文件", "写入文件", "删除文件",
         "执行命令", "运行命令", "发给", "发一封", "帮我创建",
@@ -188,6 +241,13 @@ def plan_route(
     if _is_memory_like and not _has_explicit_action:
         is_tool = False
         reasons.append("memory_like_suppress_tool")
+    # ── Tech stack / name declarations → memory, NOT rag/research ──
+    if (_is_tech_stack or _is_name_preference) and not _has_explicit_action and not forced:
+        is_rag = False
+        is_research = False
+        is_artifact = False
+        is_memory = True
+        reasons.append("declaration_to_memory")
 
     # Conversation recall: "what did I just ask?" — must NOT trigger research/rag
     import re as _re
@@ -398,6 +458,12 @@ def plan_route(
         "chat": "answer",
     }
 
+    answer_mode = _infer_answer_mode(
+        intent, user_input,
+        is_memory_write=is_memory_write,
+        is_tech_stack=_is_tech_stack,
+        is_name_pref=_is_name_preference,
+    )
     route_plan: RoutePlan = {
         "intent": intent,
         "route": route,
@@ -405,6 +471,7 @@ def plan_route(
         "needs_approval": needs_approval,
         "expected_output": expected_output_map.get(intent, "answer"),
         "reason": "; ".join(reasons) if reasons else "default_chat_route",
+        "answer_mode": answer_mode,
     }
     return route_plan
 

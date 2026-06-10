@@ -1,8 +1,8 @@
 from typing import Any, Literal, TypedDict
 
-AgentRoute = Literal["research", "rag", "artifact", "skill", "memory", "tool", "blocked", "approval", "chat", "feed_research", "mixed"]
+AgentRoute = Literal["research", "rag", "artifact", "skill", "memory", "memory_confirm", "tool", "blocked", "approval", "chat", "feed_research", "mixed"]
 
-AgentIntent = Literal["chat", "research", "rag", "artifact", "tool", "tool.email", "tool.local_file", "tool.browser", "tool.comment", "tool.form_submit", "tool.shell_readonly", "tool.shell_write", "tool.dangerous", "memory", "skill", "feed_research", "mixed"]
+AgentIntent = Literal["chat", "research", "rag", "artifact", "tool", "tool.email", "tool.local_file", "tool.browser", "tool.comment", "tool.form_submit", "tool.shell_readonly", "tool.shell_write", "tool.dangerous", "memory", "memory_confirm", "skill", "feed_research", "mixed"]
 
 RiskLevel = Literal["L0", "L1", "L2", "L3", "L4"]
 
@@ -14,6 +14,22 @@ class RoutePlan(TypedDict, total=False):
     needs_approval: bool
     expected_output: str
     reason: str
+    answer_mode: str  # memory_confirm / general_qa / project_advice / rag_qa / tool_action / casual / chat
+
+
+class MemorySaveResult(TypedDict, total=False):
+    """Per-item memory write status — truth source for '已记住' confirmation."""
+    ok: bool
+    memory_id: int | None
+    qdrant_point_id: str | None
+    memory_type: str
+    content: str
+    category: str | None
+    status: str
+    qdrant_indexed: bool
+    error: str | None
+    deduped: bool
+    updated_existing: bool
 
 
 class AgentRuntimeState(TypedDict, total=False):
@@ -35,6 +51,7 @@ class AgentRuntimeState(TypedDict, total=False):
     current_node: str
     completed_nodes: list[str]
     errors: list[dict[str, Any]]
+    answer_mode: str  # memory_confirm / general_qa / project_advice / rag_qa / tool_action / casual / chat
 
     # ── Permission ─────────────────────────────────────────────────
     route: AgentRoute  # legacy — kept for backward compat
@@ -58,6 +75,8 @@ class AgentRuntimeState(TypedDict, total=False):
     memory_result: dict[str, Any] | None
     skill_result: dict[str, Any] | None
     evaluation_result: dict[str, Any] | None
+    memory_candidates: list[dict[str, Any]]  # items the agent intended to save
+    memory_save_results: list[dict[str, Any]]  # structured per-item write status (MemorySaveResult-shaped)
 
     # ── Agent outputs (list form) ──────────────────────────────────
     agent_outputs: list[dict[str, Any]]

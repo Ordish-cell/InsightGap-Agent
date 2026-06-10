@@ -60,11 +60,14 @@ class MemoryService:
                 source_type=source_type,
                 metadata_json=metadata or {},
             )
+            qdrant_point_id = None
+            qdrant_indexed = False
+            qdrant_error = None
             # ── Fire-and-forget Qdrant upsert ─────────────────────────
             store = self._get_qdrant_store()
             if store is not None:
                 try:
-                    point_id = store.upsert_memory(
+                    qdrant_point_id = store.upsert_memory(
                         memory_id=item.id,
                         user_id=user_id,
                         content=content,
@@ -73,11 +76,12 @@ class MemoryService:
                         source_type=source_type,
                         metadata=metadata,
                     )
+                    qdrant_indexed = True
                     # Mark as indexed in PG metadata (best-effort)
                     try:
                         MemoryRepository(db).update(
                             item,
-                            qdrant_point_id=point_id,
+                            qdrant_point_id=qdrant_point_id,
                             metadata_json={
                                 **(item.metadata_json or {}),
                                 "qdrant_indexed": True,
@@ -85,9 +89,21 @@ class MemoryService:
                         )
                     except Exception:
                         pass  # metadata update is non-critical
-                except Exception:
+                except Exception as exc:
+                    qdrant_error = str(exc)[:200]
                     logger.warning("memory.qdrant_upsert_failed", exc_info=True)
-            return self._to_dict(item)
+            result = self._to_dict(item)
+            result.update({
+                "ok": True,
+                "qdrant_point_id": qdrant_point_id,
+                "qdrant_indexed": qdrant_indexed,
+                "deduped": False,
+                "updated_existing": False,
+                "error": qdrant_error,
+                "category": (metadata or {}).get("category", ""),
+                "status": (metadata or {}).get("status", "active"),
+            })
+            return result
         item = {
             "id": len(self._items) + 1,
             "user_id": user_id,
@@ -95,6 +111,14 @@ class MemoryService:
             "memory_type": memory_type,
             "importance": importance,
             "metadata": metadata or {},
+            "ok": True,
+            "qdrant_point_id": None,
+            "qdrant_indexed": False,
+            "deduped": False,
+            "updated_existing": False,
+            "error": None,
+            "category": (metadata or {}).get("category", ""),
+            "status": (metadata or {}).get("status", "active"),
         }
         self._items.append(item)
         return item
@@ -170,12 +194,27 @@ class MemoryService:
             importance=updated_importance,
             metadata_json=updated_meta,
         )
+        qdrant_indexed = False
+        qdrant_error = None
         store = self._get_qdrant_store()
         if store is not None and existing.qdrant_point_id:
             try:
                 store.upsert_memory(memory_id=existing.id, user_id=existing.user_id, content=existing.content, memory_type=existing.memory_type, importance=updated_importance, source_type=existing.source_type or "", metadata=updated_meta, point_id=existing.qdrant_point_id)
-            except Exception: pass
-        return self._to_dict(existing)
+                qdrant_indexed = True
+            except Exception as exc:
+                qdrant_error = str(exc)[:200]
+        result = self._to_dict(existing)
+        result.update({
+            "ok": True,
+            "qdrant_point_id": existing.qdrant_point_id,
+            "qdrant_indexed": qdrant_indexed,
+            "deduped": True,
+            "updated_existing": True,
+            "error": qdrant_error,
+            "category": updated_meta.get("category", ""),
+            "status": updated_meta.get("status", "active"),
+        })
+        return result
 
     def search_memory(
         self,
@@ -488,6 +527,7 @@ class MemoryService:
 
     def _save_extracted(self, user_id, extraction, db, run_id) -> dict:
         saved = {"working": [], "episodic": [], "semantic": []}
+        save_results: list[dict[str, Any]] = []
         filtered_out = {"episodic": 0, "semantic": 0}
         now_ts = datetime.now(UTC).isoformat()
 
@@ -499,6 +539,7 @@ class MemoryService:
                           "visible_in_long_term_memory": False, "stability": "temporary",
                           "status": "active", "confidence": mem.get("confidence", 0.95)}, db=db)
             saved["working"].append(result)
+            save_results.append(result)
 
         # episodic: importance>=0.65 AND confidence>=0.65
         for mem in extraction.get("episodic_memories", []):
@@ -511,7 +552,9 @@ class MemoryService:
                 metadata={"category": mem.get("category", ""), "source": mem.get("source", ""),
                           "visible_in_long_term_memory": True, "stability": mem.get("stability", "medium_term"),
                           "status": "active", "evidence_count": 1, "last_seen_at": now_ts, "confidence": confidence}, db=db)
-            if result: saved["episodic"].append(result)
+            if result:
+                saved["episodic"].append(result)
+                save_results.append(result)
 
         # semantic: importance>=0.70 AND confidence>=0.65
         for mem in extraction.get("semantic_memories", []):
@@ -524,7 +567,9 @@ class MemoryService:
                 metadata={"category": mem.get("category", ""), "source": mem.get("source", "home_chat"),
                           "visible_in_long_term_memory": True, "stability": mem.get("stability", "long_term"),
                           "status": "active", "evidence_count": 1, "last_seen_at": now_ts, "confidence": confidence}, db=db)
-            if result: saved["semantic"].append(result)
+            if result:
+                saved["semantic"].append(result)
+                save_results.append(result)
 
         # Auto consolidate + reflect triggers
         if db:
@@ -553,10 +598,11 @@ class MemoryService:
                 logger.warning("memory.auto_reflect_failed", exc_info=True)
 
         total_saved = len(saved["working"]) + len(saved["episodic"]) + len(saved["semantic"])
-        logger.info("memory.extract_and_save: run_id=%s working=%d episodic=%d semantic=%d filtered_episodic=%d filtered_semantic=%d",
+        qdrant_indexed_count = sum(1 for r in save_results if r.get("qdrant_indexed"))
+        logger.info("memory.extract_and_save: run_id=%s working=%d episodic=%d semantic=%d filtered_episodic=%d filtered_semantic=%d qdrant_indexed=%d",
                     run_id, len(saved["working"]), len(saved["episodic"]), len(saved["semantic"]),
-                    filtered_out["episodic"], filtered_out["semantic"])
-        return {"extraction": extraction, "saved": saved, "filtered_out": filtered_out, "total_saved": total_saved}
+                    filtered_out["episodic"], filtered_out["semantic"], qdrant_indexed_count)
+        return {"extraction": extraction, "saved": saved, "save_results": save_results, "filtered_out": filtered_out, "total_saved": total_saved, "qdrant_indexed_count": qdrant_indexed_count}
 
     def _to_dict(self, item) -> dict[str, Any]:
         return {

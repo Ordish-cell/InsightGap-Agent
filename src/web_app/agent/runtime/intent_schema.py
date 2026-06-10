@@ -84,6 +84,7 @@ class HomeIntentResult(BaseModel):
     reason_summary: str = ""
     suggested_route_hints: list[str] = Field(default_factory=list)
     tool_action_type: str | None = None
+    answer_mode: str = "chat"  # memory_confirm / general_qa / project_advice / rag_qa / tool_action / casual / chat
     model_used: str | None = None
     fallback_used: bool = False
     raw_intent_source: Literal["llm", "rule", "fallback"] = "rule"
@@ -117,6 +118,7 @@ class HomeIntentResult(BaseModel):
         data["detected_intent"] = data["intent"]
         data["required_capabilities"] = [agent.replace("_agent", "") for agent in self.required_agents if agent.endswith("_agent")]
         data["reasoning_summary"] = data["reason_summary"]
+        data["answer_mode"] = data.get("answer_mode", "chat")
         return data
 
 

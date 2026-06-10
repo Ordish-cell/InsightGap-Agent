@@ -82,6 +82,29 @@ _ROUTE_WEIGHTS: dict[str, dict[str, float]] = {
     },
 }
 
+# ── Memory context policy ────────────────────────────────────────────
+# Controls which memory *categories* are injected into context per answer_mode.
+# This prevents irrelevant memories (e.g. tech_stack) from polluting casual chat.
+# Key constraint: general_qa must NOT inject project_goal/tech_stack/boundary/workflow_pattern
+#                 memory_confirm allows name/tone but NOT tech_stack/project_goal
+MEMORY_CONTEXT_POLICY: dict[str, set[str]] = {
+    "memory_confirm": {"name_preference", "language_preference", "tone_preference"},
+    "casual": {"name_preference", "language_preference", "tone_preference"},
+    "general_qa": {"name_preference", "language_preference", "answer_preference", "tone_preference"},
+    "rag_qa": {"name_preference", "language_preference", "answer_preference", "document_preference"},
+    "tool_action": {"name_preference", "language_preference", "tool_preference", "boundary"},
+    "project_advice": {
+        "name_preference", "language_preference", "answer_preference",
+        "project_goal", "tech_stack", "boundary", "workflow_pattern",
+        "preference", "negative_preference",
+    },
+    "chat": {
+        "name_preference", "language_preference", "answer_preference",
+        "tone_preference", "project_goal", "tech_stack", "boundary",
+        "workflow_pattern", "feed_interest", "research_preference",
+    },
+}
+
 
 class ContextBuilder:
     def __init__(self, config: ContextConfig | None = None, route: str = "chat"):

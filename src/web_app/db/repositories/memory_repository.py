@@ -63,6 +63,9 @@ class MemoryRepository(BaseRepository[Memory]):
 
     def list_long_term(self, user_id, memory_type=None, category=None, status=None, query=None, page=1, page_size=20) -> tuple:
         """Paginated long-term memories (semantic+episodic, visible, not superseded by default)."""
+        # Defensive int cast — query params may arrive as strings
+        page = max(1, int(page) if page else 1)
+        page_size = max(1, min(100, int(page_size) if page_size else 20))
         types = ["semantic", "episodic"]
         stmt = select(Memory).where(Memory.user_id == user_id, Memory.memory_type.in_(types)).order_by(Memory.updated_at.desc(), Memory.importance.desc())
         if memory_type and memory_type in types: stmt = stmt.where(Memory.memory_type == memory_type)
@@ -81,7 +84,7 @@ class MemoryRepository(BaseRepository[Memory]):
             if category and meta.get("category") != category: continue
             filtered.append(m)
         total = len(filtered)
-        offset = (max(1, page) - 1) * page_size
+        offset = (page - 1) * page_size
         return filtered[offset:offset + page_size], total
 
     def list_for_vector_backfill(

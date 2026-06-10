@@ -131,9 +131,9 @@ def _enrich_long_term_memory(m) -> dict:
     return d
 
 @router.get("/long-term")
-def list_long_term_memories(user_id=Depends(get_current_user_id), db=Depends(get_db), memory_type=Query(None, alias="type"), category=Query(None), status=Query(None), query=Query(None), page=Query(1, ge=1), page_size=Query(20, ge=1, le=100)):
+def list_long_term_memories(user_id=Depends(get_current_user_id), db=Depends(get_db), memory_type=Query(None, alias="type"), category=Query(None), status=Query(None), query=Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
     repo = MemoryRepository(db)
-    items, total = repo.list_long_term(user_id, memory_type=memory_type, category=category, status=status, query=query, page=page, page_size=page_size)
+    items, total = repo.list_long_term(user_id, memory_type=memory_type, category=category, status=status, query=query, page=int(page), page_size=int(page_size))
     return ok({"items": [_enrich_long_term_memory(m) for m in items], "total": total, "page": page, "page_size": page_size})
 
 @router.post("/long-term/search")
