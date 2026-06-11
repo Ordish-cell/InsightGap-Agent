@@ -2117,30 +2117,24 @@ def _state_for_storage(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def _cleanup_qdrant(db: Session, user_id: int, doc_ids: set[int]) -> None:
-    """Clean up Qdrant vectors after conversation deletion (best-effort)."""
+    """Clean up document vectors after conversation deletion (best-effort).
+
+    Conversation deletion owns only temporary/chat-upload document vectors.
+    Memory vectors live in the memory collection and are cleaned only by
+    memory delete/forget/retention paths.
+    """
     import logging
     _log = logging.getLogger(__name__)
     if doc_ids:
         try:
             store = QdrantVectorStore()
             for did in doc_ids:
-                store.delete_document(user_id, did)
-        except Exception:
-            pass
-    try:
-        from src.web_app.memory.qdrant_memory_store import QdrantMemoryStore
-        from src.web_app.core.config import settings
-        if settings.qdrant_url:
-            mem_store = QdrantMemoryStore()
-            mem_store.ensure_collection()
-            indexed = mem_store.list_indexed_memory_ids(user_id=user_id, memory_types=["working"])
-            for mid in indexed:
                 try:
-                    mem_store.delete_by_memory_id(mid)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                    store.delete_document(user_id, did)
+                except Exception as exc:
+                    _log.warning("conversation.document_vector_cleanup_failed user_id=%s document_id=%s error=%s", user_id, did, exc, exc_info=True)
+        except Exception as exc:
+            _log.warning("conversation.document_vector_store_unavailable user_id=%s doc_count=%s error=%s", user_id, len(doc_ids), exc, exc_info=True)
 
 
 def _build_approval_sse_payload(state: dict[str, Any], run_id: int) -> dict[str, Any]:

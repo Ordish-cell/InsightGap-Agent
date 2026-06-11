@@ -170,15 +170,11 @@ def update_memory(memory_id: int, payload: dict, user_id=Depends(get_current_use
 
 @router.delete("/{memory_id}")
 def delete_memory(memory_id: int, user_id=Depends(get_current_user_id), db=Depends(get_db)):
-    import logging as _log
     repo = MemoryRepository(db)
     item = repo.get_by_id(memory_id)
     if not item or item.user_id != user_id: return fail("not_found", f"Memory {memory_id} not found")
-    try:
-        QdrantMemoryStore().delete_by_memory_id(memory_id)
-    except Exception: _log.warning("qdrant_delete_failed", exc_info=True)
-    db.delete(item); db.commit()
-    return ok({"deleted": True, "memory_id": memory_id})
+    result = memory_service.forget_memory(user_id, memory_id, db)
+    return ok({"deleted": bool(result.get("deleted")), "memory_id": memory_id, **({"vector_cleanup_warning": result["vector_cleanup_warning"]} if result.get("vector_cleanup_warning") else {})})
 
 @router.post("/{memory_id}/archive")
 def archive_memory(memory_id: int, user_id=Depends(get_current_user_id), db=Depends(get_db)):

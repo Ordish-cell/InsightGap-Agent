@@ -16,13 +16,25 @@ def parse_document(path: str | Path, original_filename: str | None = None, mime_
     if ext not in ALLOWED_EXTENSIONS:
         raise ValueError(f"Unsupported document type: {ext}")
 
+    fallback_reason = ""
     try:
         parsed = _parse_markitdown(file_path)
         if parsed["text"].strip():
             parsed["metadata"].update(_base_metadata(file_path, "markitdown", original_filename, mime_type))
+            if ext == ".pdf":
+                try:
+                    _, pdf_metadata = _parse_pdf(file_path, dict(parsed["metadata"]))
+                    parsed["metadata"].update({
+                        "page_count": pdf_metadata.get("page_count", 0),
+                        "pages": pdf_metadata.get("pages", []),
+                        "page_parser": pdf_metadata.get("parser", ""),
+                    })
+                except Exception:
+                    pass
+            parsed["metadata"].update({"used_fallback": False, "fallback_reason": ""})
             return parsed
-    except Exception:
-        pass
+    except Exception as exc:
+        fallback_reason = f"{type(exc).__name__}: {exc}"
 
     parser = "text"
     metadata = _base_metadata(file_path, parser, original_filename, mime_type)
@@ -39,7 +51,7 @@ def parse_document(path: str | Path, original_filename: str | None = None, mime_
         text, metadata = _parse_xlsx(file_path, metadata)
         markdown = text
     elif ext == ".csv":
-        text = _parse_csv(file_path)
+        text, metadata = _parse_csv(file_path, metadata)
         markdown = text
     elif ext == ".json":
         text = json.dumps(json.loads(_read_text(file_path)), ensure_ascii=False, indent=2)
@@ -50,7 +62,9 @@ def parse_document(path: str | Path, original_filename: str | None = None, mime_
         markdown = text
     else:
         raise ValueError(f"Unsupported document type: {ext}")
-    metadata["parser"] = parser
+    metadata.setdefault("parser", parser)
+    metadata["used_fallback"] = bool(fallback_reason)
+    metadata["fallback_reason"] = fallback_reason
     return {"text": text, "markdown": markdown, "metadata": metadata}
 
 
@@ -81,7 +95,12 @@ def _parse_pdf(file_path: Path, metadata: dict[str, Any]) -> tuple[str, dict[str
     doc = fitz.open(str(file_path))
     metadata["parser"] = "pymupdf"
     metadata["page_count"] = doc.page_count
-    text = "\n\n".join(page.get_text("text") for page in doc)
+    pages = []
+    for index, page in enumerate(doc, 1):
+        page_text = page.get_text("text")
+        pages.append({"page_number": index, "text": page_text})
+    metadata["pages"] = pages
+    text = "\n\n".join(page["text"] for page in pages)
     doc.close()
     return text, metadata
 
@@ -99,7 +118,22 @@ def _parse_docx(file_path: Path) -> str:
         ) from exc
     try:
         doc = Document(str(file_path))
-        return "\n".join(paragraph.text for paragraph in doc.paragraphs)
+        lines: list[str] = []
+        for paragraph in doc.paragraphs:
+            text = paragraph.text.strip()
+            if not text:
+                continue
+            style_name = getattr(paragraph.style, "name", "") or ""
+            if style_name.lower().startswith("heading"):
+                lines.append(f"# {text}")
+            else:
+                lines.append(text)
+        for table in doc.tables:
+            for row in table.rows:
+                values = [cell.text.strip().replace("\n", " ") for cell in row.cells]
+                if any(values):
+                    lines.append("\t".join(values))
+        return "\n".join(lines)
     except Exception as exc:
         raise RuntimeError(f"Failed to parse DOCX file: {exc}") from exc
 
@@ -129,7 +163,10 @@ def _parse_xlsx(file_path: Path, metadata: dict[str, Any]) -> tuple[str, dict[st
     return "\n".join(lines), metadata
 
 
-def _parse_csv(file_path: Path) -> str:
+def _parse_csv(file_path: Path, metadata: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     with file_path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
         rows = list(csv.reader(handle))
-    return "\n".join("\t".join(row) for row in rows)
+    metadata["parser"] = "csv"
+    metadata["row_count"] = max(0, len(rows) - 1)
+    metadata["column_count"] = len(rows[0]) if rows else 0
+    return "\n".join("\t".join(row) for row in rows), metadata

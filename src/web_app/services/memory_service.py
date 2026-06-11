@@ -41,6 +41,21 @@ class MemoryService:
             logger.warning("memory.qdrant_init_failed", exc_info=True)
             return None
 
+    def _delete_memory_vector(self, memory_id: int | str) -> str | None:
+        """Delete only a memory vector from the memory collection."""
+        store = self._get_qdrant_store()
+        if store is None:
+            warning = "Qdrant memory store is not configured or unavailable"
+            logger.warning("memory.vector_cleanup_skipped memory_id=%s reason=%s", memory_id, warning)
+            return warning
+        try:
+            store.delete_by_memory_id(memory_id)
+            return None
+        except Exception as exc:
+            warning = f"Memory vector cleanup failed: {exc}"
+            logger.warning("memory.vector_cleanup_failed memory_id=%s error=%s", memory_id, exc, exc_info=True)
+            return warning
+
     def add_memory(
         self,
         user_id: int,
@@ -401,9 +416,13 @@ class MemoryService:
             if memory_id:
                 item = repo.get_by_id(memory_id)
                 if item and item.user_id == user_id:
+                    warning = self._delete_memory_vector(item.id)
                     db.delete(item)
                     db.commit()
-                    return {"deleted": 1}
+                    result = {"deleted": 1}
+                    if warning:
+                        result["vector_cleanup_warning"] = warning
+                    return result
             return {"deleted": 0}
         before = len(self._items)
         self._items = [item for item in self._items if not (item["user_id"] == user_id and (memory_id is None or item["id"] == memory_id))]
@@ -426,6 +445,7 @@ class MemoryService:
         current_meta["archived_at"] = now_ts
         current_meta["archive_reason"] = reason
         repo.update(memory, metadata_json=current_meta)
+        self._delete_memory_vector(memory.id)
         return self._to_dict(memory)
 
     def forget_by_importance(self, user_id: int, threshold: float = 0.2, memory_type: str | None = None, db: Session | None = None) -> dict[str, Any]:

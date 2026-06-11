@@ -20,6 +20,16 @@ class Settings(BaseSettings):
     qdrant_vector_size: int = 384
     qdrant_distance: str = "cosine"
     qdrant_timeout: int = 30
+    rag_hybrid_backend: str = "python_bm25"
+    qdrant_dense_vector_name: str = "dense"
+    qdrant_sparse_vector_name: str = "bm25"
+    qdrant_fusion_method: str = "rrf"
+    qdrant_hybrid_fallback: bool = True
+    qdrant_hybrid_collection: str = "agent_os_documents_v3"
+    qdrant_sparse_encoder: str = "qdrant_cloud_bm25"
+    qdrant_sparse_model: str = "Qdrant/bm25"
+    qdrant_cloud_inference: bool = True
+    qdrant_sparse_hash_size: int = 2_000_003
     memory_qdrant_collection: str = "memory_vectors"
     neo4j_uri: str = ""
     neo4j_username: str = ""
@@ -33,6 +43,7 @@ class Settings(BaseSettings):
     embed_model_name: str = "text-embedding-v4"
     embed_api_key: str = ""
     embed_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    dashscope_embedding_batch_size: int = 10
     default_llm_provider: str = "openai"
     default_llm_model: str = ""
     embedding_provider: str = "openai"

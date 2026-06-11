@@ -1,0 +1,15 @@
+[
+  {"query": "总结这个文档", "keywords": ["Agent", "Contract", "product_model", "混合检索"]},
+  {"query": "这个文档主要讲什么", "keywords": ["Agent", "Contract", "混合检索"]},
+  {"query": "合同编号是多少", "keywords": ["HT-2026-001"]},
+  {"query": "金额是多少", "keywords": ["128,000"]},
+  {"query": "邮箱是多少", "keywords": ["contract-eval@example.com"]},
+  {"query": "这个表格有哪些字段", "keywords": ["product_model", "price", "quantity", "owner", "status"]},
+  {"query": "产品型号 M-2026-Pro 的价格是多少", "keywords": ["M-2026-Pro", "9999"]},
+  {"query": "函数名在哪里", "keywords": ["validate_hybrid_backend", "fallback_to_python_bm25"]},
+  {"query": "配置 key 是什么", "keywords": ["RAG_HYBRID_BACKEND", "QDRANT_HYBRID_COLLECTION"]},
+  {"query": "API endpoint 是什么", "keywords": ["/api/v1/rag/search", "/api/v1/rag/ask"]},
+  {"query": "这个方案有什么风险", "keywords": ["stale sparse vectors", "incomplete reingestion", "风险"]},
+  {"query": "退款条款是什么", "keywords": ["Refund Terms", "30 days", "undelivered portion"]},
+  {"query": "中文文档里的关键风险是什么", "keywords": ["稀疏向量", "回退", "重新摄入"]}
+]

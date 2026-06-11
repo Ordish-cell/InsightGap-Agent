@@ -39,6 +39,7 @@ class QdrantMemoryStore:
                 timeout=settings.qdrant_timeout,
             )
         self.collection = settings.memory_qdrant_collection
+        self._collection_ensured = False
 
     # ── helpers ────────────────────────────────────────────────────────
 
@@ -78,6 +79,8 @@ class QdrantMemoryStore:
     # ── public API ─────────────────────────────────────────────────────
 
     def ensure_collection(self) -> None:
+        if self._collection_ensured:
+            return
         names = [item.name for item in self._client.get_collections().collections]
         if self.collection not in names:
             dist = Distance.COSINE if settings.qdrant_distance.lower() == "cosine" else Distance.COSINE
@@ -95,6 +98,7 @@ class QdrantMemoryStore:
                 )
             except Exception:
                 pass  # index may already exist
+        self._collection_ensured = True
 
     def upsert_memory(
         self,

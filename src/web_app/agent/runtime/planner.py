@@ -105,6 +105,22 @@ _STRONG_MEMORY_WRITE_PREFIXES = [
     "从今",
 ]
 
+# ── Explicit research request patterns ──────────────────────────────
+# These override the memory/tech-stack guard and force is_research=True.
+# Only trigger the full ODR pipeline when the user ASKS for deep research.
+
+_RESEARCH_REQUEST_PATTERNS = [
+    "帮我调研", "帮我研究", "做个研究", "做研究",
+    "深度研究", "深度调研", "深度分析",
+    "调研", "研究报告", "研究报告",
+    "联网搜索", "联网查", "上网搜", "上网查",
+    "搜索最新", "查一下最新", "查最新的",
+    "最新资料", "最新进展", "最新动态",
+    "最新趋势", "最新研究", "最新消息",
+    "deep research", "research report",
+    "ODR", "odr",
+]
+
 # ── Tech stack / self-intro declarations → memory_confirm ──────────
 # These are user statements ABOUT themselves/the project, not queries.
 # Must be checked BEFORE _RAG_TERMS to prevent "Qdrant"/"PostgreSQL"
@@ -173,6 +189,9 @@ def _infer_answer_mode(intent: str, user_input: str, *, is_memory_write: bool = 
     if intent == "artifact":
         return "project_advice"
     if intent == "chat":
+        # Tech stack / memory-like declaration + advice question → project_advice
+        if (is_tech_stack or is_name_pref) and is_advice_question:
+            return "project_advice"
         # LLM hint: LLM may detect memory_confirm even when rules say chat
         llm_am = str((home_intent or {}).get("answer_mode") or "")
         if llm_am == "memory_confirm":
@@ -230,6 +249,9 @@ def plan_route(
     is_tool = any(term in text for term in _TOOL_TERMS) or any(term in text for term in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "打开网页", "删除", "支付", "付款", "转账"]) or any(_has_english_term(text, kw) for kw in _EN_TOOL_KEYWORDS)
     is_memory = any(term in text for term in _MEMORY_TERMS)
     is_skill = any(term in text for term in _SKILL_TERMS)
+    _has_explicit_research_request = any(
+        pattern in text for pattern in _RESEARCH_REQUEST_PATTERNS
+    )
 
     # ── Memory-guard: suppress tool detection for memory/context declarations ──
     _memory_prefixes = (
@@ -263,8 +285,12 @@ def plan_route(
     if _is_memory_like and not _has_explicit_action:
         is_tool = False
         if _has_advice_question:
-            is_research = True
-            reasons.append("memory_like_with_question")
+            # Declaration + question → project_advice (chat, no research)
+            # e.g. "这个项目用X怎么设计架构" — user wants advice, not deep research
+            is_research = False
+            is_rag = False
+            is_artifact = False
+            reasons.append("memory_like_project_advice")
         else:
             is_rag = False
             is_research = False
@@ -272,17 +298,25 @@ def plan_route(
             is_memory = True
             reasons.append("memory_like_declaration")
     # ── Tech stack / name declarations → memory, NOT rag/research ──
-    # EXCEPT when the user is ALSO asking a question ("怎么设计架构") → keep research
+    # Advice questions keep is_research=False; answer_mode=project_advice handles phrasing.
     if (_is_tech_stack or _is_name_preference) and not _has_explicit_action and not forced:
         if _has_advice_question:
-            is_research = True
-            reasons.append("declaration_with_question")
+            is_research = False
+            is_rag = False
+            is_artifact = False
+            reasons.append("declaration_project_advice")
         else:
             is_rag = False
             is_research = False
             is_artifact = False
             is_memory = True
             reasons.append("declaration_to_memory")
+
+    # ── Explicit research request overrides memory/tech-stack guard ──
+    # Only when the user literally asks for deep research / investigation.
+    if _has_explicit_research_request and not _has_explicit_action:
+        is_research = True
+        reasons.append("explicit_research_request")
 
     # Conversation recall: "what did I just ask?" — must NOT trigger research/rag
     import re as _re
@@ -294,11 +328,16 @@ def plan_route(
 
     llm_intent = str((home_intent or {}).get("intent") or (home_intent or {}).get("detected_intent") or "")
     _tool_intents = {"tool", "tool.email", "tool.local_file", "tool.browser", "tool.comment", "tool.form_submit", "tool.shell_readonly", "tool.shell_write", "tool.dangerous"}
-    if not forced and llm_intent in {"chat", "research", "rag", "artifact", "feed_research", "memory", "skill", "mixed"} | _tool_intents:
+    # Declaration + advice question → project_advice; LLM must not override to research.
+    _is_declaration_advice = (_is_tech_stack or _is_memory_like) and _has_advice_question and not _has_explicit_research_request
+    _llm_override_blocked = _is_declaration_advice and llm_intent in ("research", "feed_research", "mixed", "rag")
+    if not forced and llm_intent in {"chat", "research", "rag", "artifact", "feed_research", "memory", "skill", "mixed"} | _tool_intents and not _llm_override_blocked:
         intent = llm_intent  # type: ignore[assignment]
         reasons.append("home_intent_used")
         if llm_intent.startswith("tool.") or llm_intent in _tool_intents:
             is_tool = True
+    elif _llm_override_blocked:
+        reasons.append(f"llm_override_blocked(llm={llm_intent}→rule={intent})")
 
     # Feed card deep-dive takes priority
     if feed_card_id and is_research:

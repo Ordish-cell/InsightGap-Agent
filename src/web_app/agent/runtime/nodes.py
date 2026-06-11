@@ -1867,7 +1867,7 @@ class RuntimeNodes:
         if artifacts:
             extra_blocks.append(
                 f"[Artifacts]\n" +
-                "\n".join(a.get("title", a.get("id", "")) for a in artifacts[:5])
+                "\n".join(str(a.get("title") or a.get("id", "")) for a in artifacts[:5])
             )
         if tool_result.get("status"):
             extra_blocks.append(

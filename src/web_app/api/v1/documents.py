@@ -49,7 +49,7 @@ def delete_document(document_id: int, user_id: int = Depends(get_current_user_id
 
 
 @router.post("/rag/search")
-def rag_search(payload: dict, user_id: int = Depends(get_current_user_id)):
+def rag_search(payload: dict, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     try:
         return ok(
             rag_service.search(
@@ -58,6 +58,7 @@ def rag_search(payload: dict, user_id: int = Depends(get_current_user_id)):
                 top_k=payload.get("top_k", 5),
                 min_score=payload.get("min_score", 0.2),
                 document_ids=payload.get("document_ids") or None,
+                db=db,
             )
         )
     except Exception as exc:
@@ -65,7 +66,7 @@ def rag_search(payload: dict, user_id: int = Depends(get_current_user_id)):
 
 
 @router.post("/rag/ask")
-def rag_ask(payload: dict, user_id: int = Depends(get_current_user_id)):
+def rag_ask(payload: dict, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     try:
         return ok(
             rag_service.ask(
@@ -75,6 +76,7 @@ def rag_ask(payload: dict, user_id: int = Depends(get_current_user_id)):
                 min_score=payload.get("min_score", 0.2),
                 document_ids=payload.get("document_ids") or None,
                 answer_mode=payload.get("answer_mode", "auto"),
+                db=db,
             )
         )
     except Exception as exc:
@@ -102,7 +104,7 @@ def chat_upload(file: UploadFile, user_id: int = Depends(get_current_user_id), d
             return fail(
                 "DOCUMENT_INGEST_FAILED",
                 str(exc),
-                details={"document_id": exc.document_id, "detail": exc.detail},
+                details={"document_id": exc.document_id, "detail": exc.detail, "ingest_status": "failed", "error_message": str(exc)},
             )
         return fail("CHAT_UPLOAD_FAILED", str(exc))
 

@@ -1,0 +1,5 @@
+product_model,price,quantity,owner,email,status
+M-2026-Pro,9999,12,Alice,alice.eval@example.com,ready
+M-2026-Lite,4999,30,Bob,bob.eval@example.com,backorder
+RAG-Box-7,1299,8,Carol,carol.eval@example.com,testing
+Hybrid-Kit-X,2399,15,David,david.eval@example.com,ready

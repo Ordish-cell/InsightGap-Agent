@@ -1,0 +1,16 @@
+Synthetic Contract Text
+
+Contract Number: HT-2026-001
+Contract Date: 2026-06-01
+Total Amount: ¥128,000
+Contact Email: contract-eval@example.com
+
+Payment Terms:
+The buyer pays 40% within five business days after signing.
+The remaining 60% is due after acceptance testing.
+
+Refund Terms:
+If delivery is delayed by more than 30 days, the buyer may request a refund of the undelivered portion.
+Refund requests must be sent to contract-eval@example.com.
+
+This document is synthetic and contains no real customer data.
