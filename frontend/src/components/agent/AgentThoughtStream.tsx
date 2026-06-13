@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import type { AgentChatMessage, AgentEvent, UnknownRecord } from '../../api/types'
 import { ApprovalCard, type ApprovalCardData } from './ApprovalCard'
@@ -10,13 +10,22 @@ type AgentThoughtStreamProps = {
   onReject: (approvalId: number) => void
 }
 
-const zhText = {
-  thinking: '正在思考',
-  answering: '正在回答',
-  completed: '已完成思考',
-  failed: '思考中断',
-  approve: '批准执行',
-  reject: '拒绝',
+type ActivityItem = {
+  id: string
+  kind: 'progress' | 'tool' | 'status'
+  text: string
+  status?: string
+  detail?: string
+  createdAt?: string
+}
+
+type ActivityTrace = {
+  items: ActivityItem[]
+  runningTools: number
+  completedTools: number
+  failedTools: number
+  sawAnswer: boolean
+  sawDone: boolean
 }
 
 function text(locale: 'en' | 'zh', zh: string, en: string) {
@@ -33,177 +42,413 @@ function asRecord(value: unknown): UnknownRecord {
   return value && typeof value === 'object' ? (value as UnknownRecord) : {}
 }
 
-function asThoughtText(value: unknown): string {
+function compact(value: unknown): string {
+  if (value === undefined || value === null) return ''
   if (typeof value === 'string') return value.trim()
-  const item = asRecord(value)
-  return String(item.text || item.summary || '').trim()
-}
-
-function asPipelineText(value: unknown): string {
-  const item = asRecord(value)
-  const title = String(item.title || item.key || '').trim()
-  const detail = String(item.detail || item.summary || '').trim()
-  if (!title && !detail) return ''
-  return detail && detail !== title ? `${title} · ${detail}` : title || detail
-}
-
-function collectPipelineSteps(message: AgentThoughtStreamProps['message']) {
-  const metadata = asRecord(message.metadata)
-  const finalResponse = asRecord(metadata.final_response)
-  const sources = [
-    finalResponse.pipeline_steps,
-    metadata.pipeline_steps,
-    (message as unknown as UnknownRecord).pipeline_steps,
-  ]
-  const items: string[] = []
-  sources.forEach((source) => {
-    if (!Array.isArray(source)) return
-    source.forEach((item) => {
-      const content = asPipelineText(item)
-      if (content && !items.includes(content)) items.push(content)
-    })
-  })
-  return items
-}
-
-function collectVisibleThoughts(message: AgentThoughtStreamProps['message']) {
-  const pipelineSteps = collectPipelineSteps(message)
-  if (pipelineSteps.length) return pipelineSteps
-
-  const items: string[] = []
-  const push = (value: unknown) => {
-    const content = asThoughtText(value)
-    if (content && !items.includes(content)) items.push(content)
+  try {
+    return JSON.stringify(value, null, 2)
+  } catch {
+    return String(value)
   }
+}
 
-  const streamed = new Map<string, string>()
-  ;(message.trace_events || []).forEach((event, index) => {
-    const payload = asRecord(event.payload)
-    if (event.event_type === 'visible_thought_delta') {
-      const id = String(payload.id || `thought-${index}`)
-      const current = streamed.get(id) || ''
-      if (payload.status === 'completed' && payload.full_text) streamed.set(id, String(payload.full_text))
-      else streamed.set(id, `${current}${String(payload.text || '')}`)
-      return
-    }
-    if (event.event_type === 'visible_thought') push(payload.text || event.payload)
-  })
-  streamed.forEach((value) => push(value))
+function truncate(value: unknown, limit = 520): string {
+  const raw = compact(value).replace(/\s+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim()
+  return raw.length > limit ? `${raw.slice(0, limit)}...` : raw
+}
 
+function thoughtText(value: unknown) {
+  if (typeof value === 'string') return value
+  const item = asRecord(value)
+  return String(item.text || item.summary || item.detail || '').trim()
+}
+
+function getToolCallId(event: AgentEvent, index: number) {
+  const payload = asRecord(event.payload)
+  return String(
+    payload.toolCallId ||
+      payload.tool_call_id ||
+      payload.id ||
+      payload.tool_call_record_id ||
+      event.id ||
+      `tool-${index}`,
+  )
+}
+
+function getToolName(event: AgentEvent) {
+  const payload = asRecord(event.payload)
+  return String(payload.toolName || payload.tool_name || payload.name || event.node_name || 'tool')
+}
+
+function pushItem(items: ActivityItem[], item: ActivityItem) {
+  const textValue = item.text.trim()
+  if (!textValue) return
+  const previous = items[items.length - 1]
+  if (previous?.kind === item.kind && previous.text === textValue && previous.status === item.status) return
+  items.push({ ...item, text: textValue })
+}
+
+function collectFallbackItems(message: AgentThoughtStreamProps['message']) {
+  const items: ActivityItem[] = []
   const metadata = asRecord(message.metadata)
   const finalResponse = asRecord(metadata.final_response)
   const langgraphstatus = asRecord(message.langgraphstatus)
   const sources = [
+    finalResponse.pipeline_steps,
     finalResponse.visible_thoughts,
     finalResponse.thinking_summary,
+    metadata.pipeline_steps,
     metadata.visible_thoughts,
     langgraphstatus.visible_thoughts,
     (message as unknown as UnknownRecord).visible_thoughts,
   ]
-  sources.forEach((source) => {
-    if (Array.isArray(source)) source.forEach(push)
-    else push(source)
+  sources.forEach((source, sourceIndex) => {
+    if (Array.isArray(source)) {
+      source.forEach((entry, index) => {
+        const record = asRecord(entry)
+        const value = record.detail || record.summary || record.text || record.title || thoughtText(entry)
+        pushItem(items, {
+          id: `fallback-${sourceIndex}-${index}`,
+          kind: 'progress',
+          text: String(value || ''),
+          status: String(record.status || 'completed'),
+        })
+      })
+    } else {
+      pushItem(items, {
+        id: `fallback-${sourceIndex}`,
+        kind: 'progress',
+        text: thoughtText(source),
+        status: 'completed',
+      })
+    }
   })
-
   return items
 }
 
-function approvalFrom(message: AgentThoughtStreamProps['message']): { approvalId: number; cardData: ApprovalCardData; currentStatus: string } {
-  const events = message.trace_events || []
+function toolStartedText(locale: 'en' | 'zh', toolName: string) {
+  return text(locale, `正在调用 ${toolName}`, `Calling ${toolName}`)
+}
 
-  // Find current approval state from event history (most recent wins)
+function toolCompletedText(locale: 'en' | 'zh', toolName: string) {
+  return text(locale, `已完成 ${toolName}`, `Finished ${toolName}`)
+}
+
+function toolFailedText(locale: 'en' | 'zh', toolName: string) {
+  return text(locale, `${toolName} 执行失败`, `${toolName} failed`)
+}
+
+function collectActivityTrace(message: AgentThoughtStreamProps['message'], locale: AgentThoughtStreamProps['locale']): ActivityTrace {
+  const items: ActivityItem[] = []
+  const thoughtIndex = new Map<string, number>()
+  const toolIndex = new Map<string, number>()
+  let completedTools = 0
+  let failedTools = 0
+  let sawAnswer = false
+  let sawDone = false
+
+  ;(message.trace_events || []).forEach((event, index) => {
+    const eventType = String(event.event_type || '')
+    const payload = asRecord(event.payload)
+    const createdAt = String(event.created_at || payload.created_at || '')
+
+    if (eventType === 'visible_thought_delta' || eventType === 'visible_progress_delta') {
+      const id = String(payload.id || `thought-${index}`)
+      const currentIndex = thoughtIndex.get(id)
+      if (currentIndex === undefined) {
+        thoughtIndex.set(id, items.length)
+        pushItem(items, {
+          id,
+          kind: 'progress',
+          text: String(payload.full_text || payload.text || ''),
+          status: String(payload.status || 'streaming'),
+          createdAt,
+        })
+      } else {
+        const current = items[currentIndex]
+        if (!current) return
+        const nextText = payload.full_text ? String(payload.full_text) : `${current.text}${String(payload.text || '')}`
+        items[currentIndex] = {
+          ...current,
+          text: nextText.trim(),
+          status: String(payload.status || current.status || 'streaming'),
+          createdAt: createdAt || current.createdAt,
+        }
+      }
+      return
+    }
+
+    if (eventType === 'visible_thought') {
+      pushItem(items, {
+        id: `thought-${event.id || index}`,
+        kind: 'progress',
+        text: String(payload.text || payload.summary || ''),
+        status: String(payload.status || 'completed'),
+        createdAt,
+      })
+      return
+    }
+
+    if (eventType === 'tool_call_started') {
+      const id = getToolCallId(event, index)
+      const toolName = getToolName(event)
+      const detail = truncate(payload.argsPreview || payload.args_preview || payload.tool_args, 360)
+      toolIndex.set(id, items.length)
+      pushItem(items, {
+        id: `tool-${id}`,
+        kind: 'tool',
+        text: toolStartedText(locale, toolName),
+        status: 'running',
+        detail,
+        createdAt,
+      })
+      return
+    }
+
+    if (eventType === 'tool_call_completed' || eventType === 'tool_call_failed') {
+      const id = getToolCallId(event, index)
+      const toolName = getToolName(event)
+      const failed = eventType === 'tool_call_failed'
+      const detail = truncate(payload.outputPreview || payload.output_preview || payload.error, 420)
+      const currentIndex = toolIndex.get(id)
+      const nextItem: ActivityItem = {
+        id: `tool-${id}`,
+        kind: 'tool',
+        text: failed ? toolFailedText(locale, toolName) : toolCompletedText(locale, toolName),
+        status: failed ? 'failed' : 'completed',
+        detail,
+        createdAt,
+      }
+      if (currentIndex === undefined) {
+        pushItem(items, nextItem)
+      } else {
+        const current = items[currentIndex]
+        if (current) {
+          items[currentIndex] = { ...current, ...nextItem, detail: detail || current.detail }
+        } else {
+          pushItem(items, nextItem)
+        }
+      }
+      if (failed) failedTools += 1
+      else completedTools += 1
+      return
+    }
+
+    if (eventType === 'approval_required') {
+      pushItem(items, {
+        id: `approval-${event.id || index}`,
+        kind: 'status',
+        text: text(locale, `等待你确认工具调用：${getToolName(event)}`, `Waiting for approval: ${getToolName(event)}`),
+        status: 'waiting_approval',
+        createdAt,
+      })
+      return
+    }
+
+    if (eventType === 'approval_granted' || eventType === 'approval_approved') {
+      pushItem(items, {
+        id: `approval-granted-${event.id || index}`,
+        kind: 'status',
+        text: text(locale, '已批准，继续执行。', 'Approved. Continuing.'),
+        status: 'completed',
+        createdAt,
+      })
+      return
+    }
+
+    if (eventType === 'approval_rejected') {
+      pushItem(items, {
+        id: `approval-rejected-${event.id || index}`,
+        kind: 'status',
+        text: text(locale, '已取消，没有执行该操作。', 'Rejected. The action was not run.'),
+        status: 'failed',
+        createdAt,
+      })
+      return
+    }
+
+    if (eventType === 'answer_started') {
+      pushItem(items, {
+        id: `answer-started-${event.id || index}`,
+        kind: 'progress',
+        text: text(locale, '正在整理最终回答。', 'Preparing the final answer.'),
+        status: 'running',
+        createdAt,
+      })
+      sawAnswer = true
+      return
+    }
+
+    if (eventType === 'answer_delta') {
+      sawAnswer = true
+      return
+    }
+
+    if (eventType === 'answer_completed' || eventType === 'run_completed') {
+      sawDone = true
+      return
+    }
+
+    if (eventType === 'run_failed') {
+      pushItem(items, {
+        id: `run-failed-${event.id || index}`,
+        kind: 'status',
+        text: text(locale, '任务执行失败。', 'The run failed.'),
+        status: 'failed',
+        detail: truncate(payload.error || payload.answer, 360),
+        createdAt,
+      })
+    }
+  })
+
+  if (!items.length) {
+    collectFallbackItems(message).forEach((item) => pushItem(items, item))
+  }
+
+  if (sawDone) {
+    items.forEach((item) => {
+      if (item.status === 'running' || item.status === 'streaming') {
+        item.status = 'completed'
+      }
+    })
+  }
+
+  const runningTools = items.filter((item) => item.kind === 'tool' && item.status === 'running').length
+  return { items, runningTools, completedTools, failedTools, sawAnswer, sawDone }
+}
+
+function approvalFrom(
+  message: AgentThoughtStreamProps['message'],
+  locale: AgentThoughtStreamProps['locale'],
+): { approvalId: number; cardData: ApprovalCardData } {
+  const events = message.trace_events || []
   let approvalStatus = 'pending'
   for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i]
-    if (!ev) continue
-    const et = ev.event_type
+    const et = events[i]?.event_type
     if (et === 'approval_granted' || et === 'approval_approved') { approvalStatus = 'approved'; break }
     if (et === 'approval_rejected') { approvalStatus = 'rejected'; break }
     if (et === 'tool_call_failed') { approvalStatus = 'approved'; break }
     if (et === 'tool_call_completed') { approvalStatus = 'approved'; break }
     if (et === 'run_completed') { approvalStatus = 'completed'; break }
   }
-  if (message.status === 'completed') { approvalStatus = 'completed' }
+  if (message.status === 'completed') approvalStatus = 'completed'
 
-  // Find approval_required event for payload data
   const event = events.find((item) => item.event_type === 'approval_required')
-  let payload: UnknownRecord = {}
-  if (event) {
-    payload = asRecord(event.payload)
-  } else {
-    const meta = asRecord(message.metadata)
-    const approvalPayload = asRecord(meta.approval_payload)
-    if (approvalPayload.approval_id) { payload = approvalPayload }
-  }
-  if (!payload.approval_id && !payload.tool_name) return { approvalId: 0, cardData: {}, currentStatus: approvalStatus }
+  const meta = asRecord(message.metadata)
+  const payload = event ? asRecord(event.payload) : asRecord(meta.approval_payload)
+  if (!payload.approval_id && !payload.tool_name) return { approvalId: 0, cardData: {} }
 
   const approvalId = Number(payload.approval_id || 0)
-  const cardData: ApprovalCardData = {
-    approval_id: payload.approval_id as string | number | undefined,
-    run_id: payload.run_id as string | number | undefined,
-    risk_level: String(payload.risk_level || 'L3'),
-    tool_name: String(payload.tool_name || ''),
-    title: String(payload.title || '需要你确认'),
-    preview: asRecord(payload.preview),
-    tool_args: asRecord(payload.tool_args),
-    safety_notes: Array.isArray(payload.safety_notes) ? payload.safety_notes : [],
-    actions: Array.isArray(payload.actions) ? payload.actions : ['approve', 'reject'],
-    status: approvalStatus,
+  return {
+    approvalId,
+    cardData: {
+      approval_id: payload.approval_id as string | number | undefined,
+      run_id: payload.run_id as string | number | undefined,
+      risk_level: String(payload.risk_level || 'L3'),
+      tool_name: String(payload.tool_name || ''),
+      title: String(payload.title || text(locale, '需要你确认', 'Approval required')),
+      preview: asRecord(payload.preview),
+      tool_args: asRecord(payload.tool_args),
+      safety_notes: Array.isArray(payload.safety_notes) ? payload.safety_notes : [],
+      actions: Array.isArray(payload.actions) ? payload.actions : ['approve', 'reject'],
+      status: approvalStatus,
+    },
   }
-  return { approvalId, cardData, currentStatus: approvalStatus }
+}
+
+function ActivityRow({ item, locale }: { item: ActivityItem; locale: 'en' | 'zh' }) {
+  const [open, setOpen] = useState(false)
+  const failed = item.status === 'failed'
+  const running = item.status === 'running' || item.status === 'streaming' || item.status === 'waiting_approval'
+  const mark = item.kind === 'tool' ? '⌘' : failed ? '!' : running ? '' : '✓'
+  const canInspect = Boolean(item.detail)
+
+  return (
+    <div className={failed ? 'activity-row failed' : running ? 'activity-row running' : 'activity-row'}>
+      <span className="activity-row-mark">{mark}</span>
+      <div className="activity-row-body">
+        <p>{item.text}</p>
+        {canInspect ? (
+          <button className="activity-row-detail-toggle" type="button" onClick={() => setOpen((value) => !value)}>
+            {open ? text(locale, '收起详情', 'Hide details') : text(locale, '查看详情', 'View details')}
+          </button>
+        ) : null}
+        {open && item.detail ? <pre className="activity-row-detail">{item.detail}</pre> : null}
+      </div>
+    </div>
+  )
 }
 
 export function AgentThoughtStream({ message, locale, onApprove, onReject }: AgentThoughtStreamProps) {
-  const thoughts = collectVisibleThoughts(message)
+  const trace = useMemo(() => collectActivityTrace(message, locale), [message, locale])
   const status = String(message.status || 'completed')
-  const running = ['thinking', 'running', 'created', 'queued'].includes(status)
+  const running = ['thinking', 'running', 'created', 'queued', 'streaming'].includes(status)
   const waitingApproval = status === 'waiting_approval'
   const resuming = status === 'resuming'
-  const answering = status === 'streaming'
   const failed = status === 'failed'
+  const done = (status === 'completed' || trace.sawDone) && !running && !waitingApproval && !resuming && !failed
+  const active = running || waitingApproval || resuming
   const elapsed = seconds(message.elapsed_ms)
-  const label = answering
-    ? text(locale, zhText.answering, 'Answering')
-    : waitingApproval
-      ? '等待审批'
-      : resuming
-        ? '已批准，继续执行...'
-        : running
-          ? text(locale, zhText.thinking, 'Thinking')
-          : failed
-            ? text(locale, zhText.failed, 'Thinking interrupted')
-            : text(locale, zhText.completed, 'Completed reasoning')
-  const { approvalId, cardData, currentStatus } = approvalFrom(message)
-  const [open, setOpen] = useState(running || failed || waitingApproval || resuming)
+  const { approvalId, cardData } = approvalFrom(message, locale)
+  const [open, setOpen] = useState(active || failed)
 
   useEffect(() => {
-    setOpen(running || failed || waitingApproval || resuming)
-  }, [failed, running, waitingApproval, resuming, message.message_id])
+    setOpen(active || failed)
+  }, [active, failed, message.message_id])
 
-  if (!thoughts.length && !running && !failed && !answering && !approvalId) return null
+  if (!trace.items.length && !active && !failed && !approvalId && !trace.sawAnswer) return null
+
+  const label = failed
+    ? text(locale, '工作过程中断', 'Activity interrupted')
+    : done
+      ? text(locale, '已处理', 'Completed')
+      : text(locale, '工作过程', 'Activity')
+  const toolSummary = trace.runningTools
+    ? text(locale, `正在运行 ${trace.runningTools} 个工具`, `${trace.runningTools} tool${trace.runningTools > 1 ? 's' : ''} running`)
+    : trace.completedTools || trace.failedTools
+      ? text(
+          locale,
+          `已运行 ${trace.completedTools + trace.failedTools} 条工具调用`,
+          `Ran ${trace.completedTools + trace.failedTools} tool call${trace.completedTools + trace.failedTools > 1 ? 's' : ''}`,
+        )
+      : ''
 
   return (
-    <div className={running ? 'agent-thought-stream running' : failed ? 'agent-thought-stream failed' : 'agent-thought-stream'}>
+    <div className={failed ? 'agent-thought-stream failed' : active ? 'agent-thought-stream running' : 'agent-thought-stream'}>
       <button className="thought-stream-status" type="button" onClick={() => setOpen((value) => !value)}>
-        <span className={running ? 'thinking-dot active' : 'thinking-dot'} />
+        <span className={active ? 'thinking-dot active' : 'thinking-dot'} />
         <strong>
           {label}
-          {elapsed ? ` · ${elapsed}` : ''}
+          {elapsed ? ` ${elapsed}` : ''}
         </strong>
-        {thoughts.length || approvalId ? <span className="thought-stream-chevron">{open ? 'v' : '>'}</span> : null}
+        {toolSummary ? <span className="activity-tool-summary">{toolSummary}</span> : null}
+        <span className="thought-stream-chevron">{open ? '⌄' : '›'}</span>
       </button>
+
       {open ? (
-        <div className="thought-paragraphs">
-          {thoughts.map((item, index) => <p key={`${index}-${item}`}>{item}</p>)}
+        <div className="activity-timeline">
+          {trace.items.length ? (
+            trace.items.map((item) => <ActivityRow key={item.id} item={item} locale={locale} />)
+          ) : active ? (
+            <div className="activity-row running">
+              <span className="activity-row-mark" />
+              <div className="activity-row-body">
+                <p>{text(locale, '正在理解需求。', 'Understanding the request.')}</p>
+              </div>
+            </div>
+          ) : null}
+
+          {approvalId ? (
+            <div className="activity-approval">
+              <ApprovalCard
+                data={cardData}
+                locale={locale}
+                onApprove={onApprove}
+                onReject={onReject}
+              />
+            </div>
+          ) : null}
         </div>
-      ) : null}
-      {approvalId && open ? (
-        <ApprovalCard
-          data={cardData}
-          locale={locale}
-          onApprove={onApprove}
-          onReject={onReject}
-        />
       ) : null}
     </div>
   )

@@ -967,7 +967,19 @@ export function AgentChatPanel({
       content: '',
       conversation_id: localConversationId,
       status: 'thinking',
-      trace_events: [],
+      trace_events: [
+        {
+          event_type: 'visible_progress_delta',
+          visibility: 'user',
+          display_channel: 'thinking',
+          payload: {
+            id: `local-start-${now}`,
+            text: text(locale, '我开始处理了，会把执行过程按步骤展示在这里。', 'I started working and will show the process here step by step.'),
+            status: 'streaming',
+          },
+          created_at: new Date(now).toISOString(),
+        },
+      ],
       local_id: `local-assistant-${now}`,
     }
     setMessages((items) => [...items, localUser, localAssistant])
@@ -1009,7 +1021,7 @@ export function AgentChatPanel({
                     ...assistantMessage,
                     message_id: localAssistant.message_id,
                     status: 'thinking',
-                    trace_events: [],
+                    trace_events: item.trace_events || localAssistant.trace_events || [],
                   }
                 }
                 return item

@@ -236,9 +236,36 @@ export interface AgentEvent {
   thread_id?: string
   event_type?: string
   node_name?: string
+  visibility?: 'user' | 'trace' | 'internal' | string
+  display_channel?: 'thinking' | 'answer' | 'tool' | 'status' | string
   payload?: UnknownRecord
   created_at?: string
   [key: string]: unknown
+}
+
+export type AgentTraceEventType =
+  | 'visible_thought_delta'
+  | 'visible_progress_delta'
+  | 'tool_call_started'
+  | 'tool_call_completed'
+  | 'tool_call_failed'
+  | 'approval_required'
+  | 'approval_granted'
+  | 'approval_rejected'
+  | 'answer_started'
+  | 'answer_delta'
+  | 'answer_completed'
+  | 'run_completed'
+  | 'run_failed'
+
+export interface AgentToolTrace {
+  id: string
+  name: string
+  status: 'running' | 'completed' | 'failed' | 'waiting_approval' | 'rejected' | string
+  argsPreview?: unknown
+  outputPreview?: string
+  error?: string
+  recordId?: string | number
 }
 
 export interface Artifact {

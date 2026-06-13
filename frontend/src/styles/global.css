@@ -3088,6 +3088,106 @@ body:has(.simple-login-page) {
   margin-top: 0;
 }
 
+.activity-timeline {
+  display: grid;
+  gap: 16px;
+  max-width: 760px;
+  padding: 8px 0 4px;
+}
+
+.activity-row {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.activity-row-mark {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: #f0eee9;
+  color: #74706a;
+  font-size: 11px;
+  font-weight: 750;
+  line-height: 1;
+}
+
+.activity-row.running .activity-row-mark {
+  background: #9f9a92;
+  color: transparent;
+  animation: activity-pulse 1.15s ease-out infinite;
+}
+
+.activity-row.failed .activity-row-mark {
+  background: #fff0ee;
+  color: var(--danger);
+}
+
+.activity-row-body {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.activity-row-body p {
+  margin: 0;
+  color: #2f2c28;
+  font-size: 16px;
+  line-height: 1.7;
+  text-wrap: pretty;
+}
+
+.activity-row-detail-toggle {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #7b756e;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.activity-row-detail-toggle:hover {
+  color: #3d3934;
+}
+
+.activity-row-detail {
+  margin: 2px 0 0;
+  max-height: 180px;
+  overflow: auto;
+  padding: 9px 10px;
+  border: 1px solid #e8e2d8;
+  border-radius: 8px;
+  background: #fbfaf8;
+  color: #3f3b36;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.activity-tool-summary {
+  color: #8b857d;
+  font-size: 13px;
+  font-weight: 550;
+}
+
+.activity-approval {
+  margin-top: 2px;
+}
+
+@keyframes activity-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgb(159 154 146 / 30%);
+  }
+  100% {
+    box-shadow: 0 0 0 8px rgb(159 154 146 / 0%);
+  }
+}
+
 .run-trace {
   width: min(780px, 100%);
   display: grid;

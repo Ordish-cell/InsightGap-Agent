@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryService:
+    _QDRANT_MEMORY_TYPES = {"semantic", "episodic"}
+
     def __init__(self):
         self._items: list[dict[str, Any]] = []
         self._qdrant_store = None
@@ -93,7 +95,7 @@ class MemoryService:
             qdrant_indexed = False
             qdrant_error = None
             # ── Fire-and-forget Qdrant upsert ─────────────────────────
-            store = self._get_qdrant_store()
+            store = self._get_qdrant_store() if memory_type in self._QDRANT_MEMORY_TYPES else None
             if store is not None:
                 try:
                     qdrant_point_id = store.upsert_memory(
@@ -229,7 +231,7 @@ class MemoryService:
         )
         qdrant_indexed = False
         qdrant_error = None
-        store = self._get_qdrant_store()
+        store = self._get_qdrant_store() if existing.memory_type in self._QDRANT_MEMORY_TYPES else None
         if store is not None and existing.qdrant_point_id:
             try:
                 store.upsert_memory(memory_id=existing.id, user_id=existing.user_id, content=existing.content, memory_type=existing.memory_type, importance=updated_importance, source_type=existing.source_type or "", metadata=updated_meta, point_id=existing.qdrant_point_id)

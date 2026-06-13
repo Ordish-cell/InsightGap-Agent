@@ -372,6 +372,19 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         run_id=run.id,
         thread_id=thread_id,
     )
+    _queue_stream_event(
+        stream_queue,
+        "visible_progress_delta",
+        {
+            "id": f"run-{run.id}-started",
+            "text": "我开始执行了，会先判断任务类型和需要的上下文。",
+            "status": "streaming",
+            "source": "activity",
+        },
+        run_id=run.id,
+        thread_id=thread_id,
+        node_name="run_start",
+    )
 
     # ── Direct image analysis fast path ──
     is_direct_image = _is_direct_image_question(user_input, attachments_data)
@@ -551,6 +564,19 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                 page_context["attachment_context"] = attachment_context
                 enriched_payload["page_context"] = page_context
 
+            _queue_stream_event(
+                stream_queue,
+                "visible_progress_delta",
+                {
+                    "id": f"run-{run.id}-runtime",
+                    "text": "我正在检查相关上下文，并准备进入执行步骤。",
+                    "status": "streaming",
+                    "source": "activity",
+                },
+                run_id=run.id,
+                thread_id=thread_id,
+                node_name="runtime_start",
+            )
             state = await AgentRuntime(db, enriched_payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue, "_answer_started_emitted": False, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
             _inject_conversation_history_snapshot(state, db, user_id, conversation_id)
         except Exception as exc:
@@ -824,8 +850,10 @@ async def stream_agent_run(db: Session, user_id: int, payload: dict[str, Any]):
                 break
             yield item
             event_type = str((item.get("data") or {}).get("event_type") or item.get("event") or "")
-            if event_type == "visible_thought_delta":
+            if event_type in {"visible_thought_delta", "visible_progress_delta"}:
                 await asyncio.sleep(0.08)
+            elif event_type in {"tool_call_started", "tool_call_completed", "tool_call_failed", "approval_required", "run_resumed"}:
+                await asyncio.sleep(0.04)
             elif event_type == "answer_delta":
                 await asyncio.sleep(0.008)
     finally:
@@ -899,6 +927,7 @@ async def resume_run_after_approval(
     pending_tool_name = graph_state.get("pending_tool_name", "")
     pending_tool_args = graph_state.get("pending_tool_args", {})
     pending_tool_call_id = graph_state.get("pending_tool_call_id")
+    client_tool_call_id = str(pending_tool_call_id or f"run-{run_id}-tool-resume")
 
     # ── Debug: snapshot at resume start ──────────────────────────
     tc = graph_state.get("tool_call") or {}
@@ -968,8 +997,14 @@ async def resume_run_after_approval(
                 real_tool_args = tool_call_record.input if tool_call_record else pending_tool_args
 
                 _queue_stream_event(stream_queue, "tool_call_started", {
+                    "tool_call_id": client_tool_call_id,
+                    "toolCallId": client_tool_call_id,
                     "tool_name": pending_tool_name,
+                    "toolName": pending_tool_name,
                     "tool_args": _sanitize_tool_args_for_frontend(pending_tool_name, real_tool_args),
+                    "args_preview": _sanitize_tool_args_for_frontend(pending_tool_name, real_tool_args),
+                    "argsPreview": _sanitize_tool_args_for_frontend(pending_tool_name, real_tool_args),
+                    "status": "running",
                 }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
 
                 try:
@@ -1011,7 +1046,14 @@ async def resume_run_after_approval(
                     if tool_success:
                         graph_state["tool_call"] = {**graph_state.get("tool_call", {}), "status": "completed", "error": ""}
                         _queue_stream_event(stream_queue, "tool_call_completed", {
-                            "tool_name": pending_tool_name, "status": "completed",
+                            "tool_call_id": client_tool_call_id,
+                            "toolCallId": client_tool_call_id,
+                            "tool_name": pending_tool_name,
+                            "toolName": pending_tool_name,
+                            "status": "completed",
+                            "output_preview": _tool_output_preview_for_frontend(tool_result),
+                            "outputPreview": _tool_output_preview_for_frontend(tool_result),
+                            "tool_call_record_id": pending_tool_call_id,
                         }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
                         _log.info("resume: tool success tool=%s run=%s", pending_tool_name, run_id)
 
@@ -1031,7 +1073,15 @@ async def resume_run_after_approval(
                         graph_state["_tool_error"] = err_msg
                         graph_state["_resume_context"] = f"failed:{pending_approval_id}"
                         _queue_stream_event(stream_queue, "tool_call_failed", {
-                            "tool_name": pending_tool_name, "error": err_msg,
+                            "tool_call_id": client_tool_call_id,
+                            "toolCallId": client_tool_call_id,
+                            "tool_name": pending_tool_name,
+                            "toolName": pending_tool_name,
+                            "status": "failed",
+                            "error": str(err_msg)[:700],
+                            "output_preview": _tool_output_preview_for_frontend(tool_result),
+                            "outputPreview": _tool_output_preview_for_frontend(tool_result),
+                            "tool_call_record_id": pending_tool_call_id,
                         }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
                         _log.warning("resume: tool failed tool=%s err=%s run=%s", pending_tool_name, err_msg, run_id)
 
@@ -1048,7 +1098,15 @@ async def resume_run_after_approval(
                     graph_state["_tool_error"] = err_msg
                     graph_state["_resume_context"] = f"failed:{pending_approval_id}"
                     _queue_stream_event(stream_queue, "tool_call_failed", {
-                        "tool_name": pending_tool_name, "error": err_msg,
+                        "tool_call_id": client_tool_call_id,
+                        "toolCallId": client_tool_call_id,
+                        "tool_name": pending_tool_name,
+                        "toolName": pending_tool_name,
+                        "status": "failed",
+                        "error": str(err_msg)[:700],
+                        "output_preview": _tool_output_preview_for_frontend(graph_state.get("tool_result") or {}),
+                        "outputPreview": _tool_output_preview_for_frontend(graph_state.get("tool_result") or {}),
+                        "tool_call_record_id": pending_tool_call_id,
                     }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
                     _queue_stream_event(stream_queue, "visible_thought_delta", {
                         "text": "工具执行失败，我会说明原因。",
@@ -1414,8 +1472,10 @@ async def stream_resume_run(db: Session, user_id: int, run_id: int):
                 break
             yield item
             event_type = str((item.get("data") or {}).get("event_type") or item.get("event") or "")
-            if event_type == "visible_thought_delta":
+            if event_type in {"visible_thought_delta", "visible_progress_delta"}:
                 await asyncio.sleep(0.08)
+            elif event_type in {"tool_call_started", "tool_call_completed", "tool_call_failed", "approval_required", "run_resumed"}:
+                await asyncio.sleep(0.04)
             elif event_type == "answer_delta":
                 await asyncio.sleep(0.008)
     finally:
@@ -2298,3 +2358,19 @@ def _safe_preview_from_output(tool_name: str, output: dict[str, Any]) -> dict[st
     preview = {k: v for k, v in output.items() if not k.startswith("_")}
     # Redact sensitive fields
     return _sanitize_tool_args_for_frontend(tool_name, preview)
+
+
+def _tool_output_preview_for_frontend(output: dict[str, Any] | None, max_chars: int = 700) -> str:
+    if not output:
+        return ""
+    safe = {
+        key: value
+        for key, value in output.items()
+        if not str(key).startswith("_") and not any(secret in str(key).lower() for secret in _SENSITIVE_KEYS)
+    }
+    try:
+        text = json.dumps(safe, ensure_ascii=False, default=str)
+    except TypeError:
+        text = str(safe)
+    text = " ".join(text.split())
+    return text[:max_chars] + ("..." if len(text) > max_chars else "")

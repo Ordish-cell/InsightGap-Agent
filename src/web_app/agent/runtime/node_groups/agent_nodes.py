@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+
+from src.web_app.agent.runtime.events import queue_stream_event
 from src.web_app.agent.runtime.node_groups.base import *
 from src.web_app.agent.runtime.state_delta import record_agent_node_result
 
@@ -18,6 +21,69 @@ def _tool_node_result_updates(state: AgentRuntimeState) -> dict[str, Any]:
         "final_output",
     )
     return {key: state.get(key) for key in keys if key in state}
+
+
+def _tool_event_id(state: AgentRuntimeState, tool_name: str) -> str:
+    count = len(state.get("tool_calls") or [])
+    return f"run-{state.get('run_id', 'unknown')}-tool-{count + 1}-{tool_name}"
+
+
+def _tool_output_preview(result: dict[str, Any] | None, max_chars: int = 700) -> str:
+    if not result:
+        return ""
+    output = result.get("output") if isinstance(result, dict) else None
+    value: Any = output if output not in (None, {}) else result
+    if isinstance(value, dict):
+        value = {
+            key: item
+            for key, item in value.items()
+            if not str(key).startswith("_") and not any(secret in str(key).lower() for secret in _SENSITIVE_ARG_KEYS)
+        }
+    try:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    except TypeError:
+        text = str(value)
+    text = " ".join(text.split())
+    return text[:max_chars] + ("..." if len(text) > max_chars else "")
+
+
+def _queue_tool_event(
+    state: AgentRuntimeState,
+    event_type: str,
+    *,
+    tool_call_id: str,
+    tool_name: str,
+    args_preview: dict[str, Any] | None = None,
+    output_preview: str = "",
+    status: str = "",
+    error: str = "",
+    tool_call_record_id: int | str | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "tool_call_id": tool_call_id,
+        "toolCallId": tool_call_id,
+        "tool_name": tool_name,
+        "toolName": tool_name,
+        "status": status,
+    }
+    if args_preview is not None:
+        payload["args_preview"] = args_preview
+        payload["argsPreview"] = args_preview
+    if output_preview:
+        payload["output_preview"] = output_preview
+        payload["outputPreview"] = output_preview
+    if error:
+        payload["error"] = error[:700]
+    if tool_call_record_id is not None:
+        payload["tool_call_record_id"] = tool_call_record_id
+    queue_stream_event(
+        state.get("_stream_queue"),
+        event_type,
+        payload,
+        run_id=state.get("run_id"),
+        thread_id=state.get("thread_id", ""),
+        node_name="tool_agent",
+    )
 
 
 class AgentNodesMixin:
@@ -682,6 +748,17 @@ class AgentNodesMixin:
                 )
                 return state
 
+            client_tool_call_id = _tool_event_id(state, tool_name)
+            safe_tool_args = _sanitize_tool_args(tool_name, tool_input)
+            _queue_tool_event(
+                state,
+                "tool_call_started",
+                tool_call_id=client_tool_call_id,
+                tool_name=tool_name,
+                args_preview=safe_tool_args,
+                status="running",
+            )
+
             result = mcp_service.call_tool(self.db, state["user_id"], tool_name, tool_input,
                                            agent_run_id=state["run_id"],
                                            dry_run=bool(self.payload.get("dry_run", False)))
@@ -706,7 +783,7 @@ class AgentNodesMixin:
                     "approval_id": approval_id,
                     "tool_name": tool_name,
                     "risk_level": route_plan.get("risk_level", "L3"),
-                    "tool_args": _sanitize_tool_args(tool_name, tool_input),
+                    "tool_args": safe_tool_args,
                     "preview": result.get("output", {}),
                     "run_id": state["run_id"],
                     "user_id": state["user_id"],
@@ -744,6 +821,16 @@ class AgentNodesMixin:
                 )
                 return state
             elif result["status"] in {"failed", "blocked"}:
+                _queue_tool_event(
+                    state,
+                    "tool_call_failed",
+                    tool_call_id=client_tool_call_id,
+                    tool_name=tool_name,
+                    output_preview=_tool_output_preview(result),
+                    status=str(result.get("status") or "failed"),
+                    error=str(result.get("error") or "tool_failed"),
+                    tool_call_record_id=result.get("id"),
+                )
                 state["status"] = "failed"
                 state["error"] = result.get("error", "")
                 state["final_output"] = f"工具 {tool_name} 失败: {result.get('error', 'unknown')}"
@@ -768,6 +855,15 @@ class AgentNodesMixin:
                     extra={"risk_level": route_plan.get("risk_level", "L0"), "status": result["status"]},
                 )
             else:
+                _queue_tool_event(
+                    state,
+                    "tool_call_completed",
+                    tool_call_id=client_tool_call_id,
+                    tool_name=tool_name,
+                    output_preview=_tool_output_preview(result),
+                    status=str(result.get("status") or "completed"),
+                    tool_call_record_id=result.get("id"),
+                )
                 append_output(state, "tool_agent", {"tool_name": tool_name, "status": result.get("status")})
                 append_agent_result(state, AgentResult(
                     task_id=task_id_for_agent(state, "tool_agent"),
