@@ -18,6 +18,7 @@ SECTIONS = [
     "Checkpoint Summary",
     "Feed Card Context",
     "Dynamic Preferences",
+    "Graph Context",
 ]
 
 SOURCE_MAP = {
@@ -34,6 +35,7 @@ SOURCE_MAP = {
     "checkpoint_summary": "Checkpoint Summary",
     "feed_card": "Feed Card Context",
     "dynamic_preferences": "Dynamic Preferences",
+    "graph_context": "Graph Context",
 }
 
 # Route-adaptive source relevance weights.
@@ -43,42 +45,42 @@ _ROUTE_WEIGHTS: dict[str, dict[str, float]] = {
         "conversation_history": 0.95, "conversation_summary": 0.80,
         "memory": 0.75, "profile": 0.60, "task": 0.70,
         "feed_card": 0.50, "evidence": 0.35, "checkpoint_summary": 0.40,
-        "dynamic_preferences": 0.65,
+        "dynamic_preferences": 0.65, "graph_context": 0.62,
     },
     "feed": {
         "memory": 0.85, "dynamic_preferences": 0.80,
         "conversation_history": 0.75, "profile": 0.65,
         "conversation_summary": 0.30, "evidence": 0.45,
-        "feed_card": 0.55, "task": 0.60,
+        "feed_card": 0.55, "task": 0.60, "graph_context": 0.55,
     },
     "research": {
         "feed_card": 0.85, "evidence": 0.80,
         "conversation_history": 0.75, "checkpoint_summary": 0.70,
         "memory": 0.65, "dynamic_preferences": 0.60,
         "task": 0.75, "conversation_summary": 0.55,
-        "profile": 0.50,
+        "profile": 0.50, "graph_context": 0.60,
     },
     "rag": {
         "evidence": 0.90, "task": 0.75,
         "conversation_history": 0.70, "feed_card": 0.65,
-        "memory": 0.55, "checkpoint_summary": 0.40,
+        "memory": 0.55, "checkpoint_summary": 0.40, "graph_context": 0.50,
     },
     "skill": {
         "memory": 0.80, "conversation_history": 0.80,
         "dynamic_preferences": 0.75, "task": 0.70,
         "conversation_summary": 0.65, "feed_card": 0.55,
-        "evidence": 0.40, "checkpoint_summary": 0.50,
+        "evidence": 0.40, "checkpoint_summary": 0.50, "graph_context": 0.70,
     },
     "artifact": {
         "dynamic_preferences": 0.85, "conversation_history": 0.80,
         "feed_card": 0.75, "task": 0.70, "memory": 0.65,
         "evidence": 0.60, "conversation_summary": 0.55,
-        "checkpoint_summary": 0.50,
+        "checkpoint_summary": 0.50, "graph_context": 0.65,
     },
     "tool": {
         "task": 0.80, "conversation_history": 0.75,
         "evidence": 0.70, "checkpoint_summary": 0.65,
-        "memory": 0.45, "feed_card": 0.40,
+        "memory": 0.45, "feed_card": 0.40, "graph_context": 0.55,
     },
 }
 

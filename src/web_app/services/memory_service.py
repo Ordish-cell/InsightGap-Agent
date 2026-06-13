@@ -1,5 +1,6 @@
 import logging
 import re
+import time
 from datetime import UTC, datetime
 from typing import Any
 
@@ -16,6 +17,7 @@ class MemoryService:
         self._items: list[dict[str, Any]] = []
         self._qdrant_store = None
         self._qdrant_init_attempted = False
+        self._qdrant_retry_after = 0.0
         self._last_search_backend = "not_searched"
         self._last_qdrant_hits = 0
 
@@ -23,7 +25,8 @@ class MemoryService:
         """Lazy-init QdrantMemoryStore. Returns None if Qdrant is unavailable."""
         if self._qdrant_store is not None:
             return self._qdrant_store
-        if self._qdrant_init_attempted:
+        now = time.monotonic()
+        if self._qdrant_init_attempted and now < self._qdrant_retry_after:
             return None
         self._qdrant_init_attempted = True
         try:
@@ -39,6 +42,7 @@ class MemoryService:
             return store
         except Exception:
             logger.warning("memory.qdrant_init_failed", exc_info=True)
+            self._qdrant_retry_after = now + 60.0
             return None
 
     def _delete_memory_vector(self, memory_id: int | str) -> str | None:
@@ -66,6 +70,16 @@ class MemoryService:
         metadata: dict[str, Any] | None = None,
         db: Session | None = None,
     ) -> dict[str, Any]:
+        # Backward-compatible positional form used by older callers:
+        # add_memory(user_id, content, type, importance, metadata, db)
+        if db is None and isinstance(metadata, Session):
+            db = metadata
+            metadata = source_type if isinstance(source_type, dict) else {}
+            source_type = ""
+        elif isinstance(source_type, dict) and metadata is None:
+            metadata = source_type
+            source_type = ""
+
         if db:
             item = MemoryRepository(db).create(
                 user_id=user_id,
@@ -118,6 +132,10 @@ class MemoryService:
                 "category": (metadata or {}).get("category", ""),
                 "status": (metadata or {}).get("status", "active"),
             })
+            graph_result = self._sync_memory_graph(user_id, item)
+            if graph_result.get("warning"):
+                result["graph_warning"] = graph_result["warning"]
+            result["graph_indexed"] = bool(graph_result.get("synced"))
             return result
         item = {
             "id": len(self._items) + 1,
@@ -229,6 +247,10 @@ class MemoryService:
             "category": updated_meta.get("category", ""),
             "status": updated_meta.get("status", "active"),
         })
+        graph_result = self._sync_memory_graph(existing.user_id, existing)
+        if graph_result.get("warning"):
+            result["graph_warning"] = graph_result["warning"]
+        result["graph_indexed"] = bool(graph_result.get("synced"))
         return result
 
     def search_memory(
@@ -372,6 +394,53 @@ class MemoryService:
         self._last_qdrant_hits = 0
         return []
 
+    def get_baseline_memories(
+        self,
+        user_id: int,
+        db: Session | None = None,
+        *,
+        categories: set[str] | list[str] | tuple[str, ...] | None = None,
+        min_importance: float = 0.75,
+        limit: int = 6,
+    ) -> list[dict[str, Any]]:
+        """Read stable profile/project memories without using the current query.
+
+        Read-only by contract: no writes, no consolidation, no importance updates.
+        """
+        allowed = set(categories or {
+            "name_preference", "language_preference", "tone_preference",
+            "answer_preference", "project_goal", "tech_stack", "boundary",
+            "workflow_pattern",
+        })
+        if not db:
+            items = [
+                item for item in self._items
+                if item.get("user_id") == user_id
+                and item.get("memory_type") == "semantic"
+                and float(item.get("importance") or 0) >= min_importance
+                and ((item.get("metadata") or {}).get("category", "") in allowed)
+            ]
+            return sorted(items, key=lambda item: float(item.get("importance") or 0), reverse=True)[:limit]
+
+        repo = MemoryRepository(db)
+        rows = repo.list_recent_important(
+            user_id=user_id,
+            memory_type="semantic",
+            min_importance=min_importance,
+            limit=max(limit * 3, limit),
+        )
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            meta = row.metadata_json or {}
+            if meta.get("status", "active") in {"superseded", "archived"}:
+                continue
+            if meta.get("category", "") not in allowed:
+                continue
+            results.append(self._to_dict(row))
+            if len(results) >= limit:
+                break
+        return results
+
     def get_semantic_memories(self, user_id: int, db: Session, min_importance: float = 0.3) -> list[dict[str, Any]]:
         return [self._to_dict(item) for item in MemoryRepository(db).search(user_id, memory_type="semantic", min_importance=min_importance)]
 
@@ -416,12 +485,15 @@ class MemoryService:
             if memory_id:
                 item = repo.get_by_id(memory_id)
                 if item and item.user_id == user_id:
+                    graph_warning = self._mark_memory_graph(user_id, item.id, "forgotten", "forget_memory")
                     warning = self._delete_memory_vector(item.id)
                     db.delete(item)
                     db.commit()
                     result = {"deleted": 1}
                     if warning:
                         result["vector_cleanup_warning"] = warning
+                    if graph_warning:
+                        result["graph_warning"] = graph_warning
                     return result
             return {"deleted": 0}
         before = len(self._items)
@@ -445,8 +517,37 @@ class MemoryService:
         current_meta["archived_at"] = now_ts
         current_meta["archive_reason"] = reason
         repo.update(memory, metadata_json=current_meta)
+        self._mark_memory_graph(memory.user_id, memory.id, "archived", reason)
         self._delete_memory_vector(memory.id)
         return self._to_dict(memory)
+
+    def _sync_memory_graph(self, user_id: int, memory: Any) -> dict[str, Any]:
+        try:
+            from src.web_app.graph.memory_projector import memory_graph_projector
+            return memory_graph_projector.sync_memory(user_id=user_id, memory=memory)
+        except Exception as exc:
+            logger.warning("memory.graph_sync_failed user_id=%s error=%s", user_id, exc, exc_info=True)
+            return {"synced": False, "warning": str(exc)[:200]}
+
+    def _mark_memory_graph(self, user_id: int, memory_id: int | str, status: str, reason: str) -> str | None:
+        try:
+            from src.web_app.graph.memory_projector import memory_graph_projector
+            result = memory_graph_projector.mark_memory_status(
+                user_id=user_id,
+                memory_id=memory_id,
+                status=status,
+                reason=reason,
+            )
+            return result.get("warning")
+        except Exception as exc:
+            logger.warning(
+                "memory.graph_status_failed user_id=%s memory_id=%s error=%s",
+                user_id,
+                memory_id,
+                exc,
+                exc_info=True,
+            )
+            return str(exc)[:200]
 
     def forget_by_importance(self, user_id: int, threshold: float = 0.2, memory_type: str | None = None, db: Session | None = None) -> dict[str, Any]:
         """Archive memories with importance below threshold. Skips protected memories."""
@@ -561,11 +662,11 @@ class MemoryService:
             saved["working"].append(result)
             save_results.append(result)
 
-        # episodic: importance>=0.65 AND confidence>=0.65
+        # episodic implicit auto-write: high confidence only
         for mem in extraction.get("episodic_memories", []):
             importance = mem.get("importance", 0.5)
             confidence = mem.get("confidence", 0.80)
-            if importance < 0.65 or confidence < 0.65:
+            if importance < 0.85 or confidence < 0.80:
                 filtered_out["episodic"] += 1; continue
             result = self.add_with_dedup(user_id, mem["content"], memory_type="episodic",
                 importance=importance,
@@ -576,11 +677,11 @@ class MemoryService:
                 saved["episodic"].append(result)
                 save_results.append(result)
 
-        # semantic: importance>=0.70 AND confidence>=0.65
+        # semantic implicit auto-write: high confidence only
         for mem in extraction.get("semantic_memories", []):
             importance = mem.get("importance", 0.8)
             confidence = mem.get("confidence", 0.80)
-            if importance < 0.70 or confidence < 0.65:
+            if importance < 0.88 or confidence < 0.85:
                 filtered_out["semantic"] += 1; continue
             result = self.add_with_dedup(user_id, mem["content"], memory_type="semantic",
                 importance=importance,

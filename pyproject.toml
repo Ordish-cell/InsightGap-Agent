@@ -63,6 +63,7 @@ dependencies = [
     "feedparser>=6.0.11",
     "python-docx>=1.1.0",
     "openpyxl>=3.1.0",
+    "neo4j>=5.28.1",
 ]
 
 [project.optional-dependencies]

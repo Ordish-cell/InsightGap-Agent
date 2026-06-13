@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from src.web_app.agent.runtime import AgentRuntime
 from src.web_app.agent.runtime.checkpoint import record_event
 from src.web_app.agent.runtime.events import queue_stream_event as _queue_stream_event
+from src.web_app.agent.runtime.latency import build_runtime_latency_trace
 from src.web_app.agent.runtime.visible_thoughts import visible_thought_texts
 from src.web_app.db.repositories.agent_repository import (
     AgentChatMessageRepository,
@@ -551,6 +552,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                 enriched_payload["page_context"] = page_context
 
             state = await AgentRuntime(db, enriched_payload).run({"user_id": user_id, "run_id": run.id, "thread_id": thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "_stream_queue": stream_queue, "_answer_started_emitted": False, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
+            _inject_conversation_history_snapshot(state, db, user_id, conversation_id)
         except Exception as exc:
             state = {
                 "user_id": user_id,
@@ -581,9 +583,11 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         final_payload["answer"] = answer
         final_payload.setdefault("thinking_summary", visible_thought_texts(state))
         final_payload.setdefault("visible_thoughts", state.get("visible_thoughts", []))
+        final_payload.setdefault("pipeline_steps", state.get("pipeline_steps", []))
         final_payload.setdefault("run_id", str(run.id))
         final_payload.setdefault("thread_id", thread_id)
         final_payload.setdefault("conversation_id", conversation_id)
+        _attach_runtime_latency_trace(state, final_payload, elapsed_ms)
         state["final_payload"] = final_payload
         langgraphstatus = dict(state.get("langgraphstatus") or {})
         langgraphstatus.update(
@@ -603,6 +607,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         is_waiting = state.get("approval_required") or state.get("status") == "waiting_approval"
         is_failed = state.get("status") == "failed"
         run_status = state.get("status", "completed")
+        _emit_runtime_latency_trace_event(db, stream_queue, run.id, thread_id, user_id, state)
 
         if is_waiting:
             # ── Paused: save resume context, mark waiting ─────────
@@ -642,6 +647,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                     "run_id": run.id,
                     "final_response": _json_safe(final_payload),
                     "visible_thoughts": _json_safe(state.get("visible_thoughts", [])),
+                    "pipeline_steps": _json_safe(final_payload.get("pipeline_steps", [])),
                     "_resume": resume_data,
                     "approval_required": True,
                 },
@@ -692,7 +698,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                 langgraphstatus_json=_json_safe(langgraphstatus),
                 steps_json=_json_safe(steps),
                 error_message=state.get("error", ""),
-                metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", []))},
+                metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", [])), "pipeline_steps": _json_safe(final_payload.get("pipeline_steps", []))},
             )
             conversation_repo.touch(
                 conversation,
@@ -727,7 +733,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                 langgraphstatus_json=_json_safe(langgraphstatus),
                 steps_json=_json_safe(steps),
                 error_message=state.get("error", ""),
-                metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", []))},
+                metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", [])), "pipeline_steps": _json_safe(final_payload.get("pipeline_steps", []))},
             )
             conversation_repo.touch(
                 conversation,
@@ -761,6 +767,33 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
 
 def run_agent(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     return asyncio.run(run_agent_async(db, user_id, payload))
+
+
+def _attach_runtime_latency_trace(state: dict[str, Any], final_payload: dict[str, Any], elapsed_ms: int) -> None:
+    latency = build_runtime_latency_trace(state, elapsed_ms=elapsed_ms)
+    state["runtime_latency_trace"] = latency["runtime_latency_trace"]
+    state["runtime_latency_warnings"] = latency["runtime_latency_warnings"]
+    state["runtime_slow_path_hints"] = latency["runtime_slow_path_hints"]
+    final_payload["runtime_latency_trace"] = state["runtime_latency_trace"]
+    final_payload["runtime_latency_warnings"] = state["runtime_latency_warnings"]
+    final_payload["runtime_slow_path_hints"] = state["runtime_slow_path_hints"]
+
+
+def _emit_runtime_latency_trace_event(
+    db: Session,
+    stream_queue: asyncio.Queue | None,
+    run_id: int,
+    thread_id: str,
+    user_id: int,
+    state: dict[str, Any],
+) -> None:
+    payload = {
+        "runtime_latency_trace": state.get("runtime_latency_trace", {}),
+        "runtime_latency_warnings": state.get("runtime_latency_warnings", []),
+        "runtime_slow_path_hints": state.get("runtime_slow_path_hints", []),
+    }
+    record_event(db, run_id, "runtime_latency_trace", payload, user_id=user_id, thread_id=thread_id)
+    _queue_stream_event(stream_queue, "runtime_latency_trace", payload, run_id=run_id, thread_id=thread_id)
 
 
 async def stream_agent_run(db: Session, user_id: int, payload: dict[str, Any]):
@@ -1168,6 +1201,8 @@ async def resume_run_after_approval(
     final_payload["answer"] = answer
     final_payload.setdefault("thinking_summary", visible_thought_texts(state))
     final_payload.setdefault("visible_thoughts", state.get("visible_thoughts", []))
+    final_payload.setdefault("pipeline_steps", state.get("pipeline_steps", []))
+    _attach_runtime_latency_trace(state, final_payload, elapsed_ms)
     state["final_payload"] = final_payload
 
     langgraphstatus = dict(state.get("langgraphstatus") or {})
@@ -1240,6 +1275,7 @@ async def resume_run_after_approval(
                 "run_id": run_id,
                 "final_response": _json_safe(final_payload),
                 "visible_thoughts": _json_safe(state.get("visible_thoughts", [])),
+                "pipeline_steps": _json_safe(final_payload.get("pipeline_steps", [])),
             },
         )
 
@@ -1281,6 +1317,7 @@ async def resume_run_after_approval(
 
     already_streamed = state.get("_answer_delta_emitted", False)
     await _stream_answer_deltas(db, stream_queue, run_id, thread_id, user_id, answer, already_streamed=already_streamed)
+    _emit_runtime_latency_trace_event(db, stream_queue, run_id, thread_id, user_id, state)
     record_event(db, run_id, "run_completed", {"status": final_status, "answer": answer}, user_id=user_id, thread_id=thread_id)
     _queue_stream_event(stream_queue, "run_completed", {
         "status": final_status,
@@ -1403,6 +1440,7 @@ def get_run(db: Session, user_id: int, run_id: int) -> dict[str, Any]:
         "final_answer": run.final_answer,
         "final_response": final_response,
         "visible_thoughts": final_response.get("visible_thoughts") or graph_state.get("visible_thoughts", []),
+        "pipeline_steps": final_response.get("pipeline_steps") or graph_state.get("pipeline_steps", []),
         "thinking_summary": final_response.get("thinking_summary") or visible_thought_texts(graph_state),
         "langgraphstatus": run.langgraphstatus_json or graph_state.get("langgraphstatus", {}),
         "elapsed_ms": run.elapsed_ms,
@@ -1740,6 +1778,55 @@ def sanitize_resume_final_state(
     return state
 
 
+def _inject_conversation_history_snapshot(
+    state: dict[str, Any],
+    db: Session,
+    user_id: int,
+    conversation_id: str,
+) -> None:
+    if not conversation_id:
+        return
+    context = state.setdefault("context", {})
+    if not isinstance(context, dict):
+        context = {}
+        state["context"] = context
+    if context.get("conversation_history"):
+        return
+    try:
+        recent_messages = AgentChatMessageRepository(db).list_recent_by_conversation(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            limit=12,
+        )
+    except Exception:
+        return
+    history = _format_chat_messages_for_context(recent_messages)
+    if history:
+        context["conversation_history"] = history
+        existing_gssc = str(context.get("gssc_context") or "")
+        if "[Conversation History]" not in existing_gssc:
+            context["gssc_context"] = (
+                f"{existing_gssc}\n\n[Conversation History]\n{history}"
+                if existing_gssc
+                else f"[Conversation History]\n{history}"
+            )
+
+
+def _format_chat_messages_for_context(messages: list[Any]) -> str:
+    lines: list[str] = []
+    for msg in messages:
+        role = str(getattr(msg, "role", "") or "")
+        content = str(getattr(msg, "content", "") or "").strip()
+        if not content:
+            continue
+        label = "User" if role == "user" else "Assistant" if role == "assistant" else role.capitalize() or "Message"
+        max_len = 1200 if role == "assistant" else 600
+        if len(content) > max_len:
+            content = content[:max_len] + "..."
+        lines.append(f"{label}: {content}")
+    return "\n\n".join(lines)
+
+
 def build_user_facing_answer(state: dict[str, Any]) -> str:
     import logging
     _log = logging.getLogger(__name__)
@@ -1910,6 +1997,7 @@ def _run_response(
     final_response["answer"] = answer
     final_response.setdefault("thinking_summary", visible_thought_texts(state))
     final_response.setdefault("visible_thoughts", state.get("visible_thoughts", []))
+    final_response.setdefault("pipeline_steps", state.get("pipeline_steps", []))
     return {
         "run_id": run_id,
         "conversation_id": state.get("conversation_id", ""),
@@ -1926,6 +2014,7 @@ def _run_response(
         "final_response": final_response,
         "final_payload": final_response,
         "visible_thoughts": state.get("visible_thoughts", []),
+        "pipeline_steps": final_response.get("pipeline_steps", []),
         "thinking_summary": visible_thought_texts(state),
         "langgraphstatus": state.get("langgraphstatus", {}),
         "user_message": _message_response(user_message) if user_message else None,
@@ -1943,11 +2032,15 @@ def _run_response(
         "tool_call": state.get("tool_call", {}),
         "tool_result": state.get("tool_result"),
         "evaluation": state.get("evaluation", {}),
+        "evaluation_result": state.get("evaluation_result", {}),
+        "final_response_constraints": state.get("final_response_constraints", []),
+        "final_warnings": state.get("final_warnings", []),
         "errors": state.get("errors", []),
         "error": state.get("error", ""),
         "approval_required": state.get("approval_required", False),
         "approval_payload": state.get("approval_payload"),
         "agent_outputs": state.get("agent_outputs", []),
+        "agent_results": state.get("agent_results", []),
     }
 
 

@@ -39,7 +39,37 @@ function asThoughtText(value: unknown): string {
   return String(item.text || item.summary || '').trim()
 }
 
+function asPipelineText(value: unknown): string {
+  const item = asRecord(value)
+  const title = String(item.title || item.key || '').trim()
+  const detail = String(item.detail || item.summary || '').trim()
+  if (!title && !detail) return ''
+  return detail && detail !== title ? `${title} · ${detail}` : title || detail
+}
+
+function collectPipelineSteps(message: AgentThoughtStreamProps['message']) {
+  const metadata = asRecord(message.metadata)
+  const finalResponse = asRecord(metadata.final_response)
+  const sources = [
+    finalResponse.pipeline_steps,
+    metadata.pipeline_steps,
+    (message as unknown as UnknownRecord).pipeline_steps,
+  ]
+  const items: string[] = []
+  sources.forEach((source) => {
+    if (!Array.isArray(source)) return
+    source.forEach((item) => {
+      const content = asPipelineText(item)
+      if (content && !items.includes(content)) items.push(content)
+    })
+  })
+  return items
+}
+
 function collectVisibleThoughts(message: AgentThoughtStreamProps['message']) {
+  const pipelineSteps = collectPipelineSteps(message)
+  if (pipelineSteps.length) return pipelineSteps
+
   const items: string[] = []
   const push = (value: unknown) => {
     const content = asThoughtText(value)

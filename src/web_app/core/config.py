@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     neo4j_max_connection_pool_size: int = 50
     neo4j_connection_timeout: int = 60
     enable_neo4j: bool = False
+    neo4j_memory_graph_enabled: bool = True
+    neo4j_project_graph_enabled: bool = True
+    neo4j_context_enabled: bool = True
+    neo4j_write_mode: str = "best_effort"
+    neo4j_project_key: str = "agent_os"
+    neo4j_graph_context_limit: int = 8
     embed_model_type: str = "dashscope"
     embed_model_name: str = "text-embedding-v4"
     embed_api_key: str = ""
@@ -165,6 +171,12 @@ class Settings(BaseSettings):
     agent_langgraph_status_enabled: bool = True
     agent_langgraph_status_max_steps: int = 12
     agent_chat_real_messages_enabled: bool = True
+    agent_supervisor_enabled: bool = True
+    agent_supervisor_shadow_policy_enabled: bool = True
+    agent_supervisor_shadow_metrics_enabled: bool = True
+    agent_supervisor_control_enabled: bool = False
+    agent_replanner_control_enabled: bool = False
+    agent_langgraph_checkpointer_enabled: bool = False
     # Qwen model tier configuration
     qwen_fast_model: str = "qwen3.6-max-preview"
     qwen_balanced_model: str = "qwen3.6-plus"

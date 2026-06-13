@@ -159,12 +159,61 @@ _CONVERSATION_RECALL_PATTERNS = [
     "你还记得我问过", "你还记得我", "我提到过",
 ]
 
+_CONVERSATION_RECALL_LITERALS = (
+    "我前面问过", "我之前问过", "我刚才问过", "我刚刚问过",
+    "前面问过", "之前问过", "刚才问过", "刚刚问过",
+    "问过你啥", "问过你什么", "我问过你", "我前面问",
+    "我之前问", "我刚才问", "会话记忆", "会话历史", "历史记录",
+    "分析一下我的意图", "分析我的意图", "分析下我的意图",
+)
+
+
+def _looks_like_conversation_recall(text: str) -> bool:
+    normalized = (text or "").strip().lower()
+    if not normalized:
+        return False
+    if any(literal in normalized for literal in _CONVERSATION_RECALL_LITERALS):
+        return True
+    current_context_terms = (
+        "刚才", "刚刚", "前面", "之前", "上一条", "上一轮",
+        "这个会话", "当前会话", "我们聊",
+    )
+    recall_verbs = ("记得", "记忆", "历史", "问过", "说过", "聊过")
+    return any(term in normalized for term in current_context_terms) and any(
+        verb in normalized for verb in recall_verbs
+    )
+
+
+def _is_project_diagnostic_question(user_input: str) -> bool:
+    text = (user_input or "").lower()
+    has_failure = any(term in text for term in (
+        "\u5931\u8d25",  # 失败
+        "\u62a5\u9519",  # 报错
+        "\u9519\u8bef",  # 错误
+        "\u6392\u67e5",  # 排查
+        "\u770b\u54ea\u4e9b\u6a21\u5757",  # 看哪些模块
+        "\u54ea\u4e9b\u6a21\u5757",  # 哪些模块
+        "diagnostic", "troubleshoot", "failed", "error",
+    ))
+    has_project_area = any(term in text for term in (
+        "\u4e0a\u4f20",  # 上传
+        "\u6587\u6863",  # 文档
+        "\u6587\u4ef6",  # 文件
+        "\u5165\u5e93",  # 入库
+        "\u6444\u5165",  # 摄入
+        "embedding", "qdrant", "rag",
+        "upload", "document", "ingest",
+    ))
+    return has_failure and has_project_area
+
 # ── Public entry point ──────────────────────────────────────────────
 
 
 def _infer_answer_mode(intent: str, user_input: str, *, is_memory_write: bool = False,
                         is_tech_stack: bool = False, is_name_pref: bool = False,
                         is_advice_question: bool = False,
+                        is_project_diagnostic: bool = False,
+                        is_conversation_recall: bool = False,
                         home_intent: dict[str, Any] | None = None) -> str:
     """Derive answer_mode from intent + input patterns + optional LLM hint.
 
@@ -172,6 +221,8 @@ def _infer_answer_mode(intent: str, user_input: str, *, is_memory_write: bool = 
     - How final_response phrases the answer (memory_confirm → "已记住")
     - Which memory categories ContextBuilder injects (MEMORY_CONTEXT_POLICY)
     """
+    if is_conversation_recall:
+        return "conversation_recall"
     if is_memory_write or is_name_pref:
         return "memory_confirm"
     if is_tech_stack and not is_advice_question:
@@ -189,6 +240,8 @@ def _infer_answer_mode(intent: str, user_input: str, *, is_memory_write: bool = 
     if intent == "artifact":
         return "project_advice"
     if intent == "chat":
+        if is_project_diagnostic:
+            return "project_advice"
         # Tech stack / memory-like declaration + advice question → project_advice
         if (is_tech_stack or is_name_pref) and is_advice_question:
             return "project_advice"
@@ -249,9 +302,17 @@ def plan_route(
     is_tool = any(term in text for term in _TOOL_TERMS) or any(term in text for term in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "打开网页", "删除", "支付", "付款", "转账"]) or any(_has_english_term(text, kw) for kw in _EN_TOOL_KEYWORDS)
     is_memory = any(term in text for term in _MEMORY_TERMS)
     is_skill = any(term in text for term in _SKILL_TERMS)
+    is_project_diagnostic = _is_project_diagnostic_question(user_input)
     _has_explicit_research_request = any(
         pattern in text for pattern in _RESEARCH_REQUEST_PATTERNS
     )
+    if is_project_diagnostic and not forced:
+        is_research = False
+        is_rag = False
+        is_artifact = False
+        is_tool = False
+        intent = "chat"
+        reasons.append("project_diagnostic_graph_context")
 
     # ── Memory-guard: suppress tool detection for memory/context declarations ──
     _memory_prefixes = (
@@ -320,7 +381,7 @@ def plan_route(
 
     # Conversation recall: "what did I just ask?" — must NOT trigger research/rag
     import re as _re
-    is_conversation_recall = any(
+    is_conversation_recall = _looks_like_conversation_recall(text) or any(
         _re.search(pattern, text) for pattern in _CONVERSATION_RECALL_PATTERNS
     )
     # Explicit memory write request — highest priority, overrides research/rag/artifact
@@ -330,7 +391,10 @@ def plan_route(
     _tool_intents = {"tool", "tool.email", "tool.local_file", "tool.browser", "tool.comment", "tool.form_submit", "tool.shell_readonly", "tool.shell_write", "tool.dangerous"}
     # Declaration + advice question → project_advice; LLM must not override to research.
     _is_declaration_advice = (_is_tech_stack or _is_memory_like) and _has_advice_question and not _has_explicit_research_request
-    _llm_override_blocked = _is_declaration_advice and llm_intent in ("research", "feed_research", "mixed", "rag")
+    _llm_override_blocked = (
+        (_is_declaration_advice or is_project_diagnostic)
+        and llm_intent in ("research", "feed_research", "mixed", "rag")
+    )
     if not forced and llm_intent in {"chat", "research", "rag", "artifact", "feed_research", "memory", "skill", "mixed"} | _tool_intents and not _llm_override_blocked:
         intent = llm_intent  # type: ignore[assignment]
         reasons.append("home_intent_used")
@@ -425,7 +489,7 @@ def plan_route(
             route = ["rag_agent"]  # only rag, no research/artifact
 
     # Post-execution: memory/skill BEFORE evaluator (so evaluator can score them)
-    if intent not in ("chat", "document_qa"):
+    if intent in ("memory", "memory_confirm"):
         route.append("memory_agent")
     if is_skill or intent == "skill":
         route.append("skill_agent")
@@ -507,7 +571,8 @@ def plan_route(
         if llm_risk in {"L0", "L1", "L2", "L3", "L4"}:
             risk_level = _max_risk(risk_level, llm_risk)  # type: ignore[arg-type]
         needs_approval = needs_approval or risk_level in {"L3", "L4"} or bool(home_intent.get("needs_approval"))
-        route = _merge_route(route, home_intent.get("suggested_route_hints") or home_intent.get("required_agents") or [])
+        if not is_project_diagnostic:
+            route = _merge_route(route, home_intent.get("suggested_route_hints") or home_intent.get("required_agents") or [])
         reasons.append("risk_guard_applied")
 
     # Expected output
@@ -537,9 +602,17 @@ def plan_route(
         is_memory_write=is_memory_write,
         is_tech_stack=_is_tech_stack,
         is_name_pref=_is_name_preference,
-        is_advice_question=_has_advice_question,
+        is_advice_question=_has_advice_question or is_project_diagnostic,
+        is_project_diagnostic=is_project_diagnostic,
+        is_conversation_recall=is_conversation_recall,
         home_intent=home_intent,
     )
+    if answer_mode == "conversation_recall":
+        route = [item for item in route if item not in {"memory_agent", "rag_agent", "research_agent", "artifact_agent", "tool_agent"}]
+        if "evaluator" not in route:
+            route.append("evaluator")
+        if "final_response" not in route:
+            route.append("final_response")
     route_plan: RoutePlan = {
         "intent": intent,
         "route": route,
@@ -548,6 +621,10 @@ def plan_route(
         "expected_output": expected_output_map.get(intent, "answer"),
         "reason": "; ".join(reasons) if reasons else "default_chat_route",
         "answer_mode": answer_mode,
+        "explicit_research": bool(_has_explicit_research_request),
+        "research_mode": "deep" if _has_explicit_research_request and "research_agent" in route else ("fallback" if "research_agent" in route else "none"),
+        "memory_context_loader": answer_mode != "conversation_recall",
+        "memory_writer_planned": "memory_agent" in route,
     }
     return route_plan
 

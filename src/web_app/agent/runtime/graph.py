@@ -1,4 +1,4 @@
-"""Supervisor Agent Runtime — LangGraph multi-agent orchestration.
+"""Supervisor Agent Runtime - LangGraph multi-agent orchestration.
 
 Routes user requests through a Planner, then executes the resulting
 RoutePlan through conditional agent nodes (research, RAG, artifact,
@@ -15,14 +15,21 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from src.web_app.agent.runtime.checkpointers import build_checkpointer
+from src.web_app.agent.runtime.dispatch import (
+    END_SENTINEL as _END_SENTINEL,
+    after_permission,
+    dispatch_next_route_node,
+    map_route_to_node,
+    record_supervisor_dispatch_audit,
+)
 from src.web_app.agent.runtime.fallback import run_fallback
-from src.web_app.agent.runtime.intent_schema import normalize_agent_name
+from src.web_app.agent.runtime.graph_builder import build_agent_runtime_graph
+from src.web_app.agent.runtime.graph_config import build_langgraph_invoke_config
+from src.web_app.agent.runtime.graph_registry import build_fallback_nodes
 from src.web_app.agent.runtime.nodes import RuntimeNodes
-from src.web_app.agent.runtime.state import AgentRuntimeState, append_output
-
-# Sentinel key used by conditional edges to terminate the graph immediately
-# (true interrupt — no evaluator, no final_response).
-_END_SENTINEL = "__end__"
+from src.web_app.agent.runtime.state import AgentRuntimeState
+from src.web_app.core.config import settings
 
 
 class AgentRuntime:
@@ -36,13 +43,7 @@ class AgentRuntime:
         if graph:
             return await graph.ainvoke(
                 state,
-                config={
-                    "configurable": {
-                        "thread_id": state.get("thread_id") or f"user:{state.get('user_id')}:run:{state.get('run_id')}",
-                        "user_id": state.get("user_id"),
-                        "run_id": state.get("run_id"),
-                    }
-                },
+                config=build_langgraph_invoke_config(state),
             )
         return await run_fallback(self._fallback_nodes(), state)
 
@@ -69,14 +70,14 @@ class AgentRuntime:
         state.setdefault("resolved_tool_call_ids", [])
         state["status"] = "resuming"
         state["approval_required"] = False
-        # ── Purge stale pause artifacts ──────────────────────────
+        # Purge stale pause artifacts.
         state["approval_payload"] = None
         state["route"] = ""  # prevent evaluator from reverting to waiting_approval
         state["error"] = state.get("_tool_error") or ""  # only carry real tool errors
         # Clean tool_call error so "approval_required" doesn't leak as failure reason
         tc = state.get("tool_call") or {}
         if isinstance(tc, dict):
-            tc["error"] = ""  # always clean — never carry approval_required forward
+            tc["error"] = ""  # always clean; never carry approval_required forward
             state["tool_call"] = tc
 
         _log.info(
@@ -103,144 +104,40 @@ class AgentRuntime:
         return result
 
     def _fallback_nodes(self):
-        return [
-            self.nodes.permission_guard,
-            self.nodes.home_intent_react,
-            self.nodes.planner,
-            self.nodes.context_builder,
-            self.nodes.skill_matcher,
-            self.nodes.research,
-            self.nodes.rag,
-            self.nodes.artifact,
-            self.nodes.skill_librarian,
-            self.nodes.tool,
-            self.nodes.memory_writer,
-            self.nodes.skill_draft_detector,
-            self.nodes.evaluator,
-            self.nodes.final_response,
-        ]
+        return build_fallback_nodes(self.nodes)
 
     def _build_langgraph(self):
-        try:
-            from langgraph.graph import END, StateGraph
-        except Exception:
-            return None
-
-        workflow = StateGraph(AgentRuntimeState)
-
-        # ── Register all nodes ────────────────────────────────────
-        workflow.add_node("permission_guard", self.nodes.permission_guard)
-        workflow.add_node("home_intent_react", self.nodes.home_intent_react)
-        workflow.add_node("planner", self.nodes.planner)
-        workflow.add_node("context_builder", self.nodes.context_builder)
-        workflow.add_node("skill_matcher", self.nodes.skill_matcher)
-        workflow.add_node("research_agent", self.nodes.research_agent)
-        workflow.add_node("rag_agent", self.nodes.rag_agent)
-        workflow.add_node("artifact_agent", self.nodes.artifact_agent)
-        workflow.add_node("tool_agent", self.nodes.tool_agent)
-        workflow.add_node("memory_agent", self.nodes.memory_agent)
-        workflow.add_node("skill_agent", self.nodes.skill_agent)
-        workflow.add_node("evaluator", self.nodes.evaluator)
-        workflow.add_node("final_response", self.nodes.final_response)
-
-        # ── Shared route destinations (including END for true interrupt) ──
-        _route_dests = {
-            "research_agent": "research_agent",
-            "rag_agent": "rag_agent",
-            "artifact_agent": "artifact_agent",
-            "tool_agent": "tool_agent",
-            "memory_agent": "memory_agent",
-            "skill_agent": "skill_agent",
-            "evaluator": "evaluator",
-            "final_response": "final_response",
-            _END_SENTINEL: END,
-        }
-
-        # ── Edges ─────────────────────────────────────────────────
-        workflow.set_entry_point("permission_guard")
-
-        # After permission check: if blocked/approval → final_response, else → planner
-        workflow.add_conditional_edges(
-            "permission_guard",
-            self._after_permission,
-            {"continue": "home_intent_react", "done": "final_response"},
+        checkpointer = None
+        if getattr(settings, "agent_langgraph_checkpointer_enabled", False):
+            checkpointer = build_checkpointer(getattr(settings, "redis_url", None))
+        return build_agent_runtime_graph(
+            self.nodes,
+            after_permission=self._after_permission,
+            dispatch_next_route_node=self._dispatch_next_route_node,
+            checkpointer=checkpointer,
         )
 
-        # Planner → context_builder
-        workflow.add_edge("home_intent_react", "planner")
-        workflow.add_edge("planner", "context_builder")
-
-        # Context → skill_matcher
-        workflow.add_edge("context_builder", "skill_matcher")
-
-        # After skill_matcher: dispatch to first agent in route_plan
-        workflow.add_conditional_edges(
-            "skill_matcher",
-            self._dispatch_next_route_node,
-            _route_dests,
-        )
-
-        # After each agent: dispatch to next route node (or END on interrupt)
-        for agent_name in ("research_agent", "rag_agent", "artifact_agent",
-                           "tool_agent", "memory_agent", "skill_agent"):
-            workflow.add_conditional_edges(
-                agent_name,
-                self._dispatch_next_route_node,
-                _route_dests,
-            )
-
-        # Evaluator → final_response (memory/skill agents run BEFORE evaluator)
-        workflow.add_edge("evaluator", "final_response")
-
-        # Final response → END
-        workflow.add_edge("final_response", END)
-
-        return workflow.compile()
-
-    # ── Conditional routing ──────────────────────────────────────
+    # Conditional routing.
 
     def _after_permission(self, state: AgentRuntimeState) -> str:
-        if state.get("route") in {"approval", "blocked"} or state.get("error"):
-            return "done"
-        return "continue"
+        return after_permission(state)
 
     def _dispatch_next_route_node(self, state: AgentRuntimeState) -> str:
         """Pop the next node from route_plan["route"] and return its name.
 
         When the run is waiting for approval, the graph performs a true
         interrupt: we return __end__ which maps to END, terminating the
-        graph immediately.  No evaluator, no final_response — the
+        graph immediately.  No evaluator, no final_response - the
         agent_service layer detects the paused state and emits
         approval_required / run_paused.
 
         Falls back to 'final_response' when all route nodes are completed.
         """
-        if state.get("status") == "waiting_approval":
-            return _END_SENTINEL  # true interrupt → END
+        return dispatch_next_route_node(state)
 
-        route_plan = state.get("route_plan") or {}
-        route_list = list(route_plan.get("route", []))
-        completed = list(state.get("completed_nodes", []))
-
-        for node_name in route_list:
-            if node_name not in completed:
-                return self._map_route_to_node(node_name)
-
-        return "final_response"
+    def _record_supervisor_dispatch_audit(self, state: AgentRuntimeState, legacy_next_node: str) -> str:
+        return record_supervisor_dispatch_audit(state, legacy_next_node)
 
     def _map_route_to_node(self, route_item: str) -> str:
         """Map a route_plan route item to a registered graph node name."""
-        normalized = normalize_agent_name(route_item)
-        mapping = {
-            "context_builder": "context_builder",
-            "skill_matcher": "skill_matcher",
-            "research_agent": "research_agent",
-            "rag_agent": "rag_agent",
-            "artifact_agent": "artifact_agent",
-            "tool_agent": "tool_agent",
-            "memory_agent": "memory_agent",
-            "skill_agent": "skill_agent",
-            "evaluator": "evaluator",
-            "final_response": "final_response",
-        }
-        return mapping.get(normalized, mapping.get(route_item, "final_response"))
+        return map_route_to_node(route_item)

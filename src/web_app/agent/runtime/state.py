@@ -15,6 +15,8 @@ class RoutePlan(TypedDict, total=False):
     expected_output: str
     reason: str
     answer_mode: str  # memory_confirm / general_qa / project_advice / rag_qa / tool_action / casual / chat
+    explicit_research: bool
+    research_mode: str
 
 
 class MemorySaveResult(TypedDict, total=False):
@@ -46,11 +48,47 @@ class AgentRuntimeState(TypedDict, total=False):
 
     # ── Planner output ─────────────────────────────────────────────
     route_plan: RoutePlan
+    execution_plan: dict[str, Any]
+    prefetch_results: dict[str, Any]
+    prefetch_warnings: list[str]
+    prefetch_elapsed_ms: int
+    prefetch_agent_results: list[dict[str, Any]]
+    parallel_read_results: dict[str, Any]
+    parallel_read_warnings: list[str]
+    parallel_read_elapsed_ms: int
+    parallel_read_branch_timings: dict[str, int]
+    supervisor_decision: dict[str, Any]
+    supervisor_warnings: list[str]
+    supervisor_trace: list[dict[str, Any]]
+    supervisor_dispatch_audit: dict[str, Any]
+    supervisor_dispatch_warnings: list[str]
+    supervisor_shadow_policy: dict[str, Any]
+    supervisor_policy_warnings: list[str]
+    supervisor_shadow_metrics: dict[str, Any]
+    supervisor_readiness_report: dict[str, Any]
+    supervisor_readiness_warnings: list[str]
+    supervisor_control_decision: dict[str, Any]
+    supervisor_control_warnings: list[str]
+    runtime_latency_trace: dict[str, Any]
+    runtime_latency_warnings: list[str]
+    runtime_slow_path_hints: list[str]
+    runtime_contract_report: dict[str, Any]
+    runtime_contract_warnings: list[str]
+    pipeline_steps: list[dict[str, Any]]
+    replanner_shadow_report: dict[str, Any]
+    replanner_shadow_warnings: list[str]
+    replanner_shadow_metrics: dict[str, Any]
+    replanner_candidate_plan: dict[str, Any]
+    replanner_candidate_warnings: list[str]
+    replanner_control_decision: dict[str, Any]
+    replanner_control_warnings: list[str]
     home_intent: dict[str, Any]
     langgraphstatus: dict[str, Any]
     current_node: str
     completed_nodes: list[str]
     errors: list[dict[str, Any]]
+    node_results: list[dict[str, Any]]
+    node_warnings: list[str]
     answer_mode: str  # memory_confirm / general_qa / project_advice / rag_qa / tool_action / casual / chat
 
     # ── Permission ─────────────────────────────────────────────────
@@ -66,6 +104,8 @@ class AgentRuntimeState(TypedDict, total=False):
     context_packets: list[dict[str, Any]]
     selected_memories: list[dict[str, Any]]
     matched_skills: list[dict[str, Any]]
+    conversation_recall_context: dict[str, Any]
+    memory_context: dict[str, Any]
 
     # ── Agent outputs (structured) ─────────────────────────────────
     research_result: dict[str, Any] | None
@@ -75,11 +115,15 @@ class AgentRuntimeState(TypedDict, total=False):
     memory_result: dict[str, Any] | None
     skill_result: dict[str, Any] | None
     evaluation_result: dict[str, Any] | None
+    final_response_constraints: list[str]
+    final_warnings: list[str]
     memory_candidates: list[dict[str, Any]]  # items the agent intended to save
     memory_save_results: list[dict[str, Any]]  # structured per-item write status (MemorySaveResult-shaped)
+    memory_write_decision: dict[str, Any]
 
     # ── Agent outputs (list form) ──────────────────────────────────
     agent_outputs: list[dict[str, Any]]
+    agent_results: list[dict[str, Any]]
     tool_calls: list[dict[str, Any]]
     artifacts: list[dict[str, Any]]
     memory_updates: list[dict[str, Any]]
