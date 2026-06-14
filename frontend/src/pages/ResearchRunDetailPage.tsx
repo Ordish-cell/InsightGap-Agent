@@ -94,7 +94,7 @@ export function ResearchRunDetailPage() {
         }
 
         timerRef.current = window.setTimeout(poll, POLL_INTERVAL_MS)
-      } catch (_err) {
+      } catch {
         if (cancelled) return
         failuresRef.current += 1
 
@@ -145,7 +145,6 @@ export function ResearchRunDetailPage() {
   const meta = run.metadata as ResearchRunMetadata | undefined
   const engine = engineLabel(meta, run.status)
   const isRunning = run.status === 'running'
-  const isCompleted = run.status === 'completed'
   const isFailed = run.status === 'failed'
   const isFallback = meta?.used_fallback === true
   const isOdr = meta?.source === 'open_deep_research' || meta?.engine === 'open_deep_research'

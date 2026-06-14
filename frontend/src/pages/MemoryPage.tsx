@@ -2,7 +2,7 @@ import { FormEvent, useCallback, useEffect, useState } from 'react'
 
 import { apiRequest } from '../api/client'
 import * as memory from '../api/memory'
-import type { LongTermMemoryItem, LongTermMemoryListResponse, MemoryItem, MemorySummary } from '../api/types'
+import type { LongTermMemoryItem, MemoryItem, MemorySummary } from '../api/types'
 import { ConfirmModal } from '../components/common/ConfirmModal'
 import { EmptyState } from '../components/common/EmptyState'
 import { ErrorState } from '../components/common/ErrorState'
@@ -147,7 +147,7 @@ export function MemoryPage() {
     })
   }
   async function handleImportanceChange(id: number, value: number) {
-    try { await memory.updateMemory(id, { importance: Math.max(0, Math.min(1, value)) }); void loadLongTerm() } catch (e) { /* ignore */ }
+    try { await memory.updateMemory(id, { importance: Math.max(0, Math.min(1, value)) }); void loadLongTerm() } catch { /* ignore */ }
   }
 
   const totalPages = Math.max(1, Math.ceil(ltTotal / ltPageSize))

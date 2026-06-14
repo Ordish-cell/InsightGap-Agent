@@ -768,7 +768,6 @@ export function AgentChatPanel({
         streamRef.current?.close()
         setRunning(true)
 
-        const resumeAssistantId = `resume-${runId}-${Date.now()}`
         let resumeContent = ''
         streamRef.current = agent.createRunResumeStream(runId, {
           onMessage: (message) => {
