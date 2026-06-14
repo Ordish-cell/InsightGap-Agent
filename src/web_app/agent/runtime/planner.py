@@ -31,6 +31,29 @@ _RAG_TERMS = [
     "rag", "RAG", "vector", "qdrant", "总结重点", "整理要点",
 ]
 
+_BROAD_DOCUMENT_REFERENCE_TERMS = {
+    "上传",
+    "文档",
+    "文件",
+    "附件",
+    "document",
+    "file",
+    "attachment",
+}
+
+
+def _has_term_match(
+    text: str,
+    terms: list[str],
+    *,
+    ignore_broad_document_terms: bool = False,
+) -> bool:
+    return any(
+        term in text
+        and not (ignore_broad_document_terms and term.lower() in _BROAD_DOCUMENT_REFERENCE_TERMS)
+        for term in terms
+    )
+
 # Document overview / Q&A patterns — these are NOT research, always route to rag.
 # Must be checked BEFORE _RESEARCH_TERMS to prevent misrouting.
 _DOCUMENT_QA_KEYWORDS = [
@@ -44,6 +67,32 @@ _DOCUMENT_QA_KEYWORDS = [
     "summarize this document", "what is this document", "what is this file about",
     "summarize the file",
 ]
+
+_EXPLICIT_DOCUMENT_REFERENCE_KEYWORDS = [
+    "根据文档", "根据文件", "根据材料", "根据附件", "根据我上传", "根据上传",
+    "基于文档", "基于文件", "基于材料", "基于附件", "基于我上传", "基于上传",
+    "上传的文档", "上传的文件", "上传的材料", "上传的附件",
+    "我上传的文档", "我上传的文件", "我上传的材料", "我上传的附件",
+    "当前文档", "当前文件", "这份文档", "这个文档", "这份文件", "这个文件",
+    "这份材料", "这个材料", "附件里", "文档里", "文件里", "材料里",
+    "this document", "this file", "the uploaded document", "the uploaded file",
+    "uploaded document", "uploaded file", "attached document", "attached file",
+    "in the attachment", "from the attachment",
+    "based on the document", "based on the file", "according to the document",
+    "according to the file", "summarize this document", "summarize this file",
+    "what is this document", "what is this file",
+    # Mojibake-compatible literals already present in historical tests/source.
+    "鏍规嵁鏂囨。", "鏍规嵁鎴戜笂浼犵殑鏂囨。",
+    "鎴戠殑鏂囨。", "杩欎釜鏂囦欢", "杩欎釜鏂囨。",
+]
+
+
+def _has_explicit_document_reference(text: str) -> bool:
+    normalized = (text or "").lower()
+    return any(
+        keyword.lower() not in _BROAD_DOCUMENT_REFERENCE_TERMS and keyword in normalized
+        for keyword in _EXPLICIT_DOCUMENT_REFERENCE_KEYWORDS
+    )
 
 _ARTIFACT_TERMS = [
     "生成文档", "方案", "网站", "页面", "代码", "图片提示词",
@@ -282,20 +331,19 @@ def plan_route(
         reasons.append(f"forced_route={forced}")
 
     # ── Detect intent ───────────────────────────────────────────
-    is_document_qa = has_document_attachments and any(
-        kw in text for kw in _DOCUMENT_QA_KEYWORDS
-    )
-    # If user uploaded documents and asks a short/ambiguous question,
-    # treat as document Q&A (rag) rather than research.
-    if has_document_attachments and not forced and not is_document_qa:
-        if len(user_input.strip()) <= 30 and not any(
-            term in text for term in _RESEARCH_TERMS
-        ):
-            is_document_qa = True
-            reasons.append("short_query_with_attachment")
+    is_document_qa = has_document_attachments and _has_explicit_document_reference(text)
     is_research = any(term in text for term in _RESEARCH_TERMS) and not is_document_qa
-    is_rag = any(term in text for term in _RAG_TERMS) or is_document_qa
-    is_artifact = any(term in text for term in _ARTIFACT_TERMS)
+    ignore_broad_document_terms = has_document_attachments and not is_document_qa
+    is_rag = is_document_qa or _has_term_match(
+        text,
+        _RAG_TERMS,
+        ignore_broad_document_terms=ignore_broad_document_terms,
+    )
+    is_artifact = _has_term_match(
+        text,
+        _ARTIFACT_TERMS,
+        ignore_broad_document_terms=ignore_broad_document_terms,
+    )
     is_tool = any(term in text for term in _TOOL_TERMS) or any(term in text for term in ["发邮件", "发送邮件", "邮件", "评论", "发布", "提交表单", "打开网页", "删除", "支付", "付款", "转账"]) or any(_has_english_term(text, kw) for kw in _EN_TOOL_KEYWORDS)
     is_memory = any(term in text for term in _MEMORY_TERMS)
     is_skill = any(term in text for term in _SKILL_TERMS)
@@ -510,9 +558,20 @@ def plan_route(
     # Document Q&A: force as rag, skip research/artifact/memory/skill
     if is_document_qa and not forced:
         intent = "document_qa"
+        reasons = [
+            reason
+            for reason in reasons
+            if reason
+            not in {
+                "mixed_keywords_detected",
+                "research_agent_in_route",
+                "rag_agent_in_route",
+                "artifact_agent_in_route",
+            }
+        ]
         reasons.append("document_qa_detected")
-        if "rag_agent" not in route:
-            route = ["rag_agent"]  # only rag, no research/artifact
+        route = ["rag_agent"]  # only rag, no research/artifact
+        reasons.append("rag_agent_in_route")
 
     # Post-execution: memory/skill BEFORE evaluator (so evaluator can score them)
     if intent in ("memory", "memory_confirm"):

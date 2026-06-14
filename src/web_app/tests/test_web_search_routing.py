@@ -86,6 +86,45 @@ def test_document_question_stays_rag_not_web_search():
     assert "tool_agent" not in plan["route"]
 
 
+def test_short_general_question_with_attachment_does_not_force_rag():
+    plan = plan_route("今年谁获得了NBA总冠军？", has_document_attachments=True)
+
+    assert plan["intent"] != "document_qa"
+    assert "rag_agent" not in plan["route"]
+    assert "short_query_with_attachment" not in plan["reason"]
+
+
+def test_english_general_question_with_attachment_does_not_force_rag():
+    plan = plan_route("Who won this year?", has_document_attachments=True)
+
+    assert plan["intent"] != "document_qa"
+    assert "rag_agent" not in plan["route"]
+
+
+def test_document_word_alone_with_attachment_does_not_force_rag():
+    plan = plan_route("What is a document database?", has_document_attachments=True)
+
+    assert plan["intent"] != "document_qa"
+    assert "rag_agent" not in plan["route"]
+
+
+def test_chinese_document_word_alone_with_attachment_does_not_force_rag():
+    plan = plan_route("文档数据库是什么？", has_document_attachments=True)
+
+    assert plan["intent"] != "document_qa"
+    assert "rag_agent" not in plan["route"]
+
+
+def test_explicit_document_reference_with_attachment_routes_to_rag():
+    plan = plan_route("根据我上传的文档回答", has_document_attachments=True)
+
+    assert plan["intent"] == "document_qa"
+    assert "rag_agent" in plan["route"]
+    assert "research_agent" not in plan["route"]
+    assert "artifact_agent" not in plan["route"]
+    assert "tool_agent" not in plan["route"]
+
+
 def test_memory_write_does_not_trigger_web_search():
     plan = plan_route("记住我喜欢 Tavily")
 
