@@ -1,11 +1,9 @@
 import asyncio
 import json
+import logging
 from datetime import date, datetime
 from typing import Any
 from uuid import uuid4
-
-# ── BUILD_MARKER: visible in uvicorn startup ────────────────
-print("[BUILD_MARKER] approval-resume-fix-2026-06-09-v2 loaded")
 
 from sqlalchemy.orm import Session
 
@@ -26,6 +24,9 @@ from src.web_app.services.document_service import document_service
 from src.web_app.rag.vector_store import QdrantVectorStore
 from src.web_app.rag.embeddings import embed_text
 from src.web_app.services.conversation_lock import conversation_lock_manager
+
+
+logger = logging.getLogger(__name__)
 
 
 GENERIC_COMPLETED_ANSWERS = {
@@ -884,7 +885,7 @@ async def resume_run_after_approval(
     conversation_repo = AgentConversationRepository(db)
     approval_repo = ApprovalRepository(db)
 
-    print(f"[APPROVAL_RESUME_DEBUG] enter resume_run_after_approval run_id={run_id}", flush=True)
+    logger.debug("[APPROVAL_RESUME_DEBUG] enter resume_run_after_approval run_id=%s", run_id)
 
     run = run_repo.get_by_user(user_id, run_id)
     if not run:
@@ -1032,15 +1033,18 @@ async def resume_run_after_approval(
                     graph_state["tool_result"] = tool_result
                     tool_success = tool_result.get("success") is True
 
-                    print(
-                        f"[APPROVAL_RESUME_DEBUG] after_tool_execution run_id={run_id} "
-                        f"tool_name={pending_tool_name} tool_success={tool_success} "
-                        f"provider={tool_result.get('provider')} "
-                        f"error_code={tool_result.get('error_code')} "
-                        f"to={tool_result.get('to')} "
-                        f"subject={tool_result.get('subject')} "
-                        f"body_preview={(tool_result.get('body_preview') or tool_result.get('body') or '')[:80]}",
-                        flush=True,
+                    logger.debug(
+                        "[APPROVAL_RESUME_DEBUG] after_tool_execution run_id=%s "
+                        "tool_name=%s tool_success=%s provider=%s error_code=%s "
+                        "to=%s subject=%s body_preview=%s",
+                        run_id,
+                        pending_tool_name,
+                        tool_success,
+                        tool_result.get("provider"),
+                        tool_result.get("error_code"),
+                        tool_result.get("to"),
+                        tool_result.get("subject"),
+                        (tool_result.get("body_preview") or tool_result.get("body") or "")[:80],
                     )
 
                     if tool_success:
@@ -1158,13 +1162,15 @@ async def resume_run_after_approval(
     enriched_payload = {"user_input": user_input, "source": "resume_after_approval"}
     try:
         state = await AgentRuntime(db, enriched_payload).resume_from_approval(graph_state)
-        print(
-            f"[APPROVAL_RESUME_DEBUG] after_runtime run_id={run_id} "
-            f"status={state.get('status')} error={state.get('error')} "
-            f"approval_required={state.get('approval_required')} "
-            f"final_answer_preview={(state.get('final_answer') or '')[:120]} "
-            f"tool_call.error={(state.get('tool_call') or {}).get('error')}",
-            flush=True,
+        logger.debug(
+            "[APPROVAL_RESUME_DEBUG] after_runtime run_id=%s status=%s error=%s "
+            "approval_required=%s final_answer_preview=%s tool_call.error=%s",
+            run_id,
+            state.get("status"),
+            state.get("error"),
+            state.get("approval_required"),
+            (state.get("final_answer") or "")[:120],
+            (state.get("tool_call") or {}).get("error"),
         )
         # Debug after graph re-run
         tc3 = state.get("tool_call") or {}
@@ -1225,7 +1231,7 @@ async def resume_run_after_approval(
 
     # If answer still contains stale approval text, force-generate from tool_result
     if is_approval_placeholder(answer) or "Run failed: approval_required" in (answer or ""):
-        print(f"[APPROVAL_RESUME_DEBUG] answer_still_stale, regenerating from tool_result", flush=True)
+        logger.debug("[APPROVAL_RESUME_DEBUG] answer_still_stale, regenerating from tool_result")
         tr = state.get("tool_result") or {}
         tn = pending_tool_name or (tr.get("tool_name") or "")
         te = state.get("_tool_error") or ""
@@ -1241,7 +1247,11 @@ async def resume_run_after_approval(
         else:
             answer = f"已获得批准，但 {tn or '工具'} 没有返回执行结果，无法确认操作成功。"
 
-    print(f"[APPROVAL_RESUME_DEBUG] before_answer run_id={run_id} answer_preview={(answer or '')[:150]}", flush=True)
+    logger.debug(
+        "[APPROVAL_RESUME_DEBUG] before_answer run_id=%s answer_preview=%s",
+        run_id,
+        (answer or "")[:150],
+    )
     # Debug before persist
     _log.info(
         "[approval_resume_debug] stage=before_persist run_id=%s "
@@ -1279,7 +1289,7 @@ async def resume_run_after_approval(
         final_status = "completed"
     # Also update state so downstream code sees the corrected status
     state["status"] = final_status
-    print(f"[APPROVAL_RESUME_DEBUG] final_status_corrected to={final_status}", flush=True)
+    logger.debug("[APPROVAL_RESUME_DEBUG] final_status_corrected to=%s", final_status)
 
     # Persist
     run_repo.update(
@@ -1310,7 +1320,7 @@ async def resume_run_after_approval(
 
     # ── Final guard: persist must never save stale approval_required ──
     if is_approval_placeholder(answer) or "Run failed: approval_required" in (answer or ""):
-        print(f"[APPROVAL_RESUME_DEBUG] FATAL persist_guard triggered, replacing stale answer", flush=True)
+        logger.debug("[APPROVAL_RESUME_DEBUG] FATAL persist_guard triggered, replacing stale answer")
         tr = state.get("tool_result") or {}
         tn = pending_tool_name or (tr.get("tool_name") or "")
         te = state.get("_tool_error") or ""
@@ -1343,17 +1353,19 @@ async def resume_run_after_approval(
         conversation_repo.touch(conversation, preview=answer, last_run_id=run_id)
 
     # ── Stream answer & emit run_completed ──────────────────────
-    print(
-        f"[APPROVAL_RESUME_DEBUG] before_final_event run_id={run_id} event=run_completed "
-        f"final_status={final_status} answer_preview={(answer or '')[:150]} "
-        f"has_approval_required={'approval_required' in (answer or '').lower()}",
-        flush=True,
+    logger.debug(
+        "[APPROVAL_RESUME_DEBUG] before_final_event run_id=%s event=run_completed "
+        "final_status=%s answer_preview=%s has_approval_required=%s",
+        run_id,
+        final_status,
+        (answer or "")[:150],
+        "approval_required" in (answer or "").lower(),
     )
 
     # ── HARD DEFENSE at event layer: if answer still contains approval_required,
     #     replace it with a resume-context fallback instead of emitting it.
     if is_approval_placeholder(answer) or "Run failed: approval_required" in (answer or ""):
-        print(f"[APPROVAL_RESUME_DEBUG] FINAL_BLOCK replacing answer at event layer", flush=True)
+        logger.debug("[APPROVAL_RESUME_DEBUG] FINAL_BLOCK replacing answer at event layer")
         tr = state.get("tool_result") or {}
         tn = pending_tool_name or (tr.get("tool_name") or "")
         te = state.get("_tool_error") or ""
@@ -1392,7 +1404,7 @@ async def stream_resume_run(db: Session, user_id: int, run_id: int):
     sentinel = object()
 
     async def runner() -> None:
-        print(f"[APPROVAL_RESUME_DEBUG] enter stream_resume_run run_id={run_id}", flush=True)
+        logger.debug("[APPROVAL_RESUME_DEBUG] enter stream_resume_run run_id=%s", run_id)
         try:
             await resume_run_after_approval(db, user_id, run_id, stream_queue=queue)
         except ValueError as exc:
@@ -1412,10 +1424,10 @@ async def stream_resume_run(db: Session, user_id: int, run_id: int):
                     },
                 })
             else:
-                print(f"[APPROVAL_RESUME_DEBUG] stream error: {msg[:200]}", flush=True)
+                logger.debug("[APPROVAL_RESUME_DEBUG] stream error: %s", msg[:200])
                 # HARD DEFENSE: never emit run_failed with approval_required
                 if "approval_required" in msg.lower():
-                    print(f"[APPROVAL_RESUME_DEBUG] BLOCKED run_failed approval_required in stream", flush=True)
+                    logger.debug("[APPROVAL_RESUME_DEBUG] BLOCKED run_failed approval_required in stream")
                     queue.put_nowait({
                         "event": "run_completed",
                         "data": {
@@ -1438,9 +1450,9 @@ async def stream_resume_run(db: Session, user_id: int, run_id: int):
                     })
         except Exception as exc:
             msg = str(exc)
-            print(f"[APPROVAL_RESUME_DEBUG] stream exception: {msg[:200]}", flush=True)
+            logger.debug("[APPROVAL_RESUME_DEBUG] stream exception: %s", msg[:200])
             if "approval_required" in msg.lower():
-                print(f"[APPROVAL_RESUME_DEBUG] BLOCKED run_failed approval_required in stream", flush=True)
+                logger.debug("[APPROVAL_RESUME_DEBUG] BLOCKED run_failed approval_required in stream")
                 queue.put_nowait({
                     "event": "run_completed",
                     "data": {
@@ -1624,13 +1636,15 @@ def hard_delete_conversation(
     blocked_run_ids = list(dict.fromkeys(waiting_run_ids + approval_required_run_ids))
     has_pending = bool(blocked_run_ids)
 
-    print("[conversation_delete] pending_guard", {
-        "conversation_id": conversation_id,
-        "pending_approval_count": len(pending_approval_ids),
-        "waiting_run_count": len(waiting_run_ids),
-        "approval_required_run_count": len(approval_required_run_ids),
-        "blocked": has_pending,
-    }, flush=True)
+    logger.info(
+        "[conversation_delete] pending_guard conversation_id=%s pending_approval_count=%s "
+        "waiting_run_count=%s approval_required_run_count=%s blocked=%s",
+        conversation_id,
+        len(pending_approval_ids),
+        len(waiting_run_ids),
+        len(approval_required_run_ids),
+        has_pending,
+    )
 
     # ── cancel_pending: cancel all pending approvals before deleting ──
     if has_pending and cancel_pending:
@@ -1765,12 +1779,13 @@ def sanitize_resume_final_state(
     Removes ALL stale approval_required artifacts regardless of where
     they are hiding.  This is the final safety net.
     """
-    print(
-        f"[APPROVAL_RESUME_DEBUG] sanitize_resume_final_state "
-        f"approval_id={approval_id} tool_name={tool_name} "
-        f"tool_success={tool_result.get('success') if tool_result else 'N/A'} "
-        f"tool_error={tool_error}",
-        flush=True,
+    logger.debug(
+        "[APPROVAL_RESUME_DEBUG] sanitize_resume_final_state approval_id=%s "
+        "tool_name=%s tool_success=%s tool_error=%s",
+        approval_id,
+        tool_name,
+        tool_result.get("success") if tool_result else "N/A",
+        tool_error,
     )
 
     state["approval_required"] = False
@@ -1788,7 +1803,7 @@ def sanitize_resume_final_state(
     # Clear error if it contains approval_required
     err = state.get("error", "")
     if err and "approval_required" in str(err).lower():
-        print(f"[APPROVAL_RESUME_DEBUG] sanitizer cleared state.error={err}", flush=True)
+        logger.debug("[APPROVAL_RESUME_DEBUG] sanitizer cleared state.error=%s", err)
         state["error"] = ""
         state.pop("error", None)
 
@@ -1797,7 +1812,11 @@ def sanitize_resume_final_state(
     if errors:
         filtered = [e for e in errors if "approval_required" not in str(e).lower()]
         if len(filtered) != len(errors):
-            print(f"[APPROVAL_RESUME_DEBUG] sanitizer filtered errors from {len(errors)} to {len(filtered)}", flush=True)
+            logger.debug(
+                "[APPROVAL_RESUME_DEBUG] sanitizer filtered errors from %s to %s",
+                len(errors),
+                len(filtered),
+            )
         state["errors"] = filtered or None
 
     # Clear tool_call.error
@@ -1805,7 +1824,7 @@ def sanitize_resume_final_state(
     if isinstance(tc, dict):
         tc_err = tc.get("error", "")
         if tc_err and "approval_required" in str(tc_err).lower():
-            print(f"[APPROVAL_RESUME_DEBUG] sanitizer cleared tool_call.error={tc_err}", flush=True)
+            logger.debug("[APPROVAL_RESUME_DEBUG] sanitizer cleared tool_call.error=%s", tc_err)
             tc["error"] = ""
             state["tool_call"] = tc
 
@@ -1814,14 +1833,17 @@ def sanitize_resume_final_state(
     for key in ("final_answer", "final_output", "answer"):
         val = state.get(key, "")
         if isinstance(val, str) and ("Run failed: approval_required" in val or "Approval required:" in val):
-            print(f"[APPROVAL_RESUME_DEBUG] sanitizer cleared state.{key}={val[:120]}", flush=True)
+            logger.debug("[APPROVAL_RESUME_DEBUG] sanitizer cleared state.%s=%s", key, val[:120])
             state[key] = ""
     # Also clean final_payload.answer — this is the 2nd candidate in build_user_facing_answer
     fp = state.get("final_payload") or {}
     if isinstance(fp, dict):
         fp_ans = fp.get("answer", "")
         if isinstance(fp_ans, str) and ("Run failed: approval_required" in fp_ans or "Approval required:" in fp_ans):
-            print(f"[APPROVAL_RESUME_DEBUG] sanitizer cleared final_payload.answer={fp_ans[:120]}", flush=True)
+            logger.debug(
+                "[APPROVAL_RESUME_DEBUG] sanitizer cleared final_payload.answer=%s",
+                fp_ans[:120],
+            )
             fp["answer"] = ""
             state["final_payload"] = fp
 
@@ -1954,10 +1976,12 @@ def build_user_facing_answer(state: dict[str, Any]) -> str:
         tool_error = state.get("_tool_error") or state.get("error") or ""
         tool_success = tool_result.get("success") is True
 
-        print(
-            f"[APPROVAL_RESUME_DEBUG] build_answer_fallback is_resume_context=True "
-            f"tool_name={tool_name} tool_success={tool_success} tool_error={tool_error[:100]}",
-            flush=True,
+        logger.debug(
+            "[APPROVAL_RESUME_DEBUG] build_answer_fallback is_resume_context=True "
+            "tool_name=%s tool_success=%s tool_error=%s",
+            tool_name,
+            tool_success,
+            tool_error[:100],
         )
 
         if tool_success and tool_result:
