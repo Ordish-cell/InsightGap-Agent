@@ -12,7 +12,7 @@ export class ApiError extends Error {
   }
 }
 
-type Query = Record<string, string | number | boolean | null | undefined>
+export type Query = Record<string, string | number | boolean | null | undefined>
 
 interface RequestOptions {
   method?: string

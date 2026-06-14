@@ -1,7 +1,19 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react'
 
 import { apiRequest } from '../api/client'
-import * as memory from '../api/memory'
+import type { Query } from '../api/client'
+import {
+  archiveMemory,
+  consolidate,
+  deleteMemory,
+  forget,
+  listLongTermMemories,
+  restoreMemory,
+  search,
+  searchLongTermMemories,
+  summary as fetchMemorySummary,
+  updateMemory,
+} from '../api/memory'
 import type { LongTermMemoryItem, MemoryItem, MemorySummary } from '../api/types'
 import { ConfirmModal } from '../components/common/ConfirmModal'
 import { EmptyState } from '../components/common/EmptyState'
@@ -68,7 +80,7 @@ export function MemoryPage() {
     setLoading(true)
     try {
       const [s, p] = await Promise.all([
-        memory.summary() as Promise<SummaryLike>,
+        fetchMemorySummary() as Promise<SummaryLike>,
         apiRequest<GrowthProfile>('/memory/growth-profile'),
       ])
       setSummary(s)
@@ -80,20 +92,20 @@ export function MemoryPage() {
     }
   }
 
-  const loadLongTerm = useCallback(async (page?: number, search?: boolean) => {
+  const loadLongTerm = useCallback(async (page?: number, useSearchEndpoint?: boolean) => {
     setLtLoading(true)
     setLtError('')
     const p = page ?? ltPage
     try {
-      const params: Record<string, unknown> = { page: p, page_size: ltPageSize }
+      const params: Query = { page: p, page_size: ltPageSize }
       if (ltType) params.type = ltType
       if (ltCategory) params.category = ltCategory
       if (ltStatus) params.status = ltStatus
       if (ltQuery) params.query = ltQuery
 
-      const result = search
-        ? await memory.searchLongTermMemories(params)
-        : await memory.listLongTermMemories(params)
+      const result = useSearchEndpoint
+        ? await searchLongTermMemories(params)
+        : await listLongTermMemories(params)
       setLtItems(result.items || [])
       setLtTotal(result.total || 0)
       setLtPage(result.page || p)
@@ -106,7 +118,7 @@ export function MemoryPage() {
 
   async function loadSearch() {
     try {
-      setSearchItems(await memory.search({ query }))
+      setSearchItems(await search({ query }))
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : '搜索失败')
     }
@@ -131,23 +143,23 @@ export function MemoryPage() {
   }
 
   async function handleReflect() { await apiRequest('/memory/reflect', { method: 'POST', body: {} }); await load() }
-  async function handleForget(id: number) { await memory.forget({ memory_id: id }); await load() }
+  async function handleForget(id: number) { await forget({ memory_id: id }); await load() }
 
   // ── Long-term actions ──
   async function handleArchive(id: number) {
-    try { await memory.archiveMemory(id); void loadLongTerm() } catch (e) { setLtError(e instanceof Error ? e.message : '归档失败') }
+    try { await archiveMemory(id); void loadLongTerm() } catch (e) { setLtError(e instanceof Error ? e.message : '归档失败') }
   }
   async function handleRestore(id: number) {
-    try { await memory.restoreMemory(id); void loadLongTerm() } catch (e) { setLtError(e instanceof Error ? e.message : '恢复失败') }
+    try { await restoreMemory(id); void loadLongTerm() } catch (e) { setLtError(e instanceof Error ? e.message : '恢复失败') }
   }
   function handleDeleteClick(id: number) {
     setConfirm({
       title: '删除记忆', message: '确定要永久删除这条记忆吗？此操作不可撤销。', danger: true,
-      action: async () => { try { await memory.deleteMemory(id); void loadLongTerm() } catch (e) { setLtError(e instanceof Error ? e.message : '删除失败') } finally { setConfirm(null) } },
+      action: async () => { try { await deleteMemory(id); void loadLongTerm() } catch (e) { setLtError(e instanceof Error ? e.message : '删除失败') } finally { setConfirm(null) } },
     })
   }
   async function handleImportanceChange(id: number, value: number) {
-    try { await memory.updateMemory(id, { importance: Math.max(0, Math.min(1, value)) }); void loadLongTerm() } catch { /* ignore */ }
+    try { await updateMemory(id, { importance: Math.max(0, Math.min(1, value)) }); void loadLongTerm() } catch { /* ignore */ }
   }
 
   const totalPages = Math.max(1, Math.ceil(ltTotal / ltPageSize))
@@ -160,7 +172,7 @@ export function MemoryPage() {
         actions={
           <div style={{ display: 'flex', gap: 8 }}>
             <button className="button secondary" onClick={handleReflect}>整理碎片</button>
-            <button className="button secondary" onClick={() => memory.consolidate().then(load)}>整理记忆</button>
+            <button className="button secondary" onClick={() => consolidate().then(load)}>整理记忆</button>
           </div>
         }
       />

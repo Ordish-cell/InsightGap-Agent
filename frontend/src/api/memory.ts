@@ -1,4 +1,5 @@
 import { apiRequest } from './client'
+import type { Query } from './client'
 import type { LongTermMemoryItem, LongTermMemoryListResponse, MemoryItem, MemorySummary } from './types'
 
 export const summary = () => apiRequest<MemorySummary>('/memory/summary')
@@ -7,7 +8,7 @@ export const add = (payload: Record<string, unknown>) => apiRequest<MemoryItem>(
 export const consolidate = (payload?: Record<string, unknown>) => apiRequest<unknown>('/memory/consolidate', { method: 'POST', body: payload || {} })
 export const forget = (payload: { memory_id?: number }) => apiRequest<unknown>('/memory/forget', { method: 'POST', body: payload })
 
-export const listLongTermMemories = (params: Record<string, unknown>) => apiRequest<LongTermMemoryListResponse>('/memory/long-term', { query: params })
+export const listLongTermMemories = (params: Query) => apiRequest<LongTermMemoryListResponse>('/memory/long-term', { query: params })
 export const searchLongTermMemories = (payload: Record<string, unknown>) => apiRequest<LongTermMemoryListResponse>('/memory/long-term/search', { method: 'POST', body: payload })
 export const updateMemory = (id: number, body: Record<string, unknown>) => apiRequest<LongTermMemoryItem>(`/memory/${id}`, { method: 'PATCH', body })
 export const deleteMemory = (id: number) => apiRequest<{ deleted: boolean; memory_id: number }>(`/memory/${id}`, { method: 'DELETE' })
