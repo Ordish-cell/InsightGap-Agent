@@ -33,18 +33,52 @@ def _tool_output_preview(result: dict[str, Any] | None, max_chars: int = 700) ->
         return ""
     output = result.get("output") if isinstance(result, dict) else None
     value: Any = output if output not in (None, {}) else result
-    if isinstance(value, dict):
-        value = {
-            key: item
-            for key, item in value.items()
-            if not str(key).startswith("_") and not any(secret in str(key).lower() for secret in _SENSITIVE_ARG_KEYS)
-        }
+    value = _redact_tool_preview_value(value)
     try:
         text = json.dumps(value, ensure_ascii=False, default=str)
     except TypeError:
         text = str(value)
     text = " ".join(text.split())
     return text[:max_chars] + ("..." if len(text) > max_chars else "")
+
+
+def _tool_event_extra(tool_name: str, result: dict[str, Any] | None) -> dict[str, Any]:
+    if tool_name != "web.search" or not isinstance(result, dict):
+        return {}
+    output = result.get("output") if isinstance(result.get("output"), dict) else result
+    results = output.get("results") if isinstance(output.get("results"), list) else []
+    return {
+        "provider": output.get("provider") or "",
+        "used_fallback": bool(output.get("used_fallback")),
+        "result_count": len(results),
+        "resultCount": len(results),
+        "final_query": output.get("final_query") or output.get("query") or "",
+        "search_rounds": output.get("search_rounds") if isinstance(output.get("search_rounds"), list) else [],
+        "reasoning_summary": str(output.get("reasoning_summary") or "")[:700],
+        "results_preview": [
+            {
+                "title": str(item.get("title") or item.get("url") or "")[:200],
+                "url": str(item.get("url") or "")[:500],
+                "snippet": str(item.get("snippet") or "")[:500],
+                "published_at": item.get("published_at"),
+            }
+            for item in results[:5]
+            if isinstance(item, dict)
+        ],
+        "error": str(output.get("error") or result.get("error") or "")[:700],
+    }
+
+
+def _redact_tool_preview_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _redact_tool_preview_value(item)
+            for key, item in value.items()
+            if not str(key).startswith("_") and not any(secret in str(key).lower() for secret in _SENSITIVE_ARG_KEYS)
+        }
+    if isinstance(value, list):
+        return [_redact_tool_preview_value(item) for item in value[:10]]
+    return value
 
 
 def _queue_tool_event(
@@ -58,6 +92,7 @@ def _queue_tool_event(
     status: str = "",
     error: str = "",
     tool_call_record_id: int | str | None = None,
+    extra_payload: dict[str, Any] | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "tool_call_id": tool_call_id,
@@ -76,6 +111,8 @@ def _queue_tool_event(
         payload["error"] = error[:700]
     if tool_call_record_id is not None:
         payload["tool_call_record_id"] = tool_call_record_id
+    if extra_payload:
+        payload.update(extra_payload)
     queue_stream_event(
         state.get("_stream_queue"),
         event_type,
@@ -830,6 +867,7 @@ class AgentNodesMixin:
                     status=str(result.get("status") or "failed"),
                     error=str(result.get("error") or "tool_failed"),
                     tool_call_record_id=result.get("id"),
+                    extra_payload=_tool_event_extra(tool_name, result),
                 )
                 state["status"] = "failed"
                 state["error"] = result.get("error", "")
@@ -863,6 +901,7 @@ class AgentNodesMixin:
                     output_preview=_tool_output_preview(result),
                     status=str(result.get("status") or "completed"),
                     tool_call_record_id=result.get("id"),
+                    extra_payload=_tool_event_extra(tool_name, result),
                 )
                 append_output(state, "tool_agent", {"tool_name": tool_name, "status": result.get("status")})
                 append_agent_result(state, AgentResult(

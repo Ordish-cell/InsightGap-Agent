@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import logging
 from typing import Any, TYPE_CHECKING
+import re
+
+from src.web_app.agent.runtime.tool_routing import detect_local_tool, is_explicit_or_realtime_web_query
 
 if TYPE_CHECKING:
     from src.web_app.agent.runtime.intent_schema import LLMToolSelectionResult
@@ -10,6 +13,10 @@ logger = logging.getLogger(__name__)
 
 TOOL_HINTS = {
     "search": "search_mcp.search",
+    "web": "web.search",
+    "web_search": "web.search",
+    "internet": "web.search",
+    "internet_search": "web.search",
     "github": "github_mcp.repo_summary",
     "artifact": "artifact_mcp.create_text_artifact",
     "memory": "memory_mcp.search",
@@ -32,10 +39,15 @@ _INTENT_TOOL_MAP: dict[str, str] = {
     "tool.shell_write": "local_file.write",
     "tool.dangerous": "local_file.delete",
     "tool.browser": "browser_mcp.plan_actions",
+    "tool.web_search": "web.search",
     "tool.comment": "email.send",
     "tool.form_submit": "email.send",
+    "system.time": "system.time",
+    "system.calc": "system.calc",
+    "system.unit_convert": "system.unit_convert",
+    "system.uuid": "system.uuid",
+    "system.hash": "system.hash",
 }
-
 
 def infer_tool(
     user_input: str,
@@ -46,15 +58,25 @@ def infer_tool(
 
     Priority:
     1. Explicit tool_name in payload
-    2. LLM result (confidence >= 0.5)
-    3. Intent → tool map from payload
-    4. Keyword matching on user_input (fallback)
+    2. Deterministic local read-only tools
+    3. LLM result (confidence >= 0.5)
+    4. Intent → tool map from payload
+    5. Keyword matching on user_input (fallback)
     """
     # 1. Explicit tool_name
     if payload.get("tool_name"):
         return payload["tool_name"], payload.get("tool_input", payload.get("input", {}))
 
-    # 2. LLM result (primary path for natural language)
+    # 2. Local read-only tools are deterministic and take priority over LLM tool selection.
+    if payload.get("intent") and str(payload["intent"]).startswith("system."):
+        tool_name = _INTENT_TOOL_MAP.get(str(payload["intent"]))
+        if tool_name:
+            return tool_name, _build_input_for_tool(tool_name, user_input, payload)
+    local_tool = detect_local_tool(user_input)
+    if local_tool:
+        return local_tool, _build_input_for_tool(local_tool, user_input, payload)
+
+    # 3. LLM result (primary path for natural language)
     if llm_result is not None and llm_result.confidence >= 0.5 and llm_result.tool_calls:
         from src.web_app.mcp.registry import normalize_tool_name
         first_call = llm_result.tool_calls[0]
@@ -76,16 +98,19 @@ def infer_tool(
         )
         return canonical, cleaned_args
 
-    # 3. Intent → tool map
+    # 4. Intent → tool map
     if payload.get("intent"):
         tool_name = _INTENT_TOOL_MAP.get(payload["intent"])
         if tool_name:
             return tool_name, _build_input_for_tool(tool_name, user_input, payload)
 
-    # 4. Keyword fallback (existing behavior, unchanged)
+    # 5. Keyword fallback. Prefer local read-only tools over web search.
     text = user_input.lower()
     if "github" in text:
         return TOOL_HINTS["github"], {"repo": payload.get("repo", "owner/name")}
+
+    if is_explicit_or_realtime_web_query(user_input):
+        return "web.search", _build_web_search_input(user_input, payload)
 
     # ── Email ───────────────────────────────────────────────
     _send_triggers = ("发邮件", "发送邮件", "发一封", "send email", "send mail")
@@ -204,6 +229,90 @@ def _build_file_write_input(user_input: str, payload: dict[str, Any]) -> dict[st
     }
 
 
+def _build_web_search_input(user_input: str, payload: dict[str, Any]) -> dict[str, Any]:
+    query = str(payload.get("query") or payload.get("q") or user_input).strip()
+    query = _rewrite_web_search_query(query)
+    result: dict[str, Any] = {"query": query, "limit": payload.get("limit", 5)}
+    if payload.get("recency_days") is not None:
+        result["recency_days"] = payload.get("recency_days")
+    elif any(term in user_input.lower() for term in ("今天", "今日", "today")):
+        result["recency_days"] = 1
+    elif any(term in user_input.lower() for term in ("新闻", "消息", "recent news", "news")):
+        result["recency_days"] = 30
+    return result
+
+
+def _rewrite_web_search_query(query: str) -> str:
+    normalized = query.lower()
+    compact = "".join(normalized.split())
+    asks_latest_model = any(term in normalized for term in ("latest", "current")) or any(term in compact for term in ("最新", "当前"))
+    asks_model = any(term in normalized for term in ("model", "models")) or "模型" in compact
+    asks_version = any(term in normalized for term in ("version", "release")) or any(term in compact for term in ("版本", "发布"))
+    if "claude" in normalized and asks_latest_model and asks_model:
+        return "site:anthropic.com/news Claude Opus latest model"
+    if asks_latest_model and asks_model:
+        subject = _extract_query_subject(query, ("最新模型", "当前模型", "latest model", "current model"))
+        if subject:
+            return f"{subject} latest model official docs announcement"
+    if asks_latest_model and asks_version:
+        subject = _extract_query_subject(query, ("最新版本", "当前版本", "latest version", "current version"))
+        if subject:
+            return f"{subject} latest version official docs release notes"
+    return query
+
+
+def _extract_query_subject(query: str, markers: tuple[str, ...]) -> str:
+    lowered = query.lower()
+    for marker in markers:
+        index = lowered.find(marker.lower())
+        if index > 0:
+            return query[:index].strip(" ：:，,。?？的")
+    return ""
+
+
+def _build_calc_input(user_input: str, payload: dict[str, Any]) -> dict[str, Any]:
+    expression = str(payload.get("expression") or "").strip()
+    if not expression:
+        text = user_input.replace("×", "*").replace("÷", "/")
+        candidates = [item.strip() for item in re.findall(r"[-+*/().\d\s]+", text)]
+        expression = max((item for item in candidates if re.search(r"\d", item)), key=len, default="")
+    return {"expression": expression}
+
+
+def _build_unit_convert_input(user_input: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if all(key in payload for key in ("value", "from", "to")):
+        return {"value": payload.get("value"), "from": payload.get("from"), "to": payload.get("to")}
+    text = user_input.lower().replace(" ", "")
+    patterns = [
+        (r"([\d.]+)mb.*?gb", "mb", "gb"),
+        (r"([\d.]+)gb.*?mb", "gb", "mb"),
+        (r"([\d.]+)km.*?(mile|mi|英里)", "km", "mile"),
+        (r"([\d.]+)(公里|千米).*?英里", "km", "mile"),
+        (r"([\d.]+)(摄氏度|摄氏|c).*?(华氏度|华氏|f)", "c", "f"),
+        (r"([\d.]+)(华氏度|华氏|f).*?(摄氏度|摄氏|c)", "f", "c"),
+        (r"([\d.]+)kg.*?(lb|lbs|磅)", "kg", "lb"),
+    ]
+    for pattern, from_unit, to_unit in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return {"value": float(match.group(1)), "from": from_unit, "to": to_unit}
+    return {"value": payload.get("value"), "from": payload.get("from", ""), "to": payload.get("to", "")}
+
+
+def _build_hash_input(user_input: str, payload: dict[str, Any]) -> dict[str, Any]:
+    algorithm = str(payload.get("algorithm") or "").strip().lower()
+    text = str(payload.get("text") or "").strip()
+    lowered = user_input.lower()
+    if not algorithm:
+        algorithm = "md5" if "md5" in lowered else "sha512" if "sha512" in lowered else "sha1" if "sha1" in lowered else "sha256"
+    if not text:
+        for marker in ("文本", "内容", "text", "hash一下", "哈希"):
+            if marker in user_input:
+                text = user_input.split(marker, 1)[-1].strip(" ：:，,")
+                break
+    return {"algorithm": algorithm, "text": text}
+
+
 def _build_input_for_tool(tool_name: str, user_input: str, payload: dict[str, Any]) -> dict[str, Any]:
     if tool_name == "email.send":
         return _build_email_input(user_input, payload)
@@ -215,6 +324,18 @@ def _build_input_for_tool(tool_name: str, user_input: str, payload: dict[str, An
         return {"path": payload.get("path", ""), "max_chars": payload.get("max_chars")}
     if tool_name == "local_file.append":
         return {"path": payload.get("path", ""), "content": payload.get("content", user_input)}
+    if tool_name == "web.search":
+        return _build_web_search_input(user_input, payload)
+    if tool_name == "system.time":
+        return {}
+    if tool_name == "system.calc":
+        return _build_calc_input(user_input, payload)
+    if tool_name == "system.unit_convert":
+        return _build_unit_convert_input(user_input, payload)
+    if tool_name == "system.uuid":
+        return {}
+    if tool_name == "system.hash":
+        return _build_hash_input(user_input, payload)
     return {}
 
 
@@ -270,6 +391,20 @@ def validate_tool_input(
         },
         "local_file.list": {
             "path": "要列出哪个目录的文件？",
+        },
+        "web.search": {
+            "query": "要搜索什么内容？",
+        },
+        "system.calc": {
+            "expression": "要计算的表达式是什么？",
+        },
+        "system.unit_convert": {
+            "value": "要换算的数值是多少？",
+            "from": "原始单位是什么？",
+            "to": "目标单位是什么？",
+        },
+        "system.hash": {
+            "text": "要计算哈希的文本是什么？",
         },
     }
     field_questions = _FIELD_QUESTIONS_ZH.get(tool_name, {})

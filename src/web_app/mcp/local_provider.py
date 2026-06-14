@@ -1,5 +1,10 @@
 from pathlib import Path
 from typing import Any
+import ast
+import hashlib
+import operator
+import uuid
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
@@ -15,6 +20,7 @@ from src.web_app.mcp.local_file_tools import (
     local_file_write,
 )
 from src.web_app.mcp.email_provider import MockEmailProvider, get_email_provider
+from src.web_app.mcp.web_search_provider import web_search_provider
 
 # Module-scope email provider instance (created once)
 _email_provider = None
@@ -31,6 +37,12 @@ class LocalMCPProvider:
     def call(self, db: Session, user_id: int, tool_name: str, payload: dict[str, Any], agent_run_id: int | None = None) -> dict[str, Any]:
         handlers = {
             "search_mcp.search": self._search,
+            "web.search": self._web_search,
+            "system.time": self._system_time,
+            "system.calc": self._system_calc,
+            "system.unit_convert": self._system_unit_convert,
+            "system.uuid": self._system_uuid,
+            "system.hash": self._system_hash,
             "github_mcp.repo_summary": self._github_repo_summary,
             "file_mcp.read_artifact": self._read_artifact,
             "artifact_mcp.create_text_artifact": self._create_text_artifact,
@@ -66,6 +78,58 @@ class LocalMCPProvider:
                 for idx in range(limit)
             ]
         }
+
+    def _web_search(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        try:
+            limit = int(payload.get("limit", 5) or 5)
+        except (TypeError, ValueError):
+            limit = 5
+        return web_search_provider.search(
+            str(payload.get("query", "")),
+            limit=limit,
+            recency_days=payload.get("recency_days"),
+        )
+
+    def _system_time(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        now = datetime.now().astimezone()
+        weekdays = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        weekdays_zh = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
+        return {
+            "date": now.date().isoformat(),
+            "time": now.strftime("%H:%M:%S"),
+            "weekday": weekdays[now.weekday()],
+            "weekday_zh": weekdays_zh[now.weekday()],
+            "timezone": now.tzname() or str(now.astimezone().tzinfo),
+            "utc_offset": now.strftime("%z"),
+            "iso": now.isoformat(),
+            "source": "local_system_clock",
+        }
+
+    def _system_calc(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        expression = str(payload.get("expression", "")).strip()
+        if not expression:
+            raise ValueError("Missing expression")
+        result = _safe_eval_arithmetic(expression)
+        return {"expression": expression, "result": result}
+
+    def _system_unit_convert(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        value = float(payload.get("value"))
+        from_unit = str(payload.get("from", "")).strip().lower()
+        to_unit = str(payload.get("to", "")).strip().lower()
+        result = _convert_unit(value, from_unit, to_unit)
+        return {"value": value, "from": from_unit, "to": to_unit, "result": result}
+
+    def _system_uuid(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        return {"uuid": str(uuid.uuid4())}
+
+    def _system_hash(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        algorithm = str(payload.get("algorithm") or "sha256").strip().lower()
+        text = str(payload.get("text") or "")
+        if algorithm not in {"md5", "sha1", "sha256", "sha512"}:
+            raise ValueError("Unsupported hash algorithm")
+        digest = hashlib.new(algorithm)
+        digest.update(text.encode("utf-8"))
+        return {"algorithm": algorithm, "hash": digest.hexdigest()}
 
     def _github_repo_summary(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
         repo = str(payload.get("repo", "unknown/repo")).strip() or "unknown/repo"
@@ -204,3 +268,69 @@ class LocalMCPProvider:
 
 
 local_provider = LocalMCPProvider()
+
+
+_ARITHMETIC_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _safe_eval_arithmetic(expression: str) -> int | float:
+    tree = ast.parse(expression, mode="eval")
+
+    def _eval(node: ast.AST) -> int | float:
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return node.value
+        if isinstance(node, ast.BinOp) and type(node.op) in _ARITHMETIC_OPERATORS:
+            left = _eval(node.left)
+            right = _eval(node.right)
+            return _ARITHMETIC_OPERATORS[type(node.op)](left, right)
+        if isinstance(node, ast.UnaryOp) and type(node.op) in _ARITHMETIC_OPERATORS:
+            return _ARITHMETIC_OPERATORS[type(node.op)](_eval(node.operand))
+        raise ValueError("Expression contains unsupported syntax")
+
+    result = _eval(tree)
+    if isinstance(result, float) and result.is_integer():
+        return int(result)
+    return result
+
+
+_LINEAR_UNIT_FACTORS = {
+    "m": 1.0,
+    "meter": 1.0,
+    "meters": 1.0,
+    "km": 1000.0,
+    "kilometer": 1000.0,
+    "kilometers": 1000.0,
+    "mile": 1609.344,
+    "miles": 1609.344,
+    "mi": 1609.344,
+    "gb": 1024.0,
+    "mb": 1.0,
+    "kb": 1 / 1024,
+    "kg": 1.0,
+    "g": 0.001,
+    "lb": 0.45359237,
+    "lbs": 0.45359237,
+}
+
+
+def _convert_unit(value: float, from_unit: str, to_unit: str) -> float:
+    if from_unit in {"c", "celsius", "摄氏", "摄氏度"} and to_unit in {"f", "fahrenheit", "华氏", "华氏度"}:
+        return round((value * 9 / 5) + 32, 6)
+    if from_unit in {"f", "fahrenheit", "华氏", "华氏度"} and to_unit in {"c", "celsius", "摄氏", "摄氏度"}:
+        return round((value - 32) * 5 / 9, 6)
+    if from_unit not in _LINEAR_UNIT_FACTORS or to_unit not in _LINEAR_UNIT_FACTORS:
+        raise ValueError("Unsupported unit conversion")
+    base_value = value * _LINEAR_UNIT_FACTORS[from_unit]
+    return round(base_value / _LINEAR_UNIT_FACTORS[to_unit], 6)

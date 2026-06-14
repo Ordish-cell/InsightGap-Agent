@@ -121,6 +121,12 @@ def _tool_display_name(tool_name: str) -> str:
         "local_file.delete": "删除文件",
         "local_file.read": "读取文件",
         "local_file.list": "列出文件",
+        "web.search": "联网搜索",
+        "system.time": "读取本地时间",
+        "system.calc": "本地计算",
+        "system.unit_convert": "本地单位换算",
+        "system.uuid": "生成 UUID",
+        "system.hash": "本地哈希计算",
         "artifact_mcp.create_text_artifact": "创建文档",
         "browser_mcp.plan_actions": "浏览器操作",
     }
@@ -153,6 +159,14 @@ def _build_action_preview(tool_name: str, input_data: dict[str, Any]) -> dict[st
             "title": "读取文件" if tool_name == "local_file.read" else "列出文件",
             "path": input_data.get("path", "."),
         }
+    if tool_name == "web.search":
+        return {
+            "title": "联网搜索",
+            "query": input_data.get("query", ""),
+            "limit": input_data.get("limit", 5),
+        }
+    if tool_name.startswith("system."):
+        return {"title": _tool_display_name(tool_name), "args": {k: str(v)[:200] for k, v in input_data.items()}}
     return {"title": _tool_display_name(tool_name), "args": {k: str(v)[:200] for k, v in input_data.items()}}
 
 

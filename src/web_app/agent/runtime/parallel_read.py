@@ -159,7 +159,7 @@ def _should_prepare_rag(state: AgentRuntimeState) -> bool:
     if "rag_agent" not in route:
         return False
     intent = str((state.get("route_plan") or {}).get("intent") or state.get("route") or "")
-    return intent not in {"tool", "tool.email", "tool.local_file", "tool.browser", "tool.comment", "tool.form_submit", "tool.shell_readonly", "tool.shell_write", "tool.dangerous", "artifact", "memory", "memory_confirm", "research", "feed_research"}
+    return intent not in {"tool", "tool.email", "tool.local_file", "tool.web_search", "tool.browser", "tool.comment", "tool.form_submit", "tool.shell_readonly", "tool.shell_write", "tool.dangerous", "system.time", "system.calc", "system.unit_convert", "system.uuid", "system.hash", "artifact", "memory", "memory_confirm", "research", "feed_research"}
 
 
 def _copy_state(state: AgentRuntimeState) -> AgentRuntimeState:

@@ -13,6 +13,105 @@ from src.web_app.agent.runtime.schemas import StateDelta
 from src.web_app.agent.runtime.state_delta import apply_state_delta, record_agent_node_result, record_node_result
 
 
+def _web_search_result_block(tool_result: dict[str, Any] | None) -> str:
+    if not isinstance(tool_result, dict):
+        return ""
+    output = tool_result.get("output") if isinstance(tool_result.get("output"), dict) else tool_result
+    tool_name = str(tool_result.get("tool_name") or output.get("tool_name") or "")
+    if tool_name != "web.search" and "results" not in output:
+        return ""
+    query = str(output.get("query") or "")
+    final_query = str(output.get("final_query") or query)
+    provider = str(output.get("provider") or "")
+    error = str(output.get("error") or "")
+    results = output.get("results") if isinstance(output.get("results"), list) else []
+    rounds = output.get("search_rounds") if isinstance(output.get("search_rounds"), list) else []
+    reasoning_summary = str(output.get("reasoning_summary") or "")
+    lines = [
+        "[Web Search Results]",
+        f"Query: {query}",
+        f"Final Query: {final_query}",
+        f"Provider: {provider or 'unavailable'}",
+        "Use these results only for this answer. Cite source URLs when making claims from search.",
+        "For latest/current questions, do not use stale model knowledge or make dated claims that are not supported by these results.",
+    ]
+    if reasoning_summary:
+        lines.append(f"Search Summary: {reasoning_summary}")
+    for item in rounds[:2]:
+        if isinstance(item, dict):
+            lines.append(
+                f"Round {item.get('round')}: query={item.get('query')} "
+                f"results={item.get('result_count')} observation={item.get('observation')}"
+            )
+    if not results:
+        lines.append(f"Search failed or returned no results: {error or 'no_results'}")
+        lines.append("Do not answer latest/current facts from memory when search returned no results. State that live verification failed.")
+        return "\n".join(lines)
+    for index, item in enumerate(results[:8], start=1):
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or item.get("url") or f"Result {index}")
+        url = str(item.get("url") or "")
+        snippet = str(item.get("snippet") or "")[:500]
+        published_at = str(item.get("published_at") or "")
+        lines.append(f"{index}. {title}")
+        if url:
+            lines.append(f"   URL: {url}")
+        if published_at:
+            lines.append(f"   Published: {published_at}")
+        if snippet:
+            lines.append(f"   Summary: {snippet}")
+    return "\n".join(lines)
+
+
+def _local_tool_result_block(tool_result: dict[str, Any] | None) -> str:
+    if not isinstance(tool_result, dict):
+        return ""
+    output = tool_result.get("output") if isinstance(tool_result.get("output"), dict) else tool_result
+    tool_name = str(tool_result.get("tool_name") or output.get("tool_name") or "")
+    if not tool_name.startswith("system."):
+        return ""
+    safe_output = {
+        key: value
+        for key, value in output.items()
+        if not str(key).startswith("_")
+    }
+    try:
+        output_text = json.dumps(safe_output, ensure_ascii=False, default=str)
+    except TypeError:
+        output_text = str(safe_output)
+    return (
+        "[Local Tool Result]\n"
+        f"Tool: {tool_name}\n"
+        f"Output: {output_text}\n"
+        "Use this local tool output directly. Do not call or mention web search for this result."
+    )
+
+
+def _fallback_local_tool_answer(tool_result: dict[str, Any] | None) -> str:
+    if not isinstance(tool_result, dict):
+        return ""
+    output = tool_result.get("output") if isinstance(tool_result.get("output"), dict) else {}
+    tool_name = str(tool_result.get("tool_name") or output.get("tool_name") or "")
+    if not tool_name.startswith("system.") or not isinstance(output, dict):
+        return ""
+    if tool_name == "system.time":
+        date = output.get("date", "")
+        time_value = output.get("time", "")
+        weekday = output.get("weekday_zh") or output.get("weekday", "")
+        timezone = output.get("timezone", "")
+        return f"当前日期是 {date}，{weekday}。当前时间是 {time_value}（{timezone}）。"
+    if tool_name == "system.calc":
+        return f"计算结果是：{output.get('result')}"
+    if tool_name == "system.unit_convert":
+        return f"换算结果是：{output.get('result')} {output.get('to', '')}".strip()
+    if tool_name == "system.uuid":
+        return f"生成的 UUID 是：{output.get('uuid')}"
+    if tool_name == "system.hash":
+        return f"{output.get('algorithm', 'hash')} 结果是：{output.get('hash')}"
+    return ""
+
+
 class EvalFinalNodesMixin:
     async def evaluator(self, state: AgentRuntimeState) -> AgentRuntimeState:
         is_resume = bool(state.get("_resume_context") or state.get("resolved_tool_call_ids"))
@@ -819,6 +918,12 @@ class EvalFinalNodesMixin:
                 f"[Artifacts]\n" +
                 "\n".join(str(a.get("title") or a.get("id", "")) for a in artifacts[:5])
             )
+        web_search_block = _web_search_result_block(tool_result)
+        if web_search_block:
+            extra_blocks.append(web_search_block)
+        local_tool_block = _local_tool_result_block(tool_result)
+        if local_tool_block:
+            extra_blocks.append(local_tool_block)
         if tool_result.get("status"):
             extra_blocks.append(
                 f"[Tool Result]\n"
@@ -865,6 +970,10 @@ class EvalFinalNodesMixin:
         )
         if intent in ("document_qa",):
             system_instruction += "8. 你只能基于当前上传文档的内容回答。如果文档解析内容有限，请如实告知用户。\n"
+        elif intent == "tool.web_search":
+            system_instruction += "8. 如果 [Web Search Results] 有结果，必须基于搜索结果回答并引用来源 URL；不要用旧知识覆盖搜索结果。若搜索失败或 results=0，必须明确说未能完成联网验证，不要编造“最新/当前”事实。\n"
+        elif str(intent).startswith("system."):
+            system_instruction += "8. 如果 [Local Tool Result] 有结果，请直接基于本地工具输出回答；不要说需要联网，不要编造权限限制。\n"
         elif intent in ("research", "rag", "feed_research", "mixed"):
             system_instruction += "8. 如果证据不足，要明确说「当前相关材料中没有足够信息」。\n"
         approval_line = _approval_context_line(state)
@@ -915,6 +1024,8 @@ class EvalFinalNodesMixin:
         rag_answer = str((payload.get("rag") or {}).get("answer", ""))
         artifact_titles = [str(a.get("title", "")) for a in (payload.get("artifacts") or [])[:3] if a.get("title")]
         tool_status = str((payload.get("tool_result") or {}).get("status", ""))
+        web_search_block = _web_search_result_block(payload.get("tool_result") or {})
+        local_tool_block = _local_tool_result_block(payload.get("tool_result") or {})
         constraint_block = self._final_response_constraint_block(state)
         runtime_context = (
             (f"{constraint_block}\n" if constraint_block else "") +
@@ -924,6 +1035,8 @@ class EvalFinalNodesMixin:
             + (f"研究摘要: {research_summary[:300]}\n" if research_summary else "")
             + (f"RAG 回答: {rag_answer[:300]}\n" if rag_answer else "")
             + (f"工具状态: {tool_status}\n" if tool_status else "")
+            + (f"{web_search_block}\n" if web_search_block else "")
+            + (f"{local_tool_block}\n" if local_tool_block else "")
             + (f"已有成果物: {', '.join(artifact_titles)}\n" if artifact_titles else "")
             + (f"错误: {len(payload.get('errors', []))} 条\n" if payload.get("errors") else "")
         )
@@ -998,6 +1111,9 @@ class EvalFinalNodesMixin:
                 bullets = "\n".join(f"- {item}" for item in previous[-8:])
                 return f"当前会话历史里，你前面问过这些：\n\n{bullets}"
             return "当前会话历史通道是打开的，但我没有找到这条消息之前的用户提问。"
+        local_tool_answer = _fallback_local_tool_answer(state.get("tool_result") or state.get("tool_call") or {})
+        if local_tool_answer:
+            return local_tool_answer
         # ── Memory write: confirm the save ONLY if actually written ──
         mem_result = state.get("memory_write_result") or {}
         save_results = state.get("memory_save_results", [])
@@ -1025,6 +1141,8 @@ class EvalFinalNodesMixin:
         if isinstance(content, list):
             return "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
         return str(content)
+
+
     @staticmethod
     def _sanitize_memory_claims(answer: str, save_results: list[dict[str, Any]],
                                  memory_write_result: dict[str, Any]) -> str:

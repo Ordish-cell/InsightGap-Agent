@@ -126,15 +126,115 @@ function collectFallbackItems(message: AgentThoughtStreamProps['message']) {
   return items
 }
 
-function toolStartedText(locale: 'en' | 'zh', toolName: string) {
+function toolArgs(payload: UnknownRecord): UnknownRecord {
+  return asRecord(payload.argsPreview || payload.args_preview || payload.tool_args)
+}
+
+function parsedToolOutput(payload: UnknownRecord): UnknownRecord {
+  const raw = payload.outputPreview || payload.output_preview
+  if (typeof raw === 'string') {
+    try {
+      return asRecord(JSON.parse(raw))
+    } catch {
+      return {}
+    }
+  }
+  return asRecord(raw)
+}
+
+function webSearchDetail(payload: UnknownRecord): string {
+  const rounds = Array.isArray(payload.search_rounds) ? payload.search_rounds : []
+  const roundText = rounds
+    .slice(0, 2)
+    .map((item) => {
+      const record = asRecord(item)
+      const round = String(record.round || '')
+      const query = String(record.query || '')
+      const count = String(record.result_count ?? '')
+      const observation = String(record.observation || '')
+      return [`Round ${round}`, query, count ? `${count} results` : '', observation].filter(Boolean).join(' · ')
+    })
+    .join('\n')
+  const previewResults = Array.isArray(payload.results_preview) ? payload.results_preview : []
+  if (previewResults.length) {
+    const resultsText = previewResults
+      .slice(0, 5)
+      .map((item, index) => {
+        const record = asRecord(item)
+        const title = String(record.title || record.url || `Result ${index + 1}`)
+        const url = String(record.url || '')
+        const snippet = String(record.snippet || '').trim()
+        return [title, url, snippet].filter(Boolean).join('\n')
+      })
+      .join('\n\n')
+    return [String(payload.reasoning_summary || '').trim(), roundText, resultsText].filter(Boolean).join('\n\n')
+  }
+  const parsed = parsedToolOutput(payload)
+  const output = asRecord(parsed.output || parsed)
+  const results = Array.isArray(output.results) ? output.results : []
+  if (!results.length) return [roundText, String(output.error || parsed.error || payload.error || '').trim()].filter(Boolean).join('\n\n')
+  return results
+    .slice(0, 5)
+    .map((item, index) => {
+      const record = asRecord(item)
+      const title = String(record.title || record.url || `Result ${index + 1}`)
+      const url = String(record.url || '')
+      const snippet = String(record.snippet || '').trim()
+      return [title, url, snippet].filter(Boolean).join('\n')
+    })
+    .join('\n\n')
+}
+
+function webSearchResultCount(payload: UnknownRecord) {
+  const directCount = payload.resultCount ?? payload.result_count
+  if (typeof directCount === 'number') return directCount
+  if (typeof directCount === 'string' && directCount.trim() !== '') return Number(directCount) || 0
+  const parsed = parsedToolOutput(payload)
+  const output = asRecord(parsed.output || parsed)
+  const results = Array.isArray(output.results) ? output.results : []
+  return results.length
+}
+
+function webSearchError(payload: UnknownRecord) {
+  if (payload.error) return String(payload.error).trim()
+  const parsed = parsedToolOutput(payload)
+  const output = asRecord(parsed.output || parsed)
+  return String(output.error || parsed.error || '').trim()
+}
+
+function isLocalSystemTool(toolName: string) {
+  return toolName.startsWith('system.')
+}
+
+function toolStartedText(locale: 'en' | 'zh', toolName: string, payload: UnknownRecord) {
+  if (toolName === 'web.search') {
+    const query = String(toolArgs(payload).query || '').trim()
+    return query ? text(locale, `正在联网搜索：${query}`, `Searching the web: ${query}`) : text(locale, '正在联网搜索', 'Searching the web')
+  }
+  if (isLocalSystemTool(toolName)) {
+    return text(locale, `正在调用本地工具：${toolName}`, `Calling local tool: ${toolName}`)
+  }
   return text(locale, `正在调用 ${toolName}`, `Calling ${toolName}`)
 }
 
-function toolCompletedText(locale: 'en' | 'zh', toolName: string) {
+function toolCompletedText(locale: 'en' | 'zh', toolName: string, payload: UnknownRecord) {
+  if (toolName === 'web.search') {
+    const count = webSearchResultCount(payload)
+    return text(locale, `已读取 ${count} 条搜索结果`, `Read ${count} search result${count === 1 ? '' : 's'}`)
+  }
+  if (isLocalSystemTool(toolName)) {
+    return text(locale, '已完成本地工具调用', 'Local tool call completed')
+  }
   return text(locale, `已完成 ${toolName}`, `Finished ${toolName}`)
 }
 
 function toolFailedText(locale: 'en' | 'zh', toolName: string) {
+  if (toolName === 'web.search') {
+    return text(locale, '联网搜索失败，改用已有上下文回答', 'Web search failed. Using the available context.')
+  }
+  if (isLocalSystemTool(toolName)) {
+    return text(locale, '本地工具调用失败', 'Local tool call failed')
+  }
   return text(locale, `${toolName} 执行失败`, `${toolName} failed`)
 }
 
@@ -192,12 +292,14 @@ function collectActivityTrace(message: AgentThoughtStreamProps['message'], local
     if (eventType === 'tool_call_started') {
       const id = getToolCallId(event, index)
       const toolName = getToolName(event)
-      const detail = truncate(payload.argsPreview || payload.args_preview || payload.tool_args, 360)
+      const detail = toolName === 'web.search'
+        ? truncate(String(toolArgs(payload).query || ''), 360)
+        : truncate(payload.argsPreview || payload.args_preview || payload.tool_args, 360)
       toolIndex.set(id, items.length)
       pushItem(items, {
         id: `tool-${id}`,
         kind: 'tool',
-        text: toolStartedText(locale, toolName),
+        text: toolStartedText(locale, toolName, payload),
         status: 'running',
         detail,
         createdAt,
@@ -208,13 +310,15 @@ function collectActivityTrace(message: AgentThoughtStreamProps['message'], local
     if (eventType === 'tool_call_completed' || eventType === 'tool_call_failed') {
       const id = getToolCallId(event, index)
       const toolName = getToolName(event)
-      const failed = eventType === 'tool_call_failed'
-      const detail = truncate(payload.outputPreview || payload.output_preview || payload.error, 420)
+      const failed = eventType === 'tool_call_failed' || (toolName === 'web.search' && webSearchResultCount(payload) === 0 && Boolean(webSearchError(payload)))
+      const detail = toolName === 'web.search'
+        ? truncate(webSearchDetail(payload) || payload.error, 700)
+        : truncate(payload.outputPreview || payload.output_preview || payload.error, 420)
       const currentIndex = toolIndex.get(id)
       const nextItem: ActivityItem = {
         id: `tool-${id}`,
         kind: 'tool',
-        text: failed ? toolFailedText(locale, toolName) : toolCompletedText(locale, toolName),
+        text: failed ? toolFailedText(locale, toolName) : toolCompletedText(locale, toolName, payload),
         status: failed ? 'failed' : 'completed',
         detail,
         createdAt,

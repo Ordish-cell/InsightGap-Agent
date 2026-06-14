@@ -186,6 +186,12 @@ def _tool_display_name_zh(tool_name: str) -> str:
         "local_file.delete": "删除文件",
         "local_file.read": "读取文件",
         "local_file.list": "列出文件",
+        "web.search": "联网搜索",
+        "system.time": "读取本地时间",
+        "system.calc": "本地计算",
+        "system.unit_convert": "本地单位换算",
+        "system.uuid": "生成 UUID",
+        "system.hash": "本地哈希计算",
     }
     return names.get(tool_name, "")
 
@@ -198,6 +204,12 @@ def _intent_label(intent: str) -> str:
         "artifact": "产物生成任务",
         "tool": "工具相关任务",
         "tool.email": "邮件工具任务",
+        "tool.web_search": "联网搜索任务",
+        "system.time": "本地时间查询",
+        "system.calc": "本地计算任务",
+        "system.unit_convert": "本地单位换算任务",
+        "system.uuid": "本地 UUID 生成任务",
+        "system.hash": "本地哈希计算任务",
         "tool.browser": "浏览器工具任务",
         "tool.comment": "评论发布任务",
         "tool.form_submit": "表单提交任务",

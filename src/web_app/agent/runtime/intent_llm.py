@@ -86,7 +86,7 @@ def _build_prompt(user_input: str, page_context: dict[str, Any], selected_feed_c
             "evaluator",
             "final_response",
         ],
-        "current_route_options": ["chat", "research", "rag", "artifact", "feed_research", "tool", "memory", "skill", "mixed"],
+        "current_route_options": ["chat", "research", "rag", "artifact", "feed_research", "tool", "tool.web_search", "system.time", "system.calc", "system.unit_convert", "system.uuid", "system.hash", "memory", "skill", "mixed"],
     }
     return (
         "你是 Agent OS 的首页意图判断器。你的任务不是执行用户请求，而是判断用户想让 Agent 做什么，并输出严格 JSON。\n"
@@ -105,6 +105,10 @@ def _build_prompt(user_input: str, page_context: dict[str, Any], selected_feed_c
         "- 文档限定问答：根据我的文档XX、知识库里有没有XX → rag_qa\n"
         "- 工具调用：帮我发邮件、帮我创建文件、帮我删除XX → 对应tool_agent\n"
         "- 临时情绪/一次性任务：我今天有点累、帮我写一封邮件\n"
+        "本地工具优先规则：能通过本地只读工具直接完成的问题，不要联网。时间/日期/星期/时区问题用 system.time；数学计算用 system.calc；单位换算用 system.unit_convert；UUID 生成用 system.uuid；哈希计算用 system.hash。\n"
+        "联网规则：只有用户明确要求联网/搜索/上网查，或问题确实需要外部世界的实时状态（新闻、价格、股价、天气、赛程、政策法规、官网信息、当前版本、最新 release 等）时，才判定为 intent=tool.web_search、required_agents=[\"tool_agent\"]、risk_level=L1。"
+        "不要因为用户只说了今天/现在/当前/实时/latest/current/today 就自动判定 web.search；这些词必须和外部动态领域组合才触发联网。"
+        "当用户要求深度研究/深度调研/研究报告/系统性调研时，仍判定为 research/feed_research，交给 research_agent，不要用 tool.web_search 替代 ODR。\n"
         "严格要求：只输出 JSON，不要 Markdown，不要代码块，不要 chain-of-thought，不要执行工具。required_agents 只能从输入的 available_capabilities 中选择。\n"
         "如果不确定，needs_clarification=true。不要把高风险动作标为低风险。\n"
         "输出字段：intent, confidence, risk_level, needs_approval, needs_clarification, required_agents, expected_output, reason_summary, suggested_route_hints, tool_action_type, answer_mode。\n"
@@ -182,6 +186,10 @@ def _build_tool_selection_prompt(
         "11. 对 L3/L4 工具，你只负责选择工具和参数，不要执行，不要跳过审批。\n"
         "12. 如果没有合适工具，返回 route=\"chat\" 或 route=\"unknown_tool\"，并说明 requested_action。\n"
         "13. 如果用户说\"发邮件说XXX\"但没有主题，正文提取为 body，subject 留空放入 missing_fields，不要编造主题。\n\n"
+        "14. 本地工具优先：日期/时间/星期/时区问题选择 system.time；数学计算选择 system.calc；单位换算选择 system.unit_convert；UUID 生成选择 system.uuid；哈希计算选择 system.hash。不要为这些问题选择 web.search。\n"
+        "15. 只有用户明确要求联网/搜索/上网查，或问题需要外部实时事实（新闻、价格、股价、天气、赛程、政策法规、官网信息、当前版本、最新 release 等），并且 available_tools 存在 web.search，才选择 web.search。\n"
+        "16. 不要因为用户只说了今天/现在/当前/实时/latest/current/today 就自动选择 web.search；这些词必须和外部动态领域组合才触发联网。\n"
+        "17. 如果用户要求深度研究/深度调研/研究报告/系统性调研，不要选择 web.search，返回 route=\"research\"。\n\n"
         "输出 JSON schema：\n"
         "{\n"
         '  "route": "chat" | "tool" | "research" | "rag" | "artifact" | "memory" | "skill" | "mixed" | "unknown_tool",\n'
@@ -213,7 +221,16 @@ def _build_tool_selection_prompt(
         "用户：帮我研究一下 LangGraph 最新动态\n"
         "输出：{\"route\":\"research\",\"confidence\":0.9,\"tool_calls\":[],\"missing_fields\":[],"
         "\"requested_action\":null,\"reason\":\"用户要求研究一个主题\"}\n\n"
-        "示例 5 — 聊天：\n"
+        "示例 5 — 轻量联网搜索：\n"
+        "用户：查一下今天 OpenAI 有什么最新消息\n"
+        "输出：{\"route\":\"tool\",\"confidence\":0.95,\"tool_calls\":[{\"name\":\"web.search\","
+        "\"arguments\":{\"query\":\"今天 OpenAI 有什么最新消息\",\"limit\":5,\"recency_days\":1}}],"
+        "\"missing_fields\":[],\"requested_action\":\"web_search\",\"reason\":\"用户询问强时效信息，需要轻量联网搜索\"}\n\n"
+        "示例 5b — 本地时间：\n"
+        "用户：今天是几月几号？\n"
+        "输出：{\"route\":\"tool\",\"confidence\":0.98,\"tool_calls\":[{\"name\":\"system.time\",\"arguments\":{}}],"
+        "\"missing_fields\":[],\"requested_action\":\"local_time\",\"reason\":\"当前日期可由本地时间工具回答，不需要联网\"}\n\n"
+        "示例 6 — 聊天：\n"
         "用户：你好\n"
         "输出：{\"route\":\"chat\",\"confidence\":0.95,\"tool_calls\":[],\"missing_fields\":[],"
         "\"requested_action\":null,\"reason\":\"用户只是打招呼\"}\n\n"

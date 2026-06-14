@@ -35,12 +35,14 @@ def test_tool_output_preview_redacts_sensitive_fields_and_truncates():
             "status": "completed",
             "token": "secret-token",
             "_metadata": {"approval_id": 1},
+            "output": {"_metadata": {"approval_id": 2}, "nested_token": "nested-secret"},
             "content": "x" * 1000,
         },
         max_chars=120,
     )
 
     assert "secret-token" not in preview
+    assert "nested-secret" not in preview
     assert "_metadata" not in preview
     assert len(preview) <= 123
     assert preview.endswith("...")

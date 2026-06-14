@@ -175,6 +175,12 @@ def _tool_display_name_local(tool_name: str) -> str:
         "local_file.delete": "删除文件",
         "local_file.read": "读取文件",
         "local_file.list": "列出文件",
+        "web.search": "联网搜索",
+        "system.time": "读取本地时间",
+        "system.calc": "本地计算",
+        "system.unit_convert": "本地单位换算",
+        "system.uuid": "生成 UUID",
+        "system.hash": "本地哈希计算",
     }
     return names.get(tool_name, tool_name)
 

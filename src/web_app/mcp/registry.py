@@ -21,6 +21,98 @@ BUILTIN_TOOLS = [
         output_schema={"type": "object", "properties": {"results": {"type": "array"}}},
     ),
     MCPToolSpec(
+        name="web.search",
+        description="Search the public web for current information. Read-only lightweight search, separate from Open Deep Research.",
+        category="web",
+        safety_level=L0_READ_ONLY,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "default": 5},
+                "recency_days": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+        output_schema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "provider": {"type": "string"},
+                "used_fallback": {"type": "boolean"},
+                "final_query": {"type": "string"},
+                "search_rounds": {"type": "array"},
+                "reasoning_summary": {"type": "string"},
+                "results": {"type": "array"},
+                "error": {"type": "string"},
+            },
+        },
+    ),
+    MCPToolSpec(
+        name="system.time",
+        description="Read the local system date, time, weekday, timezone, and ISO timestamp. No web access.",
+        category="system",
+        safety_level=L0_READ_ONLY,
+        input_schema={"type": "object", "properties": {}},
+        output_schema={
+            "type": "object",
+            "properties": {
+                "date": {"type": "string"},
+                "time": {"type": "string"},
+                "weekday": {"type": "string"},
+                "timezone": {"type": "string"},
+                "iso": {"type": "string"},
+            },
+        },
+    ),
+    MCPToolSpec(
+        name="system.calc",
+        description="Evaluate a simple local arithmetic expression. No web access.",
+        category="system",
+        safety_level=L0_READ_ONLY,
+        input_schema={"type": "object", "properties": {"expression": {"type": "string"}}, "required": ["expression"]},
+        output_schema={"type": "object", "properties": {"expression": {"type": "string"}, "result": {"type": "number"}}},
+    ),
+    MCPToolSpec(
+        name="system.unit_convert",
+        description="Convert common local units. No web access.",
+        category="system",
+        safety_level=L0_READ_ONLY,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "value": {"type": "number"},
+                "from": {"type": "string"},
+                "to": {"type": "string"},
+            },
+            "required": ["value", "from", "to"],
+        },
+        output_schema={"type": "object", "properties": {"value": {"type": "number"}, "from": {"type": "string"}, "to": {"type": "string"}, "result": {"type": "number"}}},
+    ),
+    MCPToolSpec(
+        name="system.uuid",
+        description="Generate a UUID locally. No web access.",
+        category="system",
+        safety_level=L0_READ_ONLY,
+        input_schema={"type": "object", "properties": {}},
+        output_schema={"type": "object", "properties": {"uuid": {"type": "string"}}},
+    ),
+    MCPToolSpec(
+        name="system.hash",
+        description="Hash text locally with md5, sha1, sha256, or sha512. No web access.",
+        category="system",
+        safety_level=L0_READ_ONLY,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "algorithm": {"type": "string", "default": "sha256"},
+                "text": {"type": "string"},
+            },
+            "required": ["text"],
+        },
+        output_schema={"type": "object", "properties": {"algorithm": {"type": "string"}, "hash": {"type": "string"}}},
+    ),
+    MCPToolSpec(
         name="github_mcp.repo_summary",
         description="Deterministic local GitHub repository summary.",
         category="github",
@@ -210,9 +302,18 @@ def _collect_all_aliases() -> dict[str, list[str]]:
     """Collect aliases from provider modules."""
     from src.web_app.mcp.email_provider import EMAIL_TOOL_ALIASES
     from src.web_app.mcp.local_file_tools import LOCAL_FILE_TOOL_ALIASES
+    from src.web_app.mcp.web_search_provider import WEB_SEARCH_TOOL_ALIASES
     merged: dict[str, list[str]] = {}
     merged.update(EMAIL_TOOL_ALIASES)
     merged.update(LOCAL_FILE_TOOL_ALIASES)
+    merged.update(WEB_SEARCH_TOOL_ALIASES)
+    merged.update({
+        "system.time": ["runtime.now", "clock.now", "time.now", "current_time"],
+        "system.calc": ["calculator", "calc"],
+        "system.unit_convert": ["unit.convert", "unit_convert"],
+        "system.uuid": ["uuid", "uuid.generate"],
+        "system.hash": ["hash", "hash.text"],
+    })
     return merged
 
 

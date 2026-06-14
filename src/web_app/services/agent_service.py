@@ -2363,14 +2363,22 @@ def _safe_preview_from_output(tool_name: str, output: dict[str, Any]) -> dict[st
 def _tool_output_preview_for_frontend(output: dict[str, Any] | None, max_chars: int = 700) -> str:
     if not output:
         return ""
-    safe = {
-        key: value
-        for key, value in output.items()
-        if not str(key).startswith("_") and not any(secret in str(key).lower() for secret in _SENSITIVE_KEYS)
-    }
+    safe = _redact_tool_output_value(output)
     try:
         text = json.dumps(safe, ensure_ascii=False, default=str)
     except TypeError:
         text = str(safe)
     text = " ".join(text.split())
     return text[:max_chars] + ("..." if len(text) > max_chars else "")
+
+
+def _redact_tool_output_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _redact_tool_output_value(item)
+            for key, item in value.items()
+            if not str(key).startswith("_") and not any(secret in str(key).lower() for secret in _SENSITIVE_KEYS)
+        }
+    if isinstance(value, list):
+        return [_redact_tool_output_value(item) for item in value[:10]]
+    return value
