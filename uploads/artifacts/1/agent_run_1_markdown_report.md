@@ -1,3 +1,8 @@
-# 知识库检索
+# 研究摘要
 
-当前知识库中没有找到足够证据回答该问题。
+I need a detailed, step-by-step research report workflow designed for reproducible, evidence-based academic or technical research—specifically optimized for integration with DashScope/Qwen OpenAI-compatible models that require strict JSON-object output (no arrays, no markdown, no reasoning blocks) and enforce Pydantic schema compliance (e.g., 'research_brief' as the sole field in ResearchQuestion, 'need_clarification', 'question', and 'verification' in ClarifyWithUser). The workflow must explicitly handle structured output constraints—including mandatory single JSON object returns, rejection of thinking blocks or hidden reasoning, and strict adherence to field names (e.g., never using 'research_question' or 'question' where 'research_brief' is required). It should specify how to manage int
+
+## 关键发现
+
+
+- {'title': 'Research completed via Open Deep Research', 'detail': "I need a detailed, step-by-step research report workflow designed for reproducible, evidence-based academic or technical research—specifically optimized for integration with DashScope/Qwen OpenAI-compatible models that require strict JSON-object output (no arrays, no markdown, no reasoning blocks) and enforce Pydantic schema compliance (e.g., 'research_brief' as the sole field in ResearchQuestion, 'need_clarification', 'question', and 'verification' in ClarifyWithUser). The workflow must explici", 'confidence': 0.85, 'evidence_refs': []}
