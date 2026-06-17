@@ -56,7 +56,10 @@ def legacy_next_route_node(state: AgentRuntimeState) -> str:
 
     for node_name in route_list:
         if node_name not in completed:
-            return map_route_to_node(node_name)
+            mapped = map_route_to_node(node_name)
+            if mapped == "final_response" and node_name not in {"final_response", "evaluator"}:
+                state.setdefault("dispatch_warnings", []).append(f"unknown_route_node:{node_name}")
+            return mapped
 
     return "final_response"
 

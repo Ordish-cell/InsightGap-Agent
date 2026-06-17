@@ -148,4 +148,5 @@ def test_graph_wiring_dispatches_after_supervisor_observer():
     graph_path = _ROOT / "src" / "web_app" / "agent" / "runtime" / "graph_builder.py"
     text = graph_path.read_text(encoding="utf-8")
 
-    assert 'workflow.add_conditional_edges(\n        "supervisor_observer"' in text
+    assert 'workflow.add_edge("supervisor_observer", "llm_supervisor_route")' in text
+    assert 'workflow.add_conditional_edges(\n        "llm_supervisor_route"' in text

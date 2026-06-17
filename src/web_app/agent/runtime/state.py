@@ -82,6 +82,11 @@ class AgentRuntimeState(TypedDict, total=False):
     replanner_candidate_warnings: list[str]
     replanner_control_decision: dict[str, Any]
     replanner_control_warnings: list[str]
+    llm_supervisor_trace: list[dict[str, Any]]
+    llm_supervisor_decision: dict[str, Any] | None
+    llm_supervisor_raw_response: Any | None
+    llm_supervisor_validation_errors: list[str]
+    llm_supervisor_original_route_plan: dict[str, Any]
     home_intent: dict[str, Any]
     langgraphstatus: dict[str, Any]
     current_node: str
@@ -157,6 +162,17 @@ class AgentRuntimeState(TypedDict, total=False):
     route_plan_snapshot: dict[str, Any] | None
     current_route_index: int
     resolved_tool_call_ids: list[int]
+
+    explicit_route: str | list[str] | None
+    explicit_agent: str | None
+    selected_agent: str | None
+    selected_action: str | None
+    user_clicked_action: str | None
+    action_id: str | None
+    target_agent: str | None
+    workflow: str | None
+    available_nodes: list[str]
+    dispatch_warnings: list[str]
 
     # ── Event sequencing ───────────────────────────────────────────
     _event_seq: int

@@ -176,6 +176,11 @@ class Settings(BaseSettings):
     agent_supervisor_shadow_metrics_enabled: bool = True
     agent_supervisor_control_enabled: bool = False
     agent_replanner_control_enabled: bool = False
+    agent_llm_supervisor_enabled: bool = True
+    agent_llm_supervisor_mode: str = "full"
+    agent_llm_supervisor_model: str = "qwen-plus"
+    agent_llm_supervisor_temperature: float = 0
+    agent_llm_supervisor_timeout_seconds: int = 20
     agent_langgraph_checkpointer_enabled: bool = False
     # Qwen model tier configuration
     qwen_fast_model: str = "qwen3.6-max-preview"

@@ -22,6 +22,22 @@ def get_chat_model(purpose: ModelPurpose | str, complexity: str = "normal", temp
     )
 
 
+def get_chat_model_by_name(model: str, temperature: float | None = None, timeout_seconds: int | None = None, streaming: bool = False) -> Any:
+    """Build a chat model with the existing provider/API-key configuration."""
+    settings = get_llm_settings()
+    return _cached_chat_model(
+        provider=settings.provider,
+        model=model,
+        base_url=settings.effective_base_url,
+        api_key=settings.effective_api_key,
+        timeout=settings.timeout_seconds if timeout_seconds is None else timeout_seconds,
+        max_retries=settings.max_retries,
+        temperature=settings.temperature if temperature is None else temperature,
+        enabled=settings.enabled,
+        streaming=streaming,
+    )
+
+
 @lru_cache
 def _cached_chat_model(provider: str, model: str, base_url: str, api_key: str, timeout: int, max_retries: int, temperature: float, enabled: bool, streaming: bool = False) -> Any:
     if not enabled or provider == "disabled":

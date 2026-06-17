@@ -46,6 +46,7 @@ def test_manifest_route_destinations_and_fallback_sequence_are_stable():
     assert "parallel_prefetch" in manifest["fallback_sequence"]
     assert "parallel_read_stage" in manifest["fallback_sequence"]
     assert "supervisor_observer" in manifest["fallback_sequence"]
+    assert "llm_supervisor_route" in manifest["fallback_sequence"]
     assert "context_builder" not in manifest["fallback_sequence"]
     assert "skill_matcher" not in manifest["fallback_sequence"]
     assert "replanner" not in manifest["fallback_sequence"]
@@ -59,7 +60,8 @@ def test_manifest_edges_match_current_graph_wiring():
     assert ("planner", "parallel_prefetch") in edge_pairs
     assert ("parallel_prefetch", "parallel_read_stage") in edge_pairs
     assert ("parallel_read_stage", "supervisor_observer") in edge_pairs
-    assert ("supervisor_observer", "route_dispatch") in edge_pairs
+    assert ("supervisor_observer", "llm_supervisor_route") in edge_pairs
+    assert ("llm_supervisor_route", "route_dispatch") in edge_pairs
     assert ("route_dispatch", "rag_agent") in edge_pairs
     assert ("route_dispatch", "evaluator") in edge_pairs
     assert ("evaluator", "final_response") in edge_pairs
@@ -75,6 +77,7 @@ def test_mermaid_render_includes_key_runtime_sections():
         "parallel_prefetch",
         "parallel_read_stage",
         "supervisor_observer",
+        "llm_supervisor_route",
         "route dispatch",
         "replanner dispatch observer",
         "rag_agent --> route_dispatch",

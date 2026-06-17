@@ -42,15 +42,17 @@ def build_agent_runtime_graph(
         {"continue": "home_intent_react", "done": "final_response"},
     )
 
-    # Planner -> parallel_prefetch -> parallel_read_stage -> supervisor_observer -> route dispatch.
+    # Planner -> parallel_prefetch -> parallel_read_stage -> supervisor_observer
+    # -> optional LLM route_plan supervision -> route dispatch.
     workflow.add_edge("home_intent_react", "planner")
     workflow.add_edge("planner", "parallel_prefetch")
     workflow.add_edge("parallel_prefetch", "parallel_read_stage")
     workflow.add_edge("parallel_read_stage", "supervisor_observer")
+    workflow.add_edge("supervisor_observer", "llm_supervisor_route")
 
     # context_builder + skill_matcher run inside parallel_read_stage.
     workflow.add_conditional_edges(
-        "supervisor_observer",
+        "llm_supervisor_route",
         dispatch_next_route_node,
         route_dests,
     )

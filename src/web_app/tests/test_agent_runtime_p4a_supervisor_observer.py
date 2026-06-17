@@ -135,5 +135,6 @@ def test_graph_wiring_runs_supervisor_between_parallel_read_and_dispatch():
     text = graph_path.read_text(encoding="utf-8")
 
     assert 'workflow.add_edge("parallel_read_stage", "supervisor_observer")' in text
-    assert 'workflow.add_conditional_edges(\n        "supervisor_observer"' in text
+    assert 'workflow.add_edge("supervisor_observer", "llm_supervisor_route")' in text
+    assert 'workflow.add_conditional_edges(\n        "llm_supervisor_route"' in text
     assert 'workflow.add_conditional_edges(\n            "parallel_read_stage"' not in text

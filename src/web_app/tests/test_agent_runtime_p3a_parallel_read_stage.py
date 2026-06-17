@@ -286,5 +286,6 @@ def test_graph_wiring_contains_parallel_read_stage():
     assert 'workflow.add_edge("planner", "parallel_prefetch")' in text
     assert 'workflow.add_edge("parallel_prefetch", "parallel_read_stage")' in text
     assert 'workflow.add_edge("parallel_read_stage", "supervisor_observer")' in text
-    assert 'workflow.add_conditional_edges(\n        "supervisor_observer"' in text
+    assert 'workflow.add_edge("supervisor_observer", "llm_supervisor_route")' in text
+    assert 'workflow.add_conditional_edges(\n        "llm_supervisor_route"' in text
     assert 'workflow.add_edge("parallel_prefetch", "context_builder")' not in text

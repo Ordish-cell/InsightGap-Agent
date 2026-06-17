@@ -18,6 +18,7 @@ from src.web_app.agent.runtime.node_groups.eval_final_nodes import EvalFinalNode
 from src.web_app.agent.runtime.node_groups.legacy_nodes import LegacyNodesMixin
 from src.web_app.agent.runtime.node_groups.read_nodes import ReadNodesMixin
 from src.web_app.agent.runtime.node_groups.setup_nodes import SetupNodesMixin
+from src.web_app.agent.runtime.llm_supervisor import llm_supervisor_route_node
 from src.web_app.agent.runtime.schemas import StateDelta
 from src.web_app.agent.runtime.state_delta import apply_state_delta, record_node_result
 from src.web_app.agent.runtime.supervisor import observe_supervisor_state
@@ -52,6 +53,45 @@ class RuntimeNodes(
             summary="Observed supervisor runtime state.",
         )
         return state
+
+    async def llm_supervisor_route(self, state, config=None):
+        for key in (
+            "explicit_route",
+            "explicit_agent",
+            "selected_agent",
+            "selected_action",
+            "user_clicked_action",
+            "action_id",
+            "target_agent",
+            "workflow",
+            "agent_llm_supervisor_enabled",
+            "agent_llm_supervisor_mode",
+            "agent_llm_supervisor_model",
+            "agent_llm_supervisor_temperature",
+            "agent_llm_supervisor_timeout_seconds",
+        ):
+            if key in self.payload and key not in state:
+                state[key] = self.payload[key]
+        merged_config = {"configurable": dict(self.payload)}
+        if isinstance(config, dict) and isinstance(config.get("configurable"), dict):
+            merged_config["configurable"].update(config["configurable"])
+        result = await llm_supervisor_route_node(state, config=merged_config)
+        record_node_result(
+            result,
+            node="llm_supervisor_route",
+            delta=StateDelta(
+                updates={
+                    "route_plan": result.get("route_plan"),
+                    "llm_supervisor_decision": result.get("llm_supervisor_decision"),
+                    "llm_supervisor_trace": result.get("llm_supervisor_trace", []),
+                    "llm_supervisor_validation_errors": result.get("llm_supervisor_validation_errors", []),
+                },
+                warnings=list(result.get("llm_supervisor_validation_errors", []) or []),
+                metadata={"source": "llm_supervisor_route"},
+            ),
+            summary="Applied LLM supervisor route decision when enabled.",
+        )
+        return result
 
 
 _PROPAGATE_MODULES = (

@@ -39,6 +39,7 @@ READ_NODE_NAMES: tuple[str, ...] = (
     "parallel_prefetch",
     "parallel_read_stage",
     "supervisor_observer",
+    "llm_supervisor_route",
     # Registered for compatibility; context/skill execute inside parallel_read_stage.
     "context_builder",
     "skill_matcher",
@@ -110,6 +111,13 @@ RUNTIME_NODE_SPECS: tuple[RuntimeNodeSpec, ...] = (
         description="Observe runtime state for future supervisor control without changing dispatch.",
     ),
     RuntimeNodeSpec(
+        "llm_supervisor_route", "llm_supervisor_route", "read",
+        reads=("route_plan", "parallel_read_results", "context", "completed_nodes"),
+        writes=("route_plan", "execution_plan", "llm_supervisor_decision", "llm_supervisor_trace"),
+        side_effect_level="read",
+        description="Optionally let an LLM supervisor validate and replace route_plan before dispatch.",
+    ),
+    RuntimeNodeSpec(
         "context_builder", "context_builder", "read",
         reads=("user_input", "prefetch_results"), writes=("context", "rag_evidence"),
         side_effect_level="read",
@@ -179,6 +187,7 @@ FALLBACK_NODE_NAMES: tuple[str, ...] = (
     "parallel_prefetch",
     "parallel_read_stage",
     "supervisor_observer",
+    "llm_supervisor_route",
     "research",
     "rag",
     "artifact",
