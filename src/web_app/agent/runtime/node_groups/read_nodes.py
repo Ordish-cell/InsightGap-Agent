@@ -21,7 +21,7 @@ class ReadNodesMixin:
                 "sources": list((state.get("prefetch_results") or {}).keys()),
             },
         )
-        emit_visible_thought(self.db, state, "parallel_prefetch")
+        emit_visible_thought(self.db, state, "parallel_prefetch", stream_queue=self._stream_queue)
         record_step(
             self.db,
             state["run_id"],
@@ -67,7 +67,7 @@ class ReadNodesMixin:
                 "branches": state.get("parallel_read_branch_timings", {}),
             },
         )
-        emit_visible_thought(self.db, state, "parallel_read_stage")
+        emit_visible_thought(self.db, state, "parallel_read_stage", stream_queue=self._stream_queue)
         record_step(
             self.db,
             state["run_id"],
@@ -358,7 +358,7 @@ class ReadNodesMixin:
                 "feed_card_loaded": bool(feed_card_context),
             },
         )
-        emit_visible_thought(self.db, state, "context_builder")
+        emit_visible_thought(self.db, state, "context_builder", stream_queue=self._stream_queue)
         if feed_card_id and not feed_card_context:
             record_step(self.db, state["run_id"], "feed_card_context", "load_context",
                         {"feed_card_id": feed_card_id},
@@ -403,7 +403,7 @@ class ReadNodesMixin:
                 "score": (state.get("matched_skill") or {}).get("match_score"),
             },
         )
-        emit_visible_thought(self.db, state, "skill_matcher")
+        emit_visible_thought(self.db, state, "skill_matcher", stream_queue=self._stream_queue)
         return state
 
     def _format_recent_chat_messages_for_context(self, messages: list[Any]) -> str:

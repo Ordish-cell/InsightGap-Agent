@@ -33,9 +33,10 @@ class RuntimeEventEmitter:
         await emitter.status("approval_required", {"approval_id": "..."})
     """
 
-    def __init__(self, db: Session, state: dict[str, Any]):
+    def __init__(self, db: Session, state: dict[str, Any], stream_queue: Any = None):
         self.db = db
         self._state = state
+        self._stream_queue = stream_queue
         self._seq = state.setdefault("_event_seq", 0)
 
     # ── helpers ──────────────────────────────────────────────────
@@ -66,7 +67,7 @@ class RuntimeEventEmitter:
         return self._seq
 
     def _queue(self) -> Any:
-        return self._state.get("_stream_queue")
+        return self._stream_queue or self._state.get("_stream_queue")
 
     # ── public emit ──────────────────────────────────────────────
 

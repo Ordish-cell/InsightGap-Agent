@@ -181,7 +181,20 @@ class Settings(BaseSettings):
     agent_llm_supervisor_model: str = "qwen-plus"
     agent_llm_supervisor_temperature: float = 0
     agent_llm_supervisor_timeout_seconds: int = 20
-    agent_langgraph_checkpointer_enabled: bool = False
+    agent_langgraph_checkpointer_enabled: bool = True
+    agent_approval_interrupt_enabled: bool = True  # True → LangGraph interrupt(); False → legacy END-based
+    # Pending approvals older than this are auto-expired (cannot be approved/rejected).
+    # Expired approvals' checkpoints enter cleanup rotation after the expired TTL.
+    agent_approval_pending_ttl_hours: int = 24
+    # Checkpointer backend: "postgres" (production) | "redis" (experimental) | "memory" (dev/test only)
+    agent_checkpointer_backend: str = "postgres"
+    # True → fail fast at startup if durable checkpoint storage is unavailable.
+    # Production must be True.  Only set False for local dev with no PostgreSQL.
+    agent_checkpointer_require_durable: bool = True
+    agent_checkpointer_database_url: str = ""  # if empty, uses main database_url
+    # Redis checkpointer configuration (when backend=redis)
+    redis_password: str = ""
+    redis_checkpointer_key_prefix: str = "langgraph:checkpoint:"
     # Qwen model tier configuration
     qwen_fast_model: str = "qwen3.6-max-preview"
     qwen_balanced_model: str = "qwen3.6-plus"

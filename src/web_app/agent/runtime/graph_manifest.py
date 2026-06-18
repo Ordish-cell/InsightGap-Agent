@@ -32,7 +32,6 @@ MAIN_CHAIN_EDGES: tuple[dict[str, str], ...] = (
     {"from": "route_dispatch", "to": "skill_agent", "condition": "skill_agent"},
     {"from": "route_dispatch", "to": "evaluator", "condition": "evaluator"},
     {"from": "route_dispatch", "to": "final_response", "condition": "final_response"},
-    {"from": "route_dispatch", "to": END_SENTINEL, "condition": "waiting_approval"},
     {"from": "evaluator", "to": "final_response"},
     {"from": "final_response", "to": END_SENTINEL},
 )

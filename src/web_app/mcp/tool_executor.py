@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,8 +26,17 @@ class MCPToolExecutor:
 
         decision = PermissionGuard().check_tool_call(tool_name, tool.permission_level, tool.approval_required)
         if tool.permission_level == L4_HIGH_RISK or (not decision["allowed"] and not decision["requires_approval"]):
+            logging.getLogger(__name__).info(
+                "[APPROVAL_FLOW] tool_executor BLOCKED tool=%s risk=%s reason=%s user=%s",
+                tool_name, safety_level, decision.get("reason"), user_id,
+            )
             return self._finish(db, call, "blocked", {}, decision["reason"])
         if tool.permission_level == L3_EXTERNAL_WRITE or decision["requires_approval"]:
+            logging.getLogger(__name__).info(
+                "[APPROVAL_FLOW] tool_executor REQUIRES_APPROVAL tool=%s risk=%s "
+                "user=%s run_id=%s",
+                tool_name, safety_level, user_id, agent_run_id,
+            )
             # Build a rich preview for the approval card
             preview = _build_action_preview(tool_name, input_data)
             safety_notes = _build_safety_notes(tool_name, tool.permission_level)

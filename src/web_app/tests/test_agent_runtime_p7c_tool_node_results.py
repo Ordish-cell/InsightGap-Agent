@@ -8,7 +8,6 @@ _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from src.web_app.agent.runtime.dispatch import END_SENTINEL, dispatch_next_route_node
 from src.web_app.agent.runtime.node_groups import agent_nodes, eval_final_nodes
 from src.web_app.agent.runtime.nodes import RuntimeNodes
 from src.web_app.agent.runtime.state_delta import latest_agent_result
@@ -39,8 +38,14 @@ def _node_result(state):
     return state["node_results"][-1]
 
 
+# ── updated for interrupt-based approval ──────────────────────────
+
+
 @pytest.mark.asyncio
-async def test_waiting_approval_records_needs_approval_without_completion(monkeypatch):
+async def test_interrupt_pause_sets_approval_payload_and_interrupts(monkeypatch):
+    """When mcp_service returns waiting_approval, tool_agent calls
+    LangGraph interrupt() with the correct payload containing
+    approval_id, tool_call_id, tool_name, risk_level."""
     _patch_common(monkeypatch)
     monkeypatch.setattr(agent_nodes, "infer_tool", lambda *args, **kwargs: ("email.send", {"to": "a@example.com"}))
     monkeypatch.setattr(agent_nodes, "validate_tool_input", lambda *args, **kwargs: ({"to": "a@example.com"}, []))
@@ -51,74 +56,101 @@ async def test_waiting_approval_records_needs_approval_without_completion(monkey
         "output": {"preview": "send"},
     })
 
+    # Simulate interrupt + approved resume
+    interrupt_captured = []
+    def _fake_interrupt(payload):
+        interrupt_captured.append(payload)
+        return {"action": "approved", "tool_result": {"success": True, "sent": True}}
+
+    import langgraph.types as lg_types
+    monkeypatch.setattr(lg_types, "interrupt", _fake_interrupt)
+
     result = await RuntimeNodes(make_test_session(), {}).tool_agent(_base_state())
 
-    assert result["status"] == "waiting_approval"
-    assert result["approval_payload"]["approval_id"] == "ap1"
-    assert result["pending_tool_name"] == "email.send"
-    assert result["pending_tool_call_id"] == "tc1"
-    assert "tool_agent" not in result["completed_nodes"]
-    assert latest_agent_result(result, "tool_agent")["status"] == "needs_approval"
-    assert _node_result(result)["node"] == "tool_agent"
-    assert _node_result(result)["status"] == "needs_approval"
-    assert _node_result(result)["delta"]["updates"]["approval_payload"] == result["approval_payload"]
-    assert dispatch_next_route_node(result) == END_SENTINEL
+    # interrupt was called
+    assert len(interrupt_captured) == 1
+    payload = interrupt_captured[0]
+    assert payload["type"] == "approval_required"
+    assert payload["approval_pause_mode"] == "interrupt"
+    assert payload["tool_name"] == "email.send"
+    assert payload["approval_id"] == "ap1"
+    assert payload["tool_call_id"] == "tc1"
+    assert payload["risk_level"] == "L3"
+
+    # After approved resume: completed + clean
+    assert "tool_agent" in result["completed_nodes"]
+    assert result["tool_result"]["success"] is True
+    assert result["approval_required"] is False
+    assert result["pending_tool_call_id"] is None
+    assert latest_agent_result(result, "tool_agent")["status"] == "ok"
 
 
 @pytest.mark.asyncio
-async def test_resume_approved_records_ok_and_clears_pending(monkeypatch):
+async def test_interrupt_resume_approved_clears_pending_and_completes(monkeypatch):
+    """When interrupt() returns action=approved, tool_agent accepts
+    the tool_result and marks itself completed."""
     _patch_common(monkeypatch)
-    state = _base_state()
-    state.update({
-        "pending_tool_call_id": "tc1",
-        "resolved_tool_call_ids": ["tc1"],
-        "approval_required": True,
-        "approval_payload": {"approval_id": "ap1"},
-        "pending_approval_id": "ap1",
-        "pending_tool_name": "email.send",
-        "pending_tool_args": {"to": "a@example.com"},
-        "resume_token": "approval:ap1",
-        "tool_call": {"id": "tc1", "status": "completed", "tool_name": "email.send"},
-        "tool_result": {"status": "completed"},
+    monkeypatch.setattr(agent_nodes, "infer_tool", lambda *args, **kwargs: ("email.send", {"to": "a@example.com"}))
+    monkeypatch.setattr(agent_nodes, "validate_tool_input", lambda *args, **kwargs: ({"to": "a@example.com"}, []))
+    monkeypatch.setattr(agent_nodes.mcp_service, "call_tool", lambda *args, **kwargs: {
+        "id": "tc1",
+        "status": "waiting_approval",
+        "approval_id": "ap1",
+        "output": {},
     })
 
-    result = await RuntimeNodes(make_test_session(), {}).tool_agent(state)
+    import langgraph.types as lg_types_approved
+    monkeypatch.setattr(lg_types_approved, "interrupt",
+        lambda payload: {"action": "approved", "tool_result": {"success": True, "provider": "mock", "to": "a@b.com"}}
+    )
+
+    result = await RuntimeNodes(make_test_session(), {}).tool_agent(_base_state())
 
     assert "tool_agent" in result["completed_nodes"]
     assert result["approval_required"] is False
     assert result["approval_payload"] is None
     assert result["pending_tool_call_id"] is None
+    assert result["pending_tool_name"] is None
+    assert result["pending_approval_id"] is None
+    assert result["resume_token"] is None
+    assert result["tool_result"] == {"success": True, "provider": "mock", "to": "a@b.com"}
+    assert result["tool_call"]["status"] == "completed"
     assert latest_agent_result(result, "tool_agent")["status"] == "ok"
     assert _node_result(result)["status"] == "ok"
 
 
 @pytest.mark.asyncio
-async def test_resume_failed_and_rejected_record_failed_or_denied(monkeypatch):
+async def test_interrupt_resume_rejected_records_denied(monkeypatch):
+    """When interrupt() returns action=rejected, tool_agent records
+    the rejection without executing the tool."""
     _patch_common(monkeypatch)
-
-    failed_state = _base_state()
-    failed_state.update({
-        "pending_tool_call_id": "tc1",
-        "_resume_context": "failed:tc1",
-        "tool_call": {"id": "tc1", "tool_name": "email.send"},
-        "tool_result": {"message": "smtp down"},
+    monkeypatch.setattr(agent_nodes, "infer_tool", lambda *args, **kwargs: ("email.send", {"to": "a@example.com"}))
+    monkeypatch.setattr(agent_nodes, "validate_tool_input", lambda *args, **kwargs: ({"to": "a@example.com"}, []))
+    monkeypatch.setattr(agent_nodes.mcp_service, "call_tool", lambda *args, **kwargs: {
+        "id": "tc2",
+        "status": "waiting_approval",
+        "approval_id": "ap2",
+        "output": {},
     })
-    failed = await RuntimeNodes(make_test_session(), {}).tool_agent(failed_state)
-    assert "tool_agent" in failed["completed_nodes"]
-    assert latest_agent_result(failed, "tool_agent")["status"] == "failed"
-    assert _node_result(failed)["status"] == "failed"
 
-    rejected_state = _base_state()
-    rejected_state.update({
-        "pending_tool_call_id": "tc2",
-        "_resume_context": "rejected:tc2",
-        "tool_call": {"id": "tc2", "tool_name": "email.send"},
-    })
-    rejected = await RuntimeNodes(make_test_session(), {}).tool_agent(rejected_state)
-    assert "tool_agent" in rejected["completed_nodes"]
-    assert rejected["tool_call"]["status"] == "rejected"
-    assert latest_agent_result(rejected, "tool_agent")["status"] == "denied"
-    assert _node_result(rejected)["status"] == "denied"
+    import langgraph.types as lg_types_reject
+    monkeypatch.setattr(lg_types_reject, "interrupt",
+        lambda payload: {"action": "rejected", "reason": "User rejected the approval"}
+    )
+
+    result = await RuntimeNodes(make_test_session(), {}).tool_agent(_base_state())
+
+    assert "tool_agent" in result["completed_nodes"]
+    assert result["tool_call"]["status"] == "rejected"
+    assert result["tool_result"]["status"] == "rejected"
+    assert "User rejected" in result["tool_result"]["message"]
+    assert result["approval_required"] is False
+    assert result["pending_tool_call_id"] is None
+    assert latest_agent_result(result, "tool_agent")["status"] == "denied"
+    assert _node_result(result)["status"] == "denied"
+
+
+# ── unchanged tests (no approval pause path) ──────────────────────
 
 
 @pytest.mark.asyncio

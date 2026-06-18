@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from src.web_app.agent.runtime.intent_schema import normalize_agent_name
 from src.web_app.agent.runtime.state import AgentRuntimeState
 from src.web_app.agent.runtime.replanner import (
@@ -46,10 +48,12 @@ def map_route_to_node(route_item: str) -> str:
 
 
 def legacy_next_route_node(state: AgentRuntimeState) -> str:
-    """Compute the next legacy route node without supervisor side effects."""
-    if state.get("status") == "waiting_approval":
-        return END_SENTINEL
+    """Compute the next route node from the route_plan.
 
+    Approval pause is now handled via LangGraph interrupt() inside
+    tool_agent — this dispatcher no longer routes to END for
+    waiting_approval.
+    """
     route_plan = state.get("route_plan") or {}
     route_list = list(route_plan.get("route", []))
     completed = list(state.get("completed_nodes", []))

@@ -151,7 +151,6 @@ class AgentRuntimeState(TypedDict, total=False):
     visible_thoughts: list[dict[str, Any]]
     error: str
     events: list[dict[str, Any]]
-    _stream_queue: Any
 
     # ── Approval / pause-resume ────────────────────────────────────
     pending_approval_id: str | None

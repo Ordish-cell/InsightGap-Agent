@@ -202,9 +202,10 @@ def _sanitize_tool_args(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
 
 
 class BaseNodesMixin:
-    def __init__(self, db: Session, payload: dict[str, Any]):
+    def __init__(self, db: Session, payload: dict[str, Any], stream_queue: Any = None):
         self.db = db
         self.payload = payload
+        self._stream_queue = stream_queue
 
 
 __all__ = [name for name in globals() if not name.startswith("__")]

@@ -276,7 +276,7 @@ class EvalFinalNodesMixin:
             detail=f"评估完成，状态 {status}",
             extra={"status": status, "errors": len(state.get("errors", [])), "warnings": warnings},
         )
-        emit_visible_thought(self.db, state, "evaluator")
+        emit_visible_thought(self.db, state, "evaluator", stream_queue=self._stream_queue)
         record_step(self.db, state["run_id"], "evaluator", "evaluate", {"route": state.get("route")}, {"evaluation": state["evaluation"]})
         mark_completed(state, "evaluator")
         record_node_result(
@@ -324,7 +324,7 @@ class EvalFinalNodesMixin:
 
         # ── Enrich visible thoughts BEFORE generating the final answer ──
         if intent != "chat":
-            emit_visible_thought(self.db, state, "final_response")
+            emit_visible_thought(self.db, state, "final_response", stream_queue=self._stream_queue)
             await self._enrich_visible_thoughts_with_llm(state)
 
         draft_answer = "\n\n".join(answer_parts)
@@ -659,7 +659,7 @@ class EvalFinalNodesMixin:
         run_id = state.get("run_id")
         thread_id = state.get("thread_id", "")
         user_id = state.get("user_id")
-        queue = state.get("_stream_queue")
+        queue = getattr(self, "_stream_queue", None) or state.get("_stream_queue")
         try:
             model = get_chat_model("final", temperature=0.35, streaming=True)
             # Emit answer_started (SSE + DB)

@@ -18,7 +18,7 @@ class SetupNodesMixin:
             state["permission"]["requires_approval"] = True
             state["permission"]["reason"] = "strong_approval_required"
         record_step(self.db, state["run_id"], "permission_guard", "permission", {"user_input": text}, {"permission": state["permission"], "route": state.get("route")})
-        emit_visible_thought(self.db, state, "permission_guard")
+        emit_visible_thought(self.db, state, "permission_guard", stream_queue=self._stream_queue)
         return state
 
     async def home_intent_react(self, state: AgentRuntimeState) -> AgentRuntimeState:
@@ -78,7 +78,7 @@ class SetupNodesMixin:
                 "reason_summary": home_intent.get("reason_summary") or home_intent.get("reasoning_summary", ""),
             },
         )
-        emit_visible_thought(self.db, state, "home_intent_react")
+        emit_visible_thought(self.db, state, "home_intent_react", stream_queue=self._stream_queue)
         record_step(self.db, state["run_id"], "home_intent_react", "triage_intent", {"user_input": user_input, "page_context": page_context}, {"home_intent": home_intent})
         record_event(
             self.db,
@@ -169,7 +169,7 @@ class SetupNodesMixin:
                 "steps_count": len(route_plan.get("route", [])),
             },
         )
-        emit_visible_thought(self.db, state, "planner")
+        emit_visible_thought(self.db, state, "planner", stream_queue=self._stream_queue)
         record_step(self.db, state["run_id"], "planner", "plan_route",
                     {"user_input": user_input, "feed_card_id": feed_card_id},
                     {"route_plan": route_plan})

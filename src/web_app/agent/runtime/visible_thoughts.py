@@ -64,7 +64,7 @@ def build_visible_thought_step(step: str | dict[str, Any], state: dict[str, Any]
     return "我已经完成这一阶段的处理，并把结果交给下一步继续整理。"
 
 
-def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[str, Any], *, status: str = "completed") -> str:
+def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[str, Any], *, status: str = "completed", stream_queue: Any = None) -> str:
     text = build_visible_thought_step(step, state).strip()
     if not text:
         return ""
@@ -98,7 +98,8 @@ def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[st
         user_id=state.get("user_id"),
         thread_id=state.get("thread_id", ""),
     )
-    stream_queue = state.get("_stream_queue")
+    if stream_queue is None:
+        stream_queue = state.get("_stream_queue")  # legacy fallback
     if stream_queue and should_show_visible_thought_to_user(state, key):
         base_payload = {name: entry[name] for name in ("id", "status", "visibility", "source", "created_at")}
         sentences = _split_sentences(text)

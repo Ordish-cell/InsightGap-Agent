@@ -93,6 +93,7 @@ def _queue_tool_event(
     error: str = "",
     tool_call_record_id: int | str | None = None,
     extra_payload: dict[str, Any] | None = None,
+    stream_queue: Any = None,
 ) -> None:
     payload: dict[str, Any] = {
         "tool_call_id": tool_call_id,
@@ -114,7 +115,7 @@ def _queue_tool_event(
     if extra_payload:
         payload.update(extra_payload)
     queue_stream_event(
-        state.get("_stream_queue"),
+        stream_queue or state.get("_stream_queue"),
         event_type,
         payload,
         run_id=state.get("run_id"),
@@ -218,7 +219,7 @@ class AgentNodesMixin:
             ))
             record_step(self.db, state["run_id"], "research_agent", "deep_research",
                         {}, {"error": str(exc)}, status="failed")
-        emit_visible_thought(self.db, state, "research_agent")
+        emit_visible_thought(self.db, state, "research_agent", stream_queue=self._stream_queue)
         mark_completed(state, "research_agent")
         record_agent_node_result(
             state,
@@ -388,7 +389,7 @@ class AgentNodesMixin:
                 errors=[str(exc)],
                 warnings=["rag_failed"],
             ))
-        emit_visible_thought(self.db, state, "rag_agent")
+        emit_visible_thought(self.db, state, "rag_agent", stream_queue=self._stream_queue)
         mark_completed(state, "rag_agent")
         record_agent_node_result(
             state,
@@ -481,7 +482,7 @@ class AgentNodesMixin:
                 errors=[str(exc)],
                 warnings=["artifact_failed"],
             ))
-        emit_visible_thought(self.db, state, "artifact_agent")
+        emit_visible_thought(self.db, state, "artifact_agent", stream_queue=self._stream_queue)
         mark_completed(state, "artifact_agent")
         record_agent_node_result(
             state,
@@ -497,158 +498,18 @@ class AgentNodesMixin:
     async def tool_agent(self, state: AgentRuntimeState) -> AgentRuntimeState:
         """MCP Tool Agent: infer and execute tools with approval guard.
 
-        On L3/L4 tools the executor returns waiting_approval WITHOUT executing.
-        This node saves pause context (pending_*), sets status=waiting_approval,
-        does NOT mark itself completed. The dispatcher detects waiting_approval
-        and routes to END — a true graph interrupt.
-
-        On resume (status=resuming), tool_agent checks resolved_tool_call_ids:
-        if the previously-pending tool is now resolved, it accepts the pre-executed
-        result, clears pending state, and marks itself completed so the dispatcher
-        continues to evaluator → final_response.
+        L3/L4 tools pause via LangGraph interrupt(). On resume the
+        graph continues from the interrupt point — this method does
+        NOT re-enter from the top.  Legacy END-based resume detection
+        has been removed.
         """
         if state.get("route") in {"approval", "blocked"}:
             mark_completed(state, "tool_agent")
             record_agent_node_result(
-                state,
-                node="tool_agent",
+                state, node="tool_agent",
                 updates=_tool_node_result_updates(state),
                 status="skipped",
                 summary="Skipped because route is approval or blocked.",
-            )
-            return state
-
-        # Debug: tool_agent entry
-        pending_tcid = state.get("pending_tool_call_id")
-        resolved_ids_debug = list(state.get("resolved_tool_call_ids") or [])
-        tc_debug = state.get("tool_call") or {}
-        logger.info(
-            "[approval_resume_debug] node=tool_agent status=%s approval_required=%s "
-            "pending_tcid=%s resolved_ids=%s _resume_context=%s "
-            "tool_call.error=%s tool_call.status=%s route=%s",
-            state.get("status"), state.get("approval_required"),
-            pending_tcid, resolved_ids_debug,
-            state.get("_resume_context"),
-            tc_debug.get("error") if isinstance(tc_debug, dict) else "N/A",
-            tc_debug.get("status") if isinstance(tc_debug, dict) else "N/A",
-            state.get("route"),
-        )
-
-        # ── Resume path: previously-pending tool was executed by resume runner ──
-        pending_tcid = state.get("pending_tool_call_id")
-        resolved_ids: list = list(state.get("resolved_tool_call_ids") or [])
-        if pending_tcid is not None and pending_tcid in resolved_ids:
-            # Accept the pre-executed tool result (already in state["tool_result"])
-            state["approval_required"] = False
-            state["approval_payload"] = None
-            state["pending_approval_id"] = None
-            state["pending_tool_name"] = None
-            state["pending_tool_args"] = None
-            state["pending_tool_call_id"] = None
-            state["resume_token"] = None
-            append_agent_result(state, AgentResult(
-                task_id=task_id_for_agent(state, "tool_agent"),
-                agent="tool_agent",
-                status="ok",
-                confidence=0.9,
-                summary="Tool action completed after approval.",
-                tool_calls=[state.get("tool_call", {})] if state.get("tool_call") else [],
-            ))
-            emit_visible_thought(self.db, state, "tool_agent")
-            mark_completed(state, "tool_agent")
-            record_agent_node_result(
-                state,
-                node="tool_agent",
-                updates=_tool_node_result_updates(state),
-                summary="Tool action completed after approval.",
-            )
-            return state
-
-        # ── Resume path: tool failed after approval ───────────────
-        # Detect tool failure: _resume_context starts with "failed:"
-        resume_ctx = str(state.get("_resume_context") or "")
-        if pending_tcid is not None and resume_ctx.startswith("failed:"):
-            state["approval_required"] = False
-            state["approval_payload"] = None
-            state["pending_approval_id"] = None
-            state["pending_tool_name"] = None
-            state["pending_tool_args"] = None
-            state["pending_tool_call_id"] = None
-            state["resume_token"] = None
-            append_agent_result(state, AgentResult(
-                task_id=task_id_for_agent(state, "tool_agent"),
-                agent="tool_agent",
-                status="failed",
-                confidence=0.0,
-                summary="Tool action failed after approval.",
-                tool_calls=[state.get("tool_call", {})] if state.get("tool_call") else [],
-                errors=[str((state.get("tool_result") or {}).get("message") or state.get("_tool_error") or "tool_failed")],
-                warnings=["tool_failed"],
-            ))
-            emit_visible_thought(self.db, state, "tool_agent")
-            mark_completed(state, "tool_agent")
-            record_agent_node_result(
-                state,
-                node="tool_agent",
-                updates=_tool_node_result_updates(state),
-                summary="Tool action failed after approval.",
-            )
-            return state
-
-        # ── Resume path: user rejected ────────────────────────────
-        if pending_tcid is not None and resume_ctx.startswith("rejected:"):
-            state["tool_call"] = {**state.get("tool_call", {}), "status": "rejected"}
-            state["tool_result"] = {"status": "rejected", "message": "User rejected the approval"}
-            state["approval_required"] = False
-            state["approval_payload"] = None
-            state["pending_approval_id"] = None
-            state["pending_tool_name"] = None
-            state["pending_tool_args"] = None
-            state["pending_tool_call_id"] = None
-            state["resume_token"] = None
-            append_agent_result(state, AgentResult(
-                task_id=task_id_for_agent(state, "tool_agent"),
-                agent="tool_agent",
-                status="denied",
-                confidence=0.8,
-                summary="Tool action was rejected by the user.",
-                tool_calls=[state.get("tool_call", {})] if state.get("tool_call") else [],
-                warnings=["tool_rejected"],
-            ))
-            emit_visible_thought(self.db, state, "tool_agent")
-            mark_completed(state, "tool_agent")
-            record_agent_node_result(
-                state,
-                node="tool_agent",
-                updates=_tool_node_result_updates(state),
-                summary="Tool action was rejected by the user.",
-            )
-            return state
-
-        # ── Resume path (legacy): status=resuming without context ──
-        if pending_tcid is not None and state.get("status") == "resuming":
-            state["approval_required"] = False
-            state["approval_payload"] = None
-            state["pending_approval_id"] = None
-            state["pending_tool_name"] = None
-            state["pending_tool_args"] = None
-            state["pending_tool_call_id"] = None
-            state["resume_token"] = None
-            append_agent_result(state, AgentResult(
-                task_id=task_id_for_agent(state, "tool_agent"),
-                agent="tool_agent",
-                status="ok",
-                confidence=0.7,
-                summary="Tool resume state was accepted.",
-                tool_calls=[state.get("tool_call", {})] if state.get("tool_call") else [],
-            ))
-            emit_visible_thought(self.db, state, "tool_agent")
-            mark_completed(state, "tool_agent")
-            record_agent_node_result(
-                state,
-                node="tool_agent",
-                updates=_tool_node_result_updates(state),
-                summary="Tool resume state was accepted.",
             )
             return state
 
@@ -775,7 +636,7 @@ class AgentNodesMixin:
                     "[LLM_TOOL_SELECT_DEBUG] tool=%s missing_fields=%s — stopping for user clarification",
                     tool_name, str(missing)[:200],
                 )
-                emit_visible_thought(self.db, state, "tool_agent")
+                emit_visible_thought(self.db, state, "tool_agent", stream_queue=self._stream_queue)
                 mark_completed(state, "tool_agent")
                 record_agent_node_result(
                     state,
@@ -794,6 +655,7 @@ class AgentNodesMixin:
                 tool_name=tool_name,
                 args_preview=safe_tool_args,
                 status="running",
+                stream_queue=getattr(self, "_stream_queue", None),
             )
 
             result = mcp_service.call_tool(self.db, state["user_id"], tool_name, tool_input,
@@ -803,60 +665,18 @@ class AgentNodesMixin:
             state["tool_result"] = result
 
             if result["status"] == "waiting_approval":
-                state["status"] = "waiting_approval"
-                state["approval_required"] = True
                 approval_id = result.get("approval_id") or (result.get("output", {}).get("_metadata", {}).get("approval_id"))
                 tool_call_id = result.get("id")
-                # ── Save pause context for resume ─────────────────
-                # pending_tool_args stores the REAL args (for resume execution).
-                # approval_payload gets sanitized args (for frontend).
-                state["pending_approval_id"] = str(approval_id) if approval_id else None
-                state["pending_tool_name"] = tool_name
-                state["pending_tool_args"] = dict(tool_input)
-                state["pending_tool_call_id"] = tool_call_id
-                state["route_plan_snapshot"] = dict(route_plan)
-                state["resume_token"] = f"approval:{approval_id}"
-                state["approval_payload"] = {
-                    "approval_id": approval_id,
-                    "tool_name": tool_name,
-                    "risk_level": route_plan.get("risk_level", "L3"),
-                    "tool_args": safe_tool_args,
-                    "preview": result.get("output", {}),
-                    "run_id": state["run_id"],
-                    "user_id": state["user_id"],
-                    "title": f"需要你确认：{tool_name}",
-                    "actions": ["approve", "reject"],
-                }
-                append_output(state, "tool_agent", {"tool_name": tool_name, "status": "waiting_approval"})
-                append_agent_result(state, AgentResult(
-                    task_id=task_id_for_agent(state, "tool_agent"),
-                    agent="tool_agent",
-                    status="needs_approval",
-                    confidence=0.8,
-                    summary=f"Tool {tool_name} requires approval.",
-                    tool_calls=[result],
-                    warnings=["approval_pending"],
-                ))
-                record_step(self.db, state["run_id"], "tool_agent", "mcp_approval_required",
-                            {"tool_name": tool_name, "tool_input": _sanitize_tool_args(tool_name, tool_input)},
-                            {"status": "waiting_approval", "approval_id": approval_id})
-                append_status_step(
-                    state,
-                    key="tool_agent",
-                    node_name="tool_agent",
-                    status="waiting_approval",
-                    detail=f"工具动作需要审批，风险等级 {route_plan.get('risk_level', 'L3')}",
-                    extra={"risk_level": route_plan.get("risk_level", "L3"), "tool_name": tool_name, "approval_required": True},
+                return await self._handle_waiting_approval(
+                    state=state,
+                    result=result,
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    route_plan=route_plan,
+                    safe_tool_args=safe_tool_args,
+                    approval_id=approval_id,
+                    tool_call_id=tool_call_id,
                 )
-                emit_visible_thought(self.db, state, "tool_agent")
-                # NOT marked completed → dispatcher routes to END (true interrupt)
-                record_agent_node_result(
-                    state,
-                    node="tool_agent",
-                    updates=_tool_node_result_updates(state),
-                    summary=f"Tool {tool_name} requires approval.",
-                )
-                return state
             elif result["status"] in {"failed", "blocked"}:
                 _queue_tool_event(
                     state,
@@ -868,6 +688,7 @@ class AgentNodesMixin:
                     error=str(result.get("error") or "tool_failed"),
                     tool_call_record_id=result.get("id"),
                     extra_payload=_tool_event_extra(tool_name, result),
+                stream_queue=getattr(self, "_stream_queue", None),
                 )
                 state["status"] = "failed"
                 state["error"] = result.get("error", "")
@@ -902,6 +723,7 @@ class AgentNodesMixin:
                     status=str(result.get("status") or "completed"),
                     tool_call_record_id=result.get("id"),
                     extra_payload=_tool_event_extra(tool_name, result),
+                stream_queue=getattr(self, "_stream_queue", None),
                 )
                 append_output(state, "tool_agent", {"tool_name": tool_name, "status": result.get("status")})
                 append_agent_result(state, AgentResult(
@@ -932,13 +754,215 @@ class AgentNodesMixin:
                 errors=[str(exc)],
                 warnings=["tool_agent_failed"],
             ))
-        emit_visible_thought(self.db, state, "tool_agent")
+        emit_visible_thought(self.db, state, "tool_agent", stream_queue=self._stream_queue)
         mark_completed(state, "tool_agent")
         record_agent_node_result(
             state,
             node="tool_agent",
             updates=_tool_node_result_updates(state),
             summary=(state.get("tool_call") or {}).get("tool_name", "") if isinstance(state.get("tool_call"), dict) else "",
+        )
+        return state
+
+    # ── Approval helpers ────────────────────────────────────────────
+
+    async def _handle_waiting_approval(
+        self,
+        *,
+        state: AgentRuntimeState,
+        result: dict[str, Any],
+        tool_name: str,
+        tool_input: dict[str, Any],
+        route_plan: dict[str, Any],
+        safe_tool_args: dict[str, Any],
+        approval_id: Any,
+        tool_call_id: Any,
+    ) -> AgentRuntimeState:
+        """Shared pause entry point — creates audit records, then
+        dispatches to END-based or interrupt-based pause."""
+        logger.info(
+            "[APPROVAL_FLOW] tool_agent pause for approval "
+            "tool=%s tool_call_id=%s approval_id=%s run_id=%s",
+            tool_name, result.get("id"),
+            result.get("approval_id") or (result.get("output", {}).get("_metadata", {}).get("approval_id")),
+            state.get("run_id"),
+        )
+
+        # ── shared: write pause context + audit records ─────────
+        state["pending_approval_id"] = str(approval_id) if approval_id else None
+        state["pending_tool_name"] = tool_name
+        state["pending_tool_args"] = dict(tool_input)
+        state["pending_tool_call_id"] = tool_call_id
+        state["route_plan_snapshot"] = dict(route_plan)
+        state["resume_token"] = f"approval:{approval_id}"
+        state["approval_payload"] = {
+            "approval_id": approval_id,
+            "tool_name": tool_name,
+            "risk_level": route_plan.get("risk_level", "L3"),
+            "tool_args": safe_tool_args,
+            "preview": result.get("output", {}),
+            "run_id": state["run_id"],
+            "user_id": state["user_id"],
+            "title": f"需要你确认：{tool_name}",
+            "actions": ["approve", "reject"],
+        }
+        append_output(state, "tool_agent", {"tool_name": tool_name, "status": "waiting_approval"})
+        append_agent_result(state, AgentResult(
+            task_id=task_id_for_agent(state, "tool_agent"),
+            agent="tool_agent", status="needs_approval", confidence=0.8,
+            summary=f"Tool {tool_name} requires approval.",
+            tool_calls=[result], warnings=["approval_pending"],
+        ))
+        record_step(self.db, state["run_id"], "tool_agent", "mcp_approval_required",
+                    {"tool_name": tool_name, "tool_input": _sanitize_tool_args(tool_name, tool_input)},
+                    {"status": "waiting_approval", "approval_id": approval_id})
+        append_status_step(
+            state, key="tool_agent", node_name="tool_agent",
+            status="waiting_approval",
+            detail=f"工具动作需要审批，风险等级 {route_plan.get('risk_level', 'L3')}",
+            extra={"risk_level": route_plan.get("risk_level", "L3"), "tool_name": tool_name, "approval_required": True},
+        )
+        emit_visible_thought(self.db, state, "tool_agent", stream_queue=self._stream_queue)
+        record_agent_node_result(
+            state, node="tool_agent",
+            updates=_tool_node_result_updates(state),
+            summary=f"Tool {tool_name} requires approval.",
+        )
+
+        # ── interrupt pause ────────────────────────────────────
+        return await self._interrupt_approval(
+            state=state, tool_name=tool_name,
+            tool_call_id=tool_call_id, approval_id=approval_id,
+            route_plan=route_plan,
+        )
+
+    async def _interrupt_approval(
+        self,
+        *,
+        state: AgentRuntimeState,
+        tool_name: str,
+        tool_call_id: Any,
+        approval_id: Any,
+        route_plan: dict[str, Any],
+    ) -> AgentRuntimeState:
+        """NEW: Pause via LangGraph interrupt()."""
+        from langgraph.types import interrupt as lg_interrupt
+
+        state["approval_pause_mode"] = "interrupt"
+        state["approval_required"] = True
+        state["status"] = "waiting_approval"
+
+        interrupt_payload = {
+            "type": "approval_required",
+            "approval_pause_mode": "interrupt",
+            "run_id": state.get("run_id"),
+            "approval_id": approval_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "risk_level": route_plan.get("risk_level", "L3"),
+            "message": f"Tool {tool_name} requires your approval.",
+        }
+        logger.info(
+            "[APPROVAL_FLOW] tool_agent calling interrupt() "
+            "tool=%s tcid=%s aid=%s run_id=%s",
+            tool_name, tool_call_id, approval_id, state.get("run_id"),
+        )
+        resume_data = lg_interrupt(interrupt_payload)
+        # ════════════════════════════════════════════════════════
+        # Graph resumes HERE after Command(resume=...)
+        # ════════════════════════════════════════════════════════
+        logger.info(
+            "[APPROVAL_FLOW] tool_agent interrupt resumed "
+            "action=%s tcid=%s run_id=%s",
+            resume_data.get("action"), tool_call_id, state.get("run_id"),
+        )
+
+        if resume_data.get("action") == "approved":
+            return self._handle_tool_resume_approved(
+                state, resume_data.get("tool_result") or {},
+                suffix="interrupt",
+            )
+        elif resume_data.get("action") == "rejected":
+            return self._handle_tool_resume_rejected(
+                state,
+                resume_data.get("reason", "User rejected the approval"),
+                suffix="interrupt",
+            )
+        else:
+            logger.warning(
+                "[APPROVAL_FLOW] interrupt unknown action=%s — treating as rejected",
+                resume_data.get("action"),
+            )
+            return self._handle_tool_resume_rejected(
+                state, "Unknown resume action.", suffix="interrupt",
+            )
+
+    @staticmethod
+    def _clear_pending_state(state: AgentRuntimeState) -> None:
+        """Remove all pending approval markers from state."""
+        state["approval_required"] = False
+        state["approval_payload"] = None
+        state["pending_approval_id"] = None
+        state["pending_tool_name"] = None
+        state["pending_tool_args"] = None
+        state["pending_tool_call_id"] = None
+        state["resume_token"] = None
+
+    def _handle_tool_resume_approved(
+        self,
+        state: AgentRuntimeState,
+        tool_result: dict[str, Any],
+        *,
+        suffix: str = "",
+    ) -> AgentRuntimeState:
+        """Accept a pre-executed tool result (approved resume)."""
+        state["tool_result"] = tool_result
+        state["tool_call"] = {
+            **state.get("tool_call", {}),
+            "status": "completed", "error": "",
+        }
+        self._clear_pending_state(state)
+        state["status"] = "running"  # clear waiting_approval
+        append_agent_result(state, AgentResult(
+            task_id=task_id_for_agent(state, "tool_agent"),
+            agent="tool_agent", status="ok", confidence=0.9,
+            summary=f"Tool action completed after approval{f' ({suffix})' if suffix else ''}.",
+            tool_calls=[state["tool_call"]] if state.get("tool_call") else [],
+        ))
+        emit_visible_thought(self.db, state, "tool_agent", stream_queue=self._stream_queue)
+        mark_completed(state, "tool_agent")
+        record_agent_node_result(
+            state, node="tool_agent",
+            updates=_tool_node_result_updates(state),
+            summary=f"Tool action completed after approval{f' ({suffix})' if suffix else ''}.",
+        )
+        return state
+
+    def _handle_tool_resume_rejected(
+        self,
+        state: AgentRuntimeState,
+        reason: str,
+        *,
+        suffix: str = "",
+    ) -> AgentRuntimeState:
+        """Record a rejected tool result without executing anything."""
+        state["tool_call"] = {**state.get("tool_call", {}), "status": "rejected"}
+        state["tool_result"] = {"status": "rejected", "message": reason}
+        self._clear_pending_state(state)
+        state["status"] = "running"  # clear waiting_approval
+        append_agent_result(state, AgentResult(
+            task_id=task_id_for_agent(state, "tool_agent"),
+            agent="tool_agent", status="denied", confidence=0.8,
+            summary=f"Tool action was rejected by the user{f' ({suffix})' if suffix else ''}.",
+            tool_calls=[state["tool_call"]] if state.get("tool_call") else [],
+            warnings=["tool_rejected"],
+        ))
+        emit_visible_thought(self.db, state, "tool_agent", stream_queue=self._stream_queue)
+        mark_completed(state, "tool_agent")
+        record_agent_node_result(
+            state, node="tool_agent",
+            updates=_tool_node_result_updates(state),
+            summary=f"Tool action was rejected by the user{f' ({suffix})' if suffix else ''}.",
         )
         return state
 
@@ -1069,7 +1093,7 @@ class AgentNodesMixin:
                     model=resolve_model_name("memory", complexity="low").model,
                     extra={"memory_writes": 1, "explicit": True, "ok": write_ok},
                 )
-                emit_visible_thought(self.db, state, "memory_agent")
+                emit_visible_thought(self.db, state, "memory_agent", stream_queue=self._stream_queue)
                 mark_completed(state, "memory_agent")
                 record_agent_node_result(
                     state,
@@ -1208,7 +1232,7 @@ class AgentNodesMixin:
                 errors=[str(exc)],
                 warnings=["memory_agent_failed"],
             ))
-        emit_visible_thought(self.db, state, "memory_agent")
+        emit_visible_thought(self.db, state, "memory_agent", stream_queue=self._stream_queue)
         mark_completed(state, "memory_agent")
         record_agent_node_result(
             state,
@@ -1298,7 +1322,7 @@ class AgentNodesMixin:
                 errors=[str(exc)],
                 warnings=["skill_agent_failed"],
             ))
-        emit_visible_thought(self.db, state, "skill_agent")
+        emit_visible_thought(self.db, state, "skill_agent", stream_queue=self._stream_queue)
         mark_completed(state, "skill_agent")
         record_agent_node_result(
             state,
