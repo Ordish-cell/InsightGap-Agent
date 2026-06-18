@@ -18,7 +18,7 @@
 | LangGraph 节点化运行时 | 代码中明确实现 | 可以重点讲 |
 | planner/tool/rag/memory 节点 | 代码中明确实现 | 可以重点讲 |
 | 独立 router 节点 | 代码中没有发现 | 改说“条件路由/dispatcher” |
-| checkpoint 可恢复 | 代码中部分实现 | 谨慎讲，强调默认关闭 |
+| checkpoint 可恢复 | 代码中完整实现 | 可以重点讲，PostgresSaver 生产级 |
 | MCP 注册、风险分级、审批 | 代码中明确实现 | 可以重点讲 |
 | 完整 JSON Schema 校验 | 代码中部分实现 | 改说“required 字段和格式校验” |
 | L3/L4 阻断或审批 | 代码中明确实现 | 可以重点讲 |
@@ -274,11 +274,15 @@ next = "rag_agent"
 如果遇到工具审批：
 
 ```text
-state.status = waiting_approval
-next = END
+tool_agent 内调用 LangGraph interrupt() 暂停
+-> checkpoint 写入 PostgresSaver（AsyncPostgresSaver，四表持久化）
+-> GraphInterrupt 被 agent_service 捕获
+-> SSE: approval_required + run_paused
+-> 用户批准后：agent_service 先执行工具（execute_approved_tool），再 Command(resume=...) 从 checkpoint 恢复
+-> 用户拒绝：Command(resume={"action":"rejected"})，不执行工具
 ```
 
-这保证了危险工具在审批前不会继续执行。
+这保证了危险工具在审批前不会继续执行，且 checkpoint 可跨进程恢复。
 
 #### 阶段六：能力节点执行
 
@@ -516,12 +520,15 @@ flowchart TD
     D --> E["MCP ToolExecutor"]
     E --> F["PermissionGuard 判断 L3"]
     F --> G["创建 ToolCall + Approval"]
-    G --> H["state.status=waiting_approval"]
-    H --> I["LangGraph END，中断等待用户"]
-    I --> J["用户批准"]
-    J --> K["execute_approved_tool"]
-    K --> L["resume_from_approval"]
-    L --> M["final_response 告知执行结果"]
+    G --> H["tool_agent 调用 LangGraph interrupt()"]
+    H --> I["checkpoint 写入 PostgresSaver (4 表)"]
+    I --> J["GraphInterrupt，agent_service 捕获"]
+    J --> K["SSE: approval_required + run_paused"]
+    K --> L["用户批准"]
+    L --> M["agent_service: execute_approved_tool (图外)"]
+    M --> N["Command(resume=...) 从 checkpoint 恢复"]
+    N --> O["graph 从 interrupt() 点继续"]
+    O --> P["final_response 告知执行结果"]
 ```
 
 这条链路体现的是 MCP 安全治理和人类在环。
@@ -656,39 +663,59 @@ flowchart LR
 
 ### 3.2 checkpoint 是否真的可恢复，不只是配置
 
-**结论：代码中部分实现。**
+**结论：代码中完整实现。生产级 PostgresSaver 已闭环。**
 
-项目确实接入了 LangGraph checkpointer，但默认配置是关闭的；开启后优先使用 RedisSaver，没有 Redis 时 fallback 到 MemorySaver。MemorySaver 是进程内存级，不等于生产级持久恢复。
+项目已从”可选 checkpointer + 默认关闭”升级到”生产默认开启 PostgresSaver + interrupt-based 审批暂停/恢复”。这是 Phase 8-14 的核心成果。
 
-关键证据：
+**架构演进：**
 
-| 证据 | 说明 |
-|---|---|
-| `src/web_app/agent/runtime/checkpointers.py` | `build_checkpointer()` 优先 RedisSaver，fallback MemorySaver |
-| `src/web_app/agent/runtime/graph.py` | 只有 `settings.agent_langgraph_checkpointer_enabled` 为 true 时才构建 checkpointer |
-| `src/web_app/core/config.py` | `agent_langgraph_checkpointer_enabled: bool = False`，默认关闭 |
-| `src/web_app/agent/runtime/graph_config.py` | invoke config 带 `thread_id`，满足 LangGraph checkpoint key 的基本要求 |
-| `src/web_app/services/agent_service.py` | `AgentRun.graph_state`、`thread_id`、approval resume 等状态也落 DB |
-| `src/web_app/tests/test_agent_runtime_p6b_graph_app_contract.py` | 10 passed，覆盖默认不创建 checkpointer、开启时创建等合同 |
+| 阶段 | 方式 | 状态 |
+|---|---|---|
+| 旧（Phase 1-7） | END-based：waiting_approval → dispatch 返回 END → graph 终止 → DB graph_state 保存 → 恢复时从头 replay | 已废弃，仅保留兼容旧 run |
+| 新（Phase 8+） | interrupt-based：langgraph.types.interrupt() → checkpoint 写入 PostgresSaver → Command(resume=...) 从 checkpoint 恢复 | 生产默认 |
 
-真实边界：
+**新架构的完整流程：**
 
-| 能力 | 真实性 |
-|---|---|
-| LangGraph compile(checkpointer=...) | 已实现 |
-| thread_id configurable | 已实现 |
-| RedisSaver 接入 | 已实现 |
-| 默认开启 checkpoint | 没有 |
-| 生产级 crash 后从 Redis 恢复的 E2E 测试 | 没有发现 |
-| approval resume 业务恢复 | 已实现，但主要通过 DB graph_state/approval/tool_call，而不完全依赖 LangGraph checkpoint |
+```text
+Pause: graph.ainvoke() → tool_agent → interrupt({“type”:”approval_required”,...})
+       → AsyncPostgresSaver 保存 checkpoint 到 4 张 PG 表
+       → GraphInterrupt 被 agent_service 捕获
+       → SSE: approval_required + run_paused
 
-推荐简历说法：
+Resume: agent_service 调用 tool_executor.execute_approved_tool() (图外执行)
+       → Command(resume={“action”:”approved”,”tool_result”:...})
+       → AsyncPostgresSaver 加载 checkpoint
+       → graph 从 interrupt() 调用点继续执行
+       → 不重跑 graph，无 stale state 清理需求
+```
 
-> 接入 LangGraph checkpointer 能力，支持基于 thread_id 的状态检查点；生产持久化方案预留 RedisSaver，本地开发 fallback 到 MemorySaver。同时在业务层通过 AgentRun.graph_state、Approval、ToolCall 记录实现审批中断后的恢复。
+**关键证据：**
 
-面试官如果问“服务重启后一定能恢复吗”：
+| 能力 | 状态 | 证据 |
+|---|---|---|
+| PostgresSaver 接入 | 已实现 | `checkpointers.py` — `_AsyncPostgresSaverHandle.create()` |
+| 四张 checkpoint 表 | 已确认 | `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`、`checkpoint_migrations` |
+| 启动健康检查 | 已实现 | `check_checkpointer_health()` 验证 PostgresSaver + 4 表存在 |
+| require_durable fail-fast | 已实现 | 生产默认 `agent_checkpointer_require_durable=True`，backend 不可用时启动报错 |
+| interrupt() + Command(resume) | 已实现 | `agent_nodes.py:_interrupt_approval()` + `graph.py:resume_from_interrupt()` |
+| 跨进程 E2E | 已验证 | `test_postgres_checkpoint_e2e.py` — 7 passed，restart recovery 通过 |
+| 回归测试 | 已通过 | 59 passed (regression + tool_node + E2E + expiry) |
+| 审批超时自动过期 | 已实现 | `approval_expiry.py` — `expire_stale_approvals()` |
+| Checkpoint 定期清理 | 已实现 | `checkpoint_cleanup.py` — TTL-based cleanup (completed=7d, failed=30d, expired=7d) |
+| waiting_approval 保护 | 已实现 | 清理逻辑永不删除 waiting_approval/paused/resuming 的 checkpoint |
+| MemorySaver fallback | 仅 dev/test | `require_durable=True` 时不允许 fallback |
+| RedisSaver | experimental | `langgraph-checkpoint-redis==0.4.1` 有 Command(resume) 内部 bug，标记 experimental |
 
-> 我不会说“一定”。当前真实实现是：LangGraph checkpointer 是可选能力，默认关闭；如果配置 RedisSaver，可以具备跨进程 checkpoint 基础。审批恢复这块更稳，是业务状态落在 DB 里，包括 pending approval、tool call、run graph_state。下一步我会补一个重启后从 Redis checkpoint 继续执行的 E2E 测试。
+**推荐简历说法：**
+
+> 接入 LangGraph checkpointer，以 PostgresSaver 为生产后端（AsyncPostgresSaver），实现 interrupt() + Command(resume=...) 的审批暂停/恢复机制。启动时自动健康检查 4 张 checkpoint 表，require_durable 确保生产不会静默降级到内存模式。审批支持超时自动过期（默认 24h），completed/failed/expired run 的 checkpoint 按 TTL 自动清理（7d/30d/7d），waiting_approval 永远受保护。
+
+**面试官追问”服务重启后一定能恢复吗”：**
+
+> 能。当前生产默认配置是 agent_checkpointer_backend=postgres，agent_checkpointer_require_durable=True。PostgresSaver 把 checkpoint 写在 PG 的 checkpoints、checkpoint_blobs、checkpoint_writes 三张表里，thread_id=run:{run_id} 是稳定的 key。跨进程 recovery E2E 测试已验证：Process 1 在 interrupt() 处暂停，Process 2 用同一个 PG 数据库的 AsyncPostgresSaver + Command(resume=...) 可以继续执行。同时 agent_approval_pending_ttl_hours=24 确保悬挂审批不会永久卡住，超时自动过期后 checkpoint 进入 7 天清理 TTL。
+
+不要说：
+> checkpoint 默认关闭，生产恢复靠 DB 状态。
 
 ---
 
@@ -970,8 +997,11 @@ Skill 不是空概念，存在 DB 模型、repository、service、匹配、草�
 | 缺口 | 风险 | 面试怎么说 |
 |---|---|---|
 | 没有独立 router node | 面试官按简历找不到文件 | “路由被拆成 planner、supervisor_observer、llm_supervisor_route 和 conditional dispatcher，没有单独命名 router node。” |
-| checkpoint 默认关闭 | “可恢复”容易被质疑 | “接入了可选 checkpointer 和 thread_id；生产持久恢复需要打开 RedisSaver。审批恢复主要走 DB 状态。” |
-| MemorySaver fallback 非生产持久 | 服务重启丢失 | “本地 fallback；生产目标是 RedisSaver，并补 crash recovery E2E。” |
+| checkpoint 曾默认关闭 | 已解决，现在默认开启 PostgresSaver | “已升级为生产级 PostgresSaver + interrupt/Command(resume)；启动有 health check + require_durable fail-fast。” |
+| RedisSaver 生产不可用 | langgraph-checkpoint-redis 0.4.1 有内部 bug | “已切到 PostgresSaver 作为生产 backend，RedisSaver 标记 experimental。” |
+| Approval 悬挂风险 | 用户不操作，run 永久卡在 waiting_approval | “已实现 approval expiry：24h 超时自动 expire，run/message/tool_call 四表同步，expired checkpoint 进入 7 天清理 TTL。” |
+| Checkpoint 无限增长 | PG 表持续膨胀 | “已实现 TTL cleanup：completed=7d, failed=30d, expired=7d。waiting_approval 永不清理。” |
+| MemorySaver fallback 非生产持久 | 服务重启丢失 | “require_durable=True 时启动 fail-fast，不允许静默降级到内存模式。” |
 | JSON Schema 校验不完整 | 外部 MCP server 接入会有风险 | “当前针对内置工具做 required 和格式校验；外部 MCP 应升级到标准 JSON Schema validator。” |
 | RRF 只在 Qdrant native hybrid | Python fallback 不是 RRF | “native Qdrant hybrid 使用 Fusion.RRF；fallback 是 weighted merge/rerank。” |
 | hit@5 记录是 synthetic eval | 不能说线上数据 | “是可复现 synthetic benchmark，不是生产 A/B。” |
@@ -998,7 +1028,7 @@ Skill 不是空概念，存在 DB 模型、repository、service、匹配、草�
 
 ### 不建议写的版本
 
-> 实现生产级 checkpoint 崩溃恢复。  
+> ~~实现生产级 checkpoint 崩溃恢复~~ (已实现，可写)。  
 > 实现完整 MCP JSON Schema 校验引擎。  
 > 实现独立 router 节点。  
 > 实现全自动 Skill 工作流执行引擎。  
@@ -1067,6 +1097,9 @@ Skill 不是空概念，存在 DB 模型、repository、service、匹配、草�
 | LLM Supervisor Route | `src/web_app/agent/runtime/llm_supervisor.py` |
 | Dispatcher | `src/web_app/agent/runtime/dispatch.py` |
 | Checkpointer | `src/web_app/agent/runtime/checkpointers.py` |
+| Checkpoint Cleanup | `src/web_app/agent/runtime/checkpoint_cleanup.py` |
+| Approval Expiry | `src/web_app/services/approval_expiry.py` |
+| Checkpoint Health Check | `src/web_app/agent/runtime/checkpointers.py` — `check_checkpointer_health()` |
 | MCP Registry | `src/web_app/mcp/registry.py` |
 | MCP Schema | `src/web_app/mcp/schemas.py` |
 | MCP Executor | `src/web_app/mcp/tool_executor.py` |
@@ -1096,11 +1129,14 @@ Skill 不是空概念，存在 DB 模型、repository、service、匹配、草�
 2. **MCP L0-L4 工具治理与审批中断**
 3. **Parent-Child + Qdrant Hybrid + RRF + hit@5 eval 的 RAG 工程链路**
 
-需要降调的三块是：
+需要降调的两块是：
 
-1. **checkpoint**：讲“接入和预留生产持久化”，不要讲“生产级可恢复已完成”。
-2. **Schema 校验**：讲“参数必填与格式校验”，不要讲“完整 JSON Schema validator”。
-3. **Skill 复用**：讲“复用识别、匹配、上下文注入和草稿生成”，不要讲“完整自动执行 Skill 引擎”。
+1. **Schema 校验**：讲”参数必填与格式校验”，不要讲”完整 JSON Schema validator”。
+2. **Skill 复用**：讲”复用识别、匹配、上下文注入和草稿生成”，不要讲”完整自动执行 Skill 引擎”。
+
+已升级可讲的一块是：
+
+1. **checkpoint**：已从”部分实现、默认关闭”升级到”PostgresSaver 生产闭环 + interrupt/Command(resume) + 健康检查 + require_durable fail-fast + 审批超时自动过期 + TTL 清理”。现在是真可讲的生产级能力。
 
 最稳的面试总括：
 
@@ -1360,7 +1396,7 @@ planner 只决定路线，不直接执行工具、不直接检索、不直接写
 
 你可以答：
 
-> 当前实现分两层。LangGraph checkpointer 是可选接入，开启后可以用 RedisSaver，开发环境 fallback MemorySaver；默认配置没有开启，所以我不会夸成生产级 crash recovery。业务恢复更实在，approval/tool_call/run_state 都在 DB 里，审批恢复主要靠这些业务状态。下一步我会补 Redis checkpoint 的重启恢复 E2E。
+> 能。当前默认开启 PostgresSaver（AsyncPostgresSaver，agent_checkpointer_backend=postgres），agent_checkpointer_require_durable=True。审批暂停时 LangGraph interrupt() 把 checkpoint 写入 PG 的 checkpoints、checkpoint_blobs、checkpoint_writes 三张表。恢复时 agent_service 先在图外执行工具，再 Command(resume=...) 从 checkpoint 精确恢复——不重跑 graph，不产生 stale state。跨进程 recovery E2E 已验证通过。同时有 approval expiry（24h TTL）防止悬挂，checkpoint cleanup（7d/30d TTL）防止 PG 膨胀。
 
 ---
 
@@ -1459,7 +1495,7 @@ L4 -> allowed=False, requires_approval=False, reason=high_risk_denied
 
 ### 9.2.3 L3 审批的完整工作流
 
-以用户说“帮我写一个文件”为例：
+以用户说”帮我写一个文件”为例：
 
 ```mermaid
 sequenceDiagram
@@ -1469,7 +1505,8 @@ sequenceDiagram
     participant EX as ToolExecutor
     participant PG as PermissionGuard
     participant DB as DB
-    participant UI as Frontend Approval
+    participant CP as PostgresSaver
+    participant UI as Frontend
 
     U->>TA: 请写入本地文件
     TA->>TA: infer/select tool = local_file.write
@@ -1481,49 +1518,63 @@ sequenceDiagram
     PG-->>EX: requires_approval=True
     EX->>DB: create Approval(status=pending)
     EX-->>TA: status=waiting_approval, approval_id
-    TA->>TA: 保存 pending_tool_call_id / pending_approval_id
-    TA-->>UI: approval_required event
+    TA->>TA: 保存 pending 字段
+    TA->>CP: interrupt(payload) → checkpoint 写入 PG
+    TA-->>UI: GraphInterrupt → SSE: approval_required
     UI-->>U: 展示审批卡片
 ```
 
 这里最关键的是：  
-**ToolExecutor 在审批前不会调用真实 provider。**
+**ToolExecutor 在审批前不会调用真实 provider，tool_agent 通过 LangGraph interrupt() 暂停，checkpoint 持久化到 PostgresSaver。**
 
-也就是说，L3 工具在用户确认前只创建审批记录，不执行写文件/发邮件。
+也就是说，L3 工具在用户确认前只创建审批记录，不执行写文件/发邮件。即使服务重启，checkpoint 还在 PG 里。
 
 ### 9.2.4 用户批准后的恢复工作流
 
-用户点击批准后，不是重新让模型决定一次工具调用，而是走审批恢复：
+用户点击批准后，不是重新让模型决定一次工具调用，而是走 interrupt resume：
 
 ```mermaid
 sequenceDiagram
     participant U as User
     participant AS as ApprovalService
-    participant AG as AgentService Resume
+    participant AG as AgentService
     participant EX as ToolExecutor
-    participant Provider as Local Provider
     participant G as AgentRuntime
+    participant CP as PostgresSaver
     participant F as FinalResponse
 
     U->>AS: approve approval_id
     AS->>AS: 校验 approval 属于当前 user/run
+    AS->>AS: 如果超时→expired, 拒绝执行
     AS->>AS: 更新 approval.status=approved
-    AS-->>AG: resume_stream_url
-    AG->>EX: execute_approved_tool(tool_call_id)
-    EX->>Provider: 真正执行工具
-    Provider-->>EX: result
-    EX-->>AG: ToolCall completed
-    AG->>G: resume_from_approval
-    G->>G: 清理 pending 状态，继续 graph
+    AS->>AG: resume_run_after_approval
+    AG->>EX: execute_approved_tool(tool_call_id) ← 图外执行
+    EX->>EX: 真正执行工具
+    EX-->>AG: result
+    AG->>G: resume_from_interrupt(Command(resume={"action":"approved",...}))
+    G->>CP: PostgresSaver 加载 checkpoint (thread_id=run:{run_id})
+    G->>G: graph 从 interrupt() 点继续，不重跑
     G->>F: 生成最终回复
 ```
+
+**对比旧架构（已废弃）：**
+
+| 方面 | 旧（END-based） | 新（interrupt + Command(resume)） |
+|---|---|---|
+| 暂停方式 | dispatch 返回 END | LangGraph interrupt() |
+| 状态存储 | agent_runs.graph_state (JSONB) | PostgresSaver 4 张表 |
+| 恢复方式 | 从 entry_point 重跑整个 graph | Command(resume=...) 精确继续 |
+| 跨进程 | 依赖 DB 读 graph_state | 真正的 checkpoint recovery |
+| stale state | 需要 aggressive sanitize | 不需要（不重跑） |
 
 这套设计的意义：
 
 1. 审批前不执行。
 2. 批准后执行的是之前保存的 tool_call，而不是让 LLM 重新生成参数。
-3. 恢复时把结果写回 state，再继续 graph。
-4. 审计链路能看见：谁发起、谁批准、执行结果是什么。
+3. 工具在图外执行（agent_service），结果通过 Command(resume=...) 传回 graph。
+4. graph 从 interrupt() 精确继续，不重跑，无 stale state。
+5. 审计链路能看见：谁发起、谁批准、执行结果是什么。
+6. 审批超时 24h 自动过期，防止永久悬挂。
 
 ### 9.2.5 L4 阻断工作流
 
@@ -2286,11 +2337,11 @@ Reusable Skill Applied:
 
 ### LangGraph Runtime 30 秒版
 
-> 我用 LangGraph StateGraph 做 Agent Runtime，把一次请求拆成权限检查、意图识别、规划、并行上下文读取、supervisor dispatch、RAG/tool/memory/skill agent、evaluator 和 final_response。节点共享 AgentRuntimeState，每个节点只写自己的结果。路由不是一个黑盒 router，而是 planner 生成 RoutePlan，supervisor 观察状态，dispatcher 返回下一个节点。这样整个 Agent 执行过程可观测、可中断，也能支持审批恢复。
+> 我用 LangGraph StateGraph 做 Agent Runtime，把一次请求拆成权限检查、意图识别、规划、并行上下文读取、LLM supervisor dispatch、RAG/tool/memory/skill agent、evaluator 和 final_response。节点共享 AgentRuntimeState，每个节点只写自己的结果。路由不是黑盒 router，而是 planner 生成 RoutePlan，LLM supervisor 可选接管改写，dispatcher 返回下一个节点。审批机制是真正的 LangGraph interrupt()：暂停时 checkpoint 写入 PostgresSaver（AsyncPostgresSaver），恢复时 Command(resume=...) 从精确位置继续，不重跑 graph。启动有健康检查，require_durable fail-fast，审批超时自动过期 24h，checkpoint 按 TTL 清理。
 
 ### MCP Governance 30 秒版
 
-> 工具调用统一走 MCP ToolExecutor。每个工具先注册成 MCPToolSpec，带 schema、风险等级和 approval_required。执行前校验参数，再交给 PermissionGuard 判断 L0-L4。L3 工具不执行，创建 Approval 并让 graph 进入 waiting_approval；L4 高危工具直接 blocked。审批通过后才 execute_approved_tool。ToolCall、Approval、AgentEvent 都落库，能完整审计。
+> 工具调用统一走 MCP ToolExecutor。每个工具先注册成 MCPToolSpec，带 schema、风险等级和 approval_required。执行前校验参数，再交给 PermissionGuard 判断 L0-L4。L3 工具不执行，创建 Approval 并通过 LangGraph interrupt() 暂停 graph（checkpoint 持久化到 PostgresSaver）；L4 高危工具直接 blocked。审批通过后图外执行工具，再 Command(resume=...) 从 checkpoint 恢复，不重跑 graph。审批超过 24h 自动过期。ToolCall、Approval、AgentEvent 都落库，能完整审计。
 
 ### RAG 30 秒版
 
@@ -2309,7 +2360,7 @@ Reusable Skill Applied:
 | 模块 | 主动承认边界 | 你再补一句 |
 |---|---|---|
 | Runtime | 没有独立 router node | 路由拆成 planner/supervisor/dispatcher |
-| Checkpoint | 默认关闭，不是生产级 crash recovery | 业务审批恢复靠 DB 状态，RedisSaver 是预留生产方案 |
+| Checkpoint | 已生产闭环，PostgresSaver + interrupt/Command(resume) | 启动有 health check + require_durable fail-fast；approval 超时自动过期 + TTL 清理 |
 | MCP | 不是完整 JSON Schema validator | 当前覆盖内置工具 required/format，外部 MCP 会升级 jsonschema |
 | RAG | 0.54→0.92 是 synthetic eval | 价值是可复现和防回归，不是线上 A/B |
 | RRF | 只在 Qdrant native hybrid | Python fallback 是 weighted merge/rerank |
@@ -2337,15 +2388,18 @@ mindmap
       Planner RoutePlan
       Supervisor Dispatcher
       Evaluator FinalResponse
-      Approval Interrupt
+      Interrupt + Command(resume)
+      PostgresSaver Checkpoint
     MCP Governance
       Registry
       Tool Spec
       Required Validation
       L0-L4 Risk
-      L3 Approval
+      L3 Approval + Interrupt
       L4 Block
       ToolCall Audit
+      Approval Expiry 24h
+      Checkpoint Cleanup TTL
     RAG
       Document Parse
       Parent Child Chunking
@@ -2409,8 +2463,8 @@ mindmap
 | 关键词 | 真实含义 |
 |---|---|
 | 可观测 | 每个节点执行后有 node_results、events、steps、status trace |
-| 可中断 | L3 工具审批时 graph 会停在 waiting_approval |
-| 可恢复 | 审批后用 DB 中的 pending state 和 tool_call 继续 |
+| 可中断 | L3 工具审批时 graph 通过 LangGraph interrupt() 暂停，checkpoint 写入 PostgresSaver |
+| 可恢复 | 审批后图外执行工具，再 Command(resume=...) 从 checkpoint 精确继续，不重跑 graph |
 | 可扩展 | 新增节点时注册到 graph registry，再让 planner route 到它 |
 | 可治理 | 工具、记忆、RAG、最终回复都有边界，不混在一个大函数里 |
 
@@ -2533,6 +2587,7 @@ planner 会补上：
 {
     "status": "waiting_approval",
     "approval_required": True,
+    "approval_pause_mode": "interrupt",  # 新架构：interrupt-based
     "pending_approval_id": 88,
     "pending_tool_name": "local_file.write",
     "pending_tool_args": {"path": "...", "content": "..."},
@@ -2541,7 +2596,9 @@ planner 会补上：
 }
 ```
 
-这个例子很重要，因为它说明你的 runtime 不是一次性跑到底，而是能被工具审批打断。
+此时 tool_agent 调用了 `langgraph.types.interrupt(payload)`，graph 暂停。checkpoint 已写入 PostgresSaver 的 4 张表（thread_id=run:{run_id}）。agent_service 捕获 GraphInterrupt，emit SSE 事件给前端。用户批准后，agent_service 在图外执行工具，再 `Command(resume={"action":"approved","tool_result":...})` 从 checkpoint 精确恢复。
+
+这个例子很重要，因为它说明你的 runtime 不是一次性跑到底，而是能被工具审批打断，且 checkpoint 跨进程可恢复。
 
 ### 10.1.4 节点分组的设计思路
 
@@ -2638,18 +2695,11 @@ RoutePlan 是 planner 给后续节点的执行计划。它不是自然语言，�
 
 dispatcher 不是 LLM，它是确定性的。它看：
 
-1. 当前 status 是否 waiting_approval。
-2. route_plan 里有哪些节点。
-3. completed_nodes 里哪些已经完成。
-4. 是否有 supervisor/replanner 给出的 next node。
+1. route_plan 里有哪些节点。
+2. completed_nodes 里哪些已经完成。
+3. 是否有 supervisor/replanner 给出的 next node。
 
-如果 waiting_approval：
-
-```text
-return END
-```
-
-否则：
+注意：审批暂停不再走 dispatcher 的 END 返回（旧架构）。新架构中 tool_agent 直接调用 LangGraph interrupt() 暂停 graph，checkpoint 写入 PostgresSaver。dispatcher 仅负责正常路由。
 
 ```text
 for node in route_plan.route:
@@ -2658,7 +2708,7 @@ for node in route_plan.route:
 return final_response
 ```
 
-这就是为什么它稳定。LLM 做规划，但真正跳边是代码控制的。
+这就是为什么它稳定。LLM 做规划，但真正跳边是代码控制的。审批中断由 LangGraph interrupt() 原生处理。
 
 ### 10.1.7 evaluator 的价值
 
@@ -3408,9 +3458,12 @@ Reusable Skill Applied:
 | State 字段 | `src/web_app/agent/runtime/state.py` | route_plan、context、pending approval、node_results |
 | Planner | `src/web_app/agent/runtime/planner.py` | RoutePlan、risk、answer_mode |
 | Dispatcher | `src/web_app/agent/runtime/dispatch.py` | waiting_approval -> END，next node logic |
-| Runtime run | `src/web_app/agent/runtime/graph.py` | graph.ainvoke、checkpointer、resume_from_approval |
+| Runtime run | `src/web_app/agent/runtime/graph.py` | graph.ainvoke、AsyncPostgresSaver、resume_from_interrupt (Command resume)、_legacy_resume_from_approval (deprecated) |
+| Checkpointer | `src/web_app/agent/runtime/checkpointers.py` | _AsyncPostgresSaverHandle、build_checkpointer、check_checkpointer_health |
+| Cleanup | `src/web_app/agent/runtime/checkpoint_cleanup.py` | cleanup_checkpoints (TTL-based)、estimate_checkpoint_size |
+| Approval Expiry | `src/web_app/services/approval_expiry.py` | expire_stale_approvals (24h TTL) |
 | Context node | `src/web_app/agent/runtime/node_groups/read_nodes.py` | parallel_read_stage、context_builder |
-| Agent nodes | `src/web_app/agent/runtime/node_groups/agent_nodes.py` | rag/tool/memory/skill agent |
+| Agent nodes | `src/web_app/agent/runtime/node_groups/agent_nodes.py` | rag/tool/memory/skill agent（含 _interrupt_approval） |
 | Final response | `src/web_app/agent/runtime/node_groups/eval_final_nodes.py` | GSSC prompt、constraints |
 
 ## 12.2 MCP 代码地图
@@ -3690,18 +3743,18 @@ dispatch_next_route_node 会根据（可能已被 llm_supervisor_route 改写后
 checkpoint 是保存图执行状态的机制。Agent 可能运行时间长，中间可能等待审批、服务重启或失败。checkpoint 可以让系统从某个状态恢复，而不是从头执行。
 
 **结合你的项目：**  
-你的项目接入了 LangGraph checkpointer，支持 RedisSaver 和 MemorySaver，但默认关闭。审批恢复主要靠 DB 中的 AgentRun、ToolCall、Approval 状态。
+你的项目以 PostgresSaver 为生产后端（AsyncPostgresSaver），默认开启。审批暂停时通过 LangGraph interrupt() 写入 4 张 PG 表（checkpoints、checkpoint_blobs、checkpoint_writes、checkpoint_migrations）。恢复时用 Command(resume=...) 从 checkpoint 精确继续，不重跑 graph。启动有健康检查，require_durable=True 确保不会静默降级到内存模式。跨进程 recovery E2E 测试已通过。
 
-### Q16：MemorySaver 和 RedisSaver 的区别是什么？
+### Q16：MemorySaver、RedisSaver、PostgresSaver 的区别是什么？
 
 **面试官想考什么：**  
 他想看你是否知道本地开发和生产持久化的区别。
 
 **推荐回答：**  
-MemorySaver 是进程内存级，适合本地开发和测试，服务重启后丢失。RedisSaver 是外部存储，更适合跨进程、重启恢复的生产场景。
+MemorySaver 是进程内存级，适合 dev/test，服务重启丢失。RedisSaver 是外部存储但当前版本（0.4.1）有 Command(resume) 内部 bug。PostgresSaver 是生产级选择：async 版本支持 graph.ainvoke()，数据持久在 PG，跨进程 recovery 已验证通过。项目默认 PostgresSaver + require_durable=True 启动时 fail-fast。
 
 **结合你的项目：**  
-你可以诚实说：当前默认不开 checkpoint，开启后优先 RedisSaver，失败 fallback MemorySaver。生产级 crash recovery 还需要补 E2E 测试。
+生产默认 agent_checkpointer_backend=postgres，agent_checkpointer_require_durable=True。启动时 check_checkpointer_health() 验证 4 张表存在。MemorySaver 仅 dev/test，RedisSaver 标记 experimental（等上游修 bug）。审批超时 24h 自动过期，completed/failed/expired checkpoint 按 TTL 自动清理。
 
 ### Q17：如何避免 LangGraph 节点重复执行？
 
@@ -4458,7 +4511,7 @@ Memory、ToolCall、Approval、DocumentChunk、Qdrant payload 都带 user_id。
 错误恢复包括节点级错误记录、失败状态、fallback、重试、checkpoint、业务状态恢复、用户可读错误信息。
 
 **结合你的项目：**  
-RAG 有 fallback，tool 有 failed/blocked/waiting_approval 状态，approval resume 走 DB 状态，LangGraph checkpointer 可选。
+RAG 有 fallback，tool 有 failed/blocked/waiting_approval 状态。审批恢复走 PostgresSaver checkpoint：interrupt() 暂停时状态持久化到 PG，Command(resume=...) 从 checkpoint 精确恢复，不重跑 graph。启动有 health check + require_durable fail-fast。审批超时自动过期（24h TTL），防止永久悬挂。completed/failed/expired run 的 checkpoint 按 TTL 自动清理。
 
 ### Q84：如何降低 Agent 延迟？
 
@@ -4635,10 +4688,10 @@ L3 需要审批，L4 blocked，tool spec 的 safety_level 固定在 registry/DB�
 他想看你是否知道不足。
 
 **推荐回答：**  
-可以补生产级 Redis checkpoint E2E、完整 JSON Schema validator、外部 MCP server trust policy、Memory eval、Skill 可执行子图、线上 query log RAG eval。
+可以补完整 JSON Schema validator、外部 MCP server trust policy、Memory eval、Skill 可执行子图、线上 query log RAG eval。
 
 **结合你的项目：**  
-这正好对应真实性审计里的边界。你要主动承认这些不是当前已完成生产级能力。
+Checkpoint 已从"待补"升级为"已完成"（PostgresSaver 生产闭环）。当前真正需要升级的是：标准 JSON Schema 校验（当前只做 required/format）、Skill 从"上下文注入"升级为"可执行子图"、RAG eval 从 synthetic benchmark 升级为线上真实 query log。
 
 ### Q100：如果只能保留你项目里最有价值的三个设计，你选什么？
 
