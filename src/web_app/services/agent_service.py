@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from src.web_app.agent.runtime import AgentRuntime
 from src.web_app.agent.runtime.checkpoint import record_event
+from src.web_app.agent.runtime.checkpoint_cleanup import delete_checkpoints_for_runs
 from src.web_app.agent.runtime.events import queue_stream_event as _queue_stream_event
 from src.web_app.agent.runtime.latency import build_runtime_latency_trace
 from src.web_app.agent.runtime.visible_thoughts import visible_thought_texts
@@ -1828,6 +1829,24 @@ def clear_conversation(db: Session, user_id: int, conversation_id: str) -> dict[
     return {"conversation": _conversation_response(conversation), "cleared_messages": removed}
 
 
+def _cleanup_checkpoints_for_runs(run_ids: list[int]) -> None:
+    """Best-effort checkpoint cleanup for hard-deleted conversations."""
+    if not run_ids:
+        return
+    try:
+        deleted = delete_checkpoints_for_runs(run_ids)
+        logger.info(
+            "[conversation_delete] checkpoint cleanup: deleted %d rows "
+            "for %d runs (%s)", deleted, len(run_ids), run_ids,
+        )
+    except Exception:
+        logger.exception(
+            "[conversation_delete] checkpoint cleanup failed for runs=%s — "
+            "checkpoints will be picked up by orphan cleanup",
+            run_ids,
+        )
+
+
 def hard_delete_conversation(
     db: Session,
     user_id: int,
@@ -1930,6 +1949,8 @@ def hard_delete_conversation(
                 )
 
         # Proceed with deletion
+        all_run_ids = [r.id for r in runs]
+        _cleanup_checkpoints_for_runs(all_run_ids)
         try:
             doc_ids = repo.get_conversation_document_ids(user_id, conversation_id)
         except Exception:
@@ -1953,6 +1974,8 @@ def hard_delete_conversation(
             run_ids=pending_approval_ids,
         )
 
+    all_run_ids = [r.id for r in runs]
+    _cleanup_checkpoints_for_runs(all_run_ids)
     try:
         doc_ids = repo.get_conversation_document_ids(user_id, conversation_id)
     except Exception:

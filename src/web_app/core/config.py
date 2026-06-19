@@ -186,6 +186,11 @@ class Settings(BaseSettings):
     # Pending approvals older than this are auto-expired (cannot be approved/rejected).
     # Expired approvals' checkpoints enter cleanup rotation after the expired TTL.
     agent_approval_pending_ttl_hours: int = 24
+    # Background checkpoint cleanup interval in minutes.  0 = disabled.
+    # Cleans completed/cancelled/expired checkpoints (TTL: 7d) and failed (30d),
+    # plus any orphan checkpoints whose agent_runs row has been deleted.
+    agent_checkpoint_cleanup_interval_minutes: int = 60
+    agent_checkpoint_cleanup_enabled: bool = True
     # Checkpointer backend: "postgres" (production) | "redis" (experimental) | "memory" (dev/test only)
     agent_checkpointer_backend: str = "postgres"
     # True → fail fast at startup if durable checkpoint storage is unavailable.
