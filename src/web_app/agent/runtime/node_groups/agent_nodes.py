@@ -503,6 +503,10 @@ class AgentNodesMixin:
         NOT re-enter from the top.  Legacy END-based resume detection
         has been removed.
         """
+        route_plan = state.get("route_plan") or {}
+        user_text = state.get("user_input", "")
+        print(f"[TOOL_AGENT_TRACE] enter user_text={user_text[:200]} intent={route_plan.get('intent')} route={route_plan.get('route')}")
+
         if state.get("route") in {"approval", "blocked"}:
             mark_completed(state, "tool_agent")
             record_agent_node_result(
@@ -514,9 +518,6 @@ class AgentNodesMixin:
             return state
 
         try:
-            route_plan = state.get("route_plan") or {}
-            user_text = state.get("user_input", "")
-
             # ── LLM tool selection (first entry only, reused on resume) ──
             llm_selection = None
             if state.get("llm_tool_selection"):

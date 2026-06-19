@@ -64,6 +64,7 @@ class SetupNodesMixin:
                     thread_id=thread_id,
                 )
         state["home_intent"] = home_intent
+        print(f"[HOME_INTENT_TRACE] input={user_input[:200]} intent={home_intent.get('intent') or home_intent.get('detected_intent')} answer_mode={home_intent.get('answer_mode')} route_hints={home_intent.get('suggested_route_hints') or home_intent.get('required_agents')} source={home_intent.get('raw_intent_source', 'rule')}")
         append_status_step(
             state,
             key="home_intent",
@@ -122,6 +123,7 @@ class SetupNodesMixin:
             home_intent=state.get("home_intent"),
             has_document_attachments=_has_doc_attachments,
         )
+        print(f"[PLANNER_TRACE] input={user_input[:200]} intent={route_plan.get('intent')} route={route_plan.get('route')} risk={route_plan.get('risk_level')} reasons={route_plan.get('reason')}")
         state["route_plan"] = route_plan
         state["execution_plan"] = execution_plan_from_route_plan(route_plan, state)
         route_intent = route_plan.get("intent", "chat")

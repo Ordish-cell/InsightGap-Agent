@@ -101,6 +101,7 @@ def infer_tool(
     # 4. Intent → tool map
     if payload.get("intent"):
         tool_name = _INTENT_TOOL_MAP.get(payload["intent"])
+        print(f"[INFER_TOOL_TRACE] step4_intent_map intent={payload.get('intent')} → tool={tool_name}")
         if tool_name:
             return tool_name, _build_input_for_tool(tool_name, user_input, payload)
 
@@ -110,6 +111,7 @@ def infer_tool(
         return TOOL_HINTS["github"], {"repo": payload.get("repo", "owner/name")}
 
     if is_explicit_or_realtime_web_query(user_input):
+        print("[INFER_TOOL_TRACE] step5_keyword_fallback → web.search")
         return "web.search", _build_web_search_input(user_input, payload)
 
     # ── Email ───────────────────────────────────────────────
@@ -132,6 +134,7 @@ def infer_tool(
     if any(t in text for t in ("追加", "追加写入", "append")):
         return "local_file.append", {"path": payload.get("path", ""), "content": payload.get("content", user_input)}
 
+    print(f"[INFER_TOOL_TRACE] no_tool_matched user_input={user_input[:200]}")
     return None, {}
 
 

@@ -140,9 +140,12 @@ async def llm_supervisor_route_node(
 
     planner_route = _planner_route(state)
     available_nodes = get_available_runtime_nodes(state)
+    route_plan = state.get("route_plan") or {}
+    print(f"[LLM_SUPERVISOR_TRACE] entry planner_intent={route_plan.get('intent')} planner_route={planner_route} mode={settings.mode}")
 
     pre_rule = _build_pre_rule_decision(state, available_nodes, planner_route)
     if pre_rule is not None:
+        print(f"[LLM_SUPERVISOR_TRACE] pre_rule_matched={pre_rule.metadata.get('pre_rule')} route={pre_rule.route}")
         return apply_supervisor_route_plan(state, pre_rule, mode=settings.mode)
 
     raw_output: dict[str, Any] | None = None
@@ -154,6 +157,7 @@ async def llm_supervisor_route_node(
             planner_route=planner_route,
         )
         raw_output = decision.model_dump()
+        print(f"[LLM_SUPERVISOR_TRACE] llm_raw_decision route={decision.route} target={decision.target_runtime} reason={decision.reason[:200]}")
         normalized = validate_and_normalize_llm_supervisor_route(
             decision,
             state,
@@ -161,6 +165,7 @@ async def llm_supervisor_route_node(
             planner_route=planner_route,
         )
     except Exception as exc:
+        print(f"[LLM_SUPERVISOR_TRACE] llm_failed error={exc}")
         normalized = build_fallback_supervisor_decision(
             state,
             reason=f"llm_supervisor_failed:{type(exc).__name__}:{exc}",
@@ -168,6 +173,7 @@ async def llm_supervisor_route_node(
             available_nodes=available_nodes,
         )
 
+    print(f"[LLM_SUPERVISOR_TRACE] final_decision route={normalized.route} fallback={normalized.fallback} errors={normalized.validation_errors}")
     if raw_output is not None:
         normalized.raw_decision = raw_output
     normalized.metadata.setdefault("model", settings.model or "default:planner")
@@ -396,6 +402,9 @@ def apply_supervisor_route_plan(
         explicit_override=decision.explicit_override,
     )
 
+    original_intent = (state.get("route_plan") or {}).get("intent")
+    print(f"[LLM_SUPERVISOR_TRACE] apply mode={mode} route={decision.route} original_intent={original_intent} target={decision.target_runtime}")
+
     if mode != "full":
         return state
 
@@ -524,6 +533,7 @@ def _build_pre_rule_decision(
                 original_planner_route=list(planner_route),
                 metadata={"pre_rule": "explicit_user_route"},
             )
+
     return None
 
 
@@ -594,13 +604,13 @@ def _build_user_prompt(
         "If they agree, still verify that the route is safe, minimal, uses only available_executable_nodes, and matches evidence/approval readiness.",
     ]
     if "tool_agent" in available_nodes:
-        supervisor_task.append("If the user does not ask for a tool or external side effect, do not route to tool_agent.")
+        supervisor_task.append("MANDATORY: If user_input contains time-sensitive words (最新/今天/当前/实时/latest/today/now/current), route to tool_agent. Your training data may be outdated. Do NOT answer from memory.")
     if "final_response" in available_nodes:
-        supervisor_task.append("If the user only makes a casual statement or simple chat, route to final_response.")
+        supervisor_task.append("If the user only makes a casual statement, greeting, or simple chat with NO time-sensitive element, route to final_response.")
     if "rag_agent" in available_nodes:
         supervisor_task.append("If the user asks about uploaded documents, attachments, or private knowledge, route to rag_agent.")
     if "research_agent" in available_nodes:
-        supervisor_task.append("If the user asks for broad/current/open-ended research, route to research_agent.")
+        supervisor_task.append("If the user explicitly asks for deep research, a comprehensive report, or long-form investigation, route to research_agent.")
     if "memory_agent" in available_nodes:
         supervisor_task.append("If the user asks to remember a preference or fact, route to memory_agent.")
     supervisor_task.extend([
