@@ -5,7 +5,7 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy import delete as sa_delete
 
 from src.web_app.db.repositories.base_repository import BaseRepository
-from src.web_app.models.orm import AgentChatMessage, AgentConversation, AgentEvent, AgentRun, AgentStep, Approval, Artifact, Document, DocumentChunk, LLMCall, Memory, ResearchRun, ToolCall
+from src.web_app.models.orm import AgentChatMessage, AgentConversation, AgentConversationSummary, AgentConversationSummarySegment, AgentEvent, AgentRun, AgentStep, Approval, Artifact, Document, DocumentChunk, LLMCall, Memory, ResearchRun, ToolCall
 
 
 class AgentRunRepository(BaseRepository[AgentRun]):
@@ -261,3 +261,227 @@ class AgentChatMessageRepository(BaseRepository[AgentChatMessage]):
             )
             self.db.commit()
         return count
+
+
+class AgentConversationSummaryRepository(BaseRepository[AgentConversationSummary]):
+    model = AgentConversationSummary
+
+    def get_by_conversation(self, user_id: int, conversation_id: str) -> AgentConversationSummary | None:
+        stmt = (
+            select(AgentConversationSummary)
+            .where(
+                AgentConversationSummary.user_id == user_id,
+                AgentConversationSummary.conversation_id == conversation_id,
+            )
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
+    def upsert(
+        self,
+        user_id: int,
+        conversation_id: str,
+        **values,
+    ) -> AgentConversationSummary:
+        existing = self.get_by_conversation(user_id, conversation_id)
+        if existing:
+            return self.update(existing, **values)
+        values.setdefault("summary_version", 1)
+        return self.create(user_id=user_id, conversation_id=conversation_id, **values)
+
+
+class AgentConversationSummarySegmentRepository(BaseRepository[AgentConversationSummarySegment]):
+    model = AgentConversationSummarySegment
+
+    def get_latest_segment(
+        self,
+        *,
+        conversation_id: str,
+        user_id: int,
+    ) -> AgentConversationSummarySegment | None:
+        stmt = (
+            select(AgentConversationSummarySegment)
+            .where(
+                AgentConversationSummarySegment.user_id == user_id,
+                AgentConversationSummarySegment.conversation_id == conversation_id,
+            )
+            .order_by(AgentConversationSummarySegment.end_message_id.desc().nullslast())
+            .limit(1)
+        )
+        return self.db.execute(stmt).scalar_one_or_none()
+
+    def list_messages_after_segment(
+        self,
+        *,
+        conversation_id: str,
+        user_id: int,
+        after_message_created_at: datetime | None = None,
+        after_message_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[AgentChatMessage]:
+        stmt = (
+            select(AgentChatMessage)
+            .where(
+                AgentChatMessage.user_id == user_id,
+                AgentChatMessage.conversation_id == conversation_id,
+            )
+            .order_by(AgentChatMessage.created_at.asc(), AgentChatMessage.id.asc())
+        )
+        # Prefer id-based exclusion (reliable across same-second inserts)
+        if after_message_id is not None:
+            stmt = stmt.where(AgentChatMessage.id > after_message_id)
+        elif after_message_created_at is not None:
+            stmt = stmt.where(AgentChatMessage.created_at > after_message_created_at)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        return list(self.db.execute(stmt).scalars())
+
+    def segment_exists(
+        self,
+        *,
+        conversation_id: str,
+        user_id: int,
+        start_message_id: int,
+        end_message_id: int,
+    ) -> bool:
+        stmt = (
+            select(func.count(AgentConversationSummarySegment.id))
+            .where(
+                AgentConversationSummarySegment.user_id == user_id,
+                AgentConversationSummarySegment.conversation_id == conversation_id,
+                AgentConversationSummarySegment.start_message_id == start_message_id,
+                AgentConversationSummarySegment.end_message_id == end_message_id,
+            )
+        )
+        return (self.db.execute(stmt).scalar() or 0) > 0
+
+    def create_segment(
+        self,
+        *,
+        conversation_id: str,
+        user_id: int,
+        start_message_id: int,
+        end_message_id: int,
+        start_message_created_at: datetime | None = None,
+        end_message_created_at: datetime | None = None,
+        message_count: int = 0,
+        summary_text: str = "",
+        keywords_json: list | None = None,
+        facts_json: list | None = None,
+        embedding_id: str = "",
+    ) -> AgentConversationSummarySegment:
+        return self.create(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            start_message_id=start_message_id,
+            end_message_id=end_message_id,
+            start_message_created_at=start_message_created_at,
+            end_message_created_at=end_message_created_at,
+            message_count=message_count,
+            summary_text=summary_text,
+            keywords_json=keywords_json or [],
+            facts_json=facts_json or [],
+            embedding_id=embedding_id,
+        )
+
+    def update_embedding_id(
+        self,
+        *,
+        segment_id: int,
+        embedding_id: str,
+    ) -> None:
+        stmt = (
+            update(AgentConversationSummarySegment)
+            .where(AgentConversationSummarySegment.id == segment_id)
+            .values(embedding_id=embedding_id)
+        )
+        self.db.execute(stmt)
+        self.db.commit()
+
+    def search_segments_ilike(
+        self,
+        *,
+        conversation_id: str,
+        user_id: int,
+        query: str,
+        limit: int = 5,
+    ) -> list[dict]:
+        """Fallback keyword search on summary_text when Qdrant is unavailable."""
+        import re as _re
+        from datetime import UTC
+
+        rows = (
+            self.db.execute(
+                select(AgentConversationSummarySegment)
+                .where(
+                    AgentConversationSummarySegment.user_id == user_id,
+                    AgentConversationSummarySegment.conversation_id == conversation_id,
+                )
+                .order_by(AgentConversationSummarySegment.created_at.desc())
+            )
+            .scalars()
+            .all()
+        )
+
+        terms = _extract_search_terms(query)
+        scored: list[tuple[float, AgentConversationSummarySegment]] = []
+        for row in rows:
+            text = (row.summary_text or "").lower()
+            if not text:
+                continue
+            score = _ilike_score(text, terms)
+            if score > 0:
+                scored.append((score, row))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        results: list[dict] = []
+        for score, row in scored[:limit]:
+            results.append({
+                "id": row.id,
+                "conversation_id": row.conversation_id,
+                "summary_text": row.summary_text,
+                "score": score,
+                "start_message_id": row.start_message_id,
+                "end_message_id": row.end_message_id,
+                "start_time": row.start_message_created_at,
+                "end_time": row.end_message_created_at,
+                "message_count": row.message_count or 0,
+                "source": "pg_ilike",
+            })
+        return results
+
+    def count_by_conversation(self, user_id: int, conversation_id: str) -> int:
+        stmt = (
+            select(func.count(AgentConversationSummarySegment.id))
+            .where(
+                AgentConversationSummarySegment.user_id == user_id,
+                AgentConversationSummarySegment.conversation_id == conversation_id,
+            )
+        )
+        return int(self.db.execute(stmt).scalar() or 0)
+
+
+def _extract_search_terms(query: str) -> list[str]:
+    """Extract searchable tokens from a query string."""
+    import re
+    tokens: list[str] = []
+    cjk = re.findall(r"[一-鿿]+", query or "")
+    for chunk in cjk:
+        tokens.extend(chunk)
+    alpha = re.findall(r"[a-zA-Z0-9_]{2,}", query or "")
+    tokens.extend(alpha)
+    seen: set[str] = set()
+    result: list[str] = []
+    for t in tokens:
+        tl = t.lower()
+        if tl not in seen:
+            seen.add(tl)
+            result.append(tl)
+    return result[:16]
+
+
+def _ilike_score(text: str, terms: list[str]) -> float:
+    """Simple keyword-match score for ILIKE fallback."""
+    if not terms:
+        return 0.0
+    hits = sum(1 for t in terms if t in text)
+    return hits / len(terms)

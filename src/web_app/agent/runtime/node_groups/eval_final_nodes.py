@@ -190,13 +190,13 @@ class EvalFinalNodesMixin:
                 _add_warning("tool_denied" if tool_status == "denied" else "tool_failed")
                 _add_constraint("Do not claim the tool action has been completed.")
         elif "tool_agent" in route_agents:
-            legacy_tool_result = state.get("tool_result") or state.get("tool_call") or {}
-            legacy_tool_status = str(legacy_tool_result.get("status") or "")
-            if legacy_tool_status in {"waiting_approval", "missing_fields"}:
+            fallback_tool_result = state.get("tool_result") or state.get("tool_call") or {}
+            fallback_tool_status = str(fallback_tool_result.get("status") or "")
+            if fallback_tool_status in {"waiting_approval", "missing_fields"}:
                 _add_warning("tool_waiting_approval")
                 _add_constraint("Do not claim the tool action has been completed. Tell the user approval is required before execution.")
-            elif legacy_tool_status in {"failed", "blocked", "rejected"}:
-                _add_warning("tool_denied" if legacy_tool_status in {"blocked", "rejected"} else "tool_failed")
+            elif fallback_tool_status in {"failed", "blocked", "rejected"}:
+                _add_warning("tool_denied" if fallback_tool_status in {"blocked", "rejected"} else "tool_failed")
                 _add_constraint("Do not claim the tool action has been completed.")
 
         artifact_planned = "artifact_agent" in route_agents or route_plan.get("intent") == "artifact"

@@ -47,7 +47,7 @@ def map_route_to_node(route_item: str) -> str:
     return mapping.get(normalized, mapping.get(route_item, "final_response"))
 
 
-def legacy_next_route_node(state: AgentRuntimeState) -> str:
+def next_route_node(state: AgentRuntimeState) -> str:
     """Compute the next route node from the route_plan.
 
     Approval pause is now handled via LangGraph interrupt() inside
@@ -103,4 +103,4 @@ def record_supervisor_dispatch_audit(state: AgentRuntimeState, legacy_next_node:
 
 def dispatch_next_route_node(state: AgentRuntimeState) -> str:
     """Return the next graph node while preserving supervisor observation side effects."""
-    return record_supervisor_dispatch_audit(state, legacy_next_route_node(state))
+    return record_supervisor_dispatch_audit(state, next_route_node(state))

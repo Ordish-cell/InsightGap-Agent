@@ -149,6 +149,31 @@ class Settings(BaseSettings):
     agent_llm_usage_log_enabled: bool = True
     agent_llm_log_prompt_preview: bool = False
     agent_llm_log_raw_output: bool = False
+    # Max recent chat messages injected into the LLM context per turn.
+    # Only the last N messages are loaded; earlier messages rely on
+    # conversation_summary (running) + recalled historical segments.
+    conversation_recent_message_limit: int = 24
+    # ── Running conversation summary (incremental, after each assistant turn) ──
+    enable_conversation_summary: bool = True
+    # ── Conversation segment: freeze old messages into indexed summary blocks ──
+    # Controls whether the system creates compressed historical segments from
+    # long conversations. These segments are later recalled via vector search
+    # to keep early-turn context alive even after hundreds of messages.
+    enable_conversation_segment_creation: bool = True
+    # Controls whether the context builder recalls relevant historical segments
+    # via Qdrant vector search (fallback to PostgreSQL ILIKE).
+    enable_conversation_segment_recall: bool = True
+    # Number of messages per frozen historical segment.
+    conversation_summary_segment_size: int = 24
+    # Max number of recalled segments injected into the LLM context per turn.
+    conversation_segment_recall_limit: int = 5
+    # Minimum similarity / keyword-match score for a segment to be recalled.
+    conversation_segment_min_score: float = 0.15
+    # Token budget ceiling for all recalled segment text combined.
+    conversation_segment_max_tokens: int = 1800
+    # Qdrant collection name for conversation segment vectors.
+    conversation_segment_vector_collection: str = "conversation_summary_segments"
+
     feed_real_sources_enabled: bool = True
     feed_allow_mock_data: bool = False
     feed_home_card_count: int = 3
@@ -182,7 +207,7 @@ class Settings(BaseSettings):
     agent_llm_supervisor_temperature: float = 0
     agent_llm_supervisor_timeout_seconds: int = 20
     agent_langgraph_checkpointer_enabled: bool = True
-    agent_approval_interrupt_enabled: bool = True  # True → LangGraph interrupt(); False → legacy END-based
+    # Approval pause always uses LangGraph interrupt() / Command(resume=...)
     # Pending approvals older than this are auto-expired (cannot be approved/rejected).
     # Expired approvals' checkpoints enter cleanup rotation after the expired TTL.
     agent_approval_pending_ttl_hours: int = 24

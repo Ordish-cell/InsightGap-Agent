@@ -39,6 +39,7 @@ from src.web_app.models.orm import (
 from src.web_app.services.conversation_summary_service import (
     CONVERSATION_SUMMARY_UPDATE_PROMPT,
     ConversationSummaryService,
+    RecalledConversationSegment,
     _extract_query_terms,
 )
 from src.web_app.tests.db_test_utils import make_test_session
@@ -126,6 +127,33 @@ def test_recent_messages_limit_configurable(monkeypatch):
 # ── Test 2: Running summary updates after a turn ───────────────────────
 
 
+def test_history_snapshot_uses_configured_recent_limit(monkeypatch):
+    """The production history snapshot loader must honor conversation_recent_message_limit."""
+    db = make_test_session()
+    user = _make_user(db)
+    conv = _make_conversation(db, user.id)
+
+    for i in range(8):
+        _make_message(db, user.id, conv.conversation_id, role="user", content=f"configured msg {i}")
+
+    monkeypatch.setattr("src.web_app.core.config.settings.conversation_recent_message_limit", 3)
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "fastapi", SimpleNamespace(UploadFile=object))
+    from src.web_app.services.agent_service import _inject_conversation_history_snapshot
+
+    state: dict[str, Any] = {"context": {}}
+    _inject_conversation_history_snapshot(state, db, user.id, conv.conversation_id)
+
+    history = state["context"]["conversation_history"]
+    assert "configured msg 5" in history
+    assert "configured msg 7" in history
+    assert "configured msg 4" not in history
+
+    db.close()
+
+
 def test_running_summary_updates_after_turn(monkeypatch):
     """Calling update_after_turn creates/updates the conversation summary."""
     db = make_test_session()
@@ -187,6 +215,45 @@ def test_running_summary_updates_after_turn(monkeypatch):
 # ── Test 3: Summary preserves early fact after many turns ───────────────
 
 
+def test_agent_service_updates_running_summary_after_turn(monkeypatch):
+    """Production finalization helper should call the conversation summary service."""
+    db = make_test_session()
+    user = _make_user(db)
+    conv = _make_conversation(db, user.id)
+    run = _make_run(db, user.id, conv.conversation_id)
+    _make_message(db, user.id, conv.conversation_id, role="user", content="remember Phoenix", run_id=run.id)
+    _make_message(db, user.id, conv.conversation_id, role="assistant", content="Phoenix noted", run_id=run.id)
+
+    def fake_llm(prompt: str) -> str:
+        assert "remember Phoenix" in prompt
+        assert "Phoenix noted" in prompt
+        return '{"summary_text": "Project Phoenix was discussed", "facts": ["Phoenix"], "preferences": [], "decisions": [], "open_threads": [], "entities": ["Phoenix"]}'
+
+    monkeypatch.setattr(
+        "src.web_app.services.conversation_summary_service._llm_call",
+        fake_llm,
+    )
+
+    import sys
+
+    monkeypatch.setitem(sys.modules, "fastapi", SimpleNamespace(UploadFile=object))
+    from src.web_app.services.agent_service import _update_conversation_summary_after_turn
+
+    _update_conversation_summary_after_turn(
+        db=db,
+        user_id=user.id,
+        conversation_id=conv.conversation_id,
+        run_id=run.id,
+    )
+
+    row = AgentConversationSummaryRepository(db).get_by_conversation(user.id, conv.conversation_id)
+    assert row is not None
+    assert row.summary_text == "Project Phoenix was discussed"
+    assert "Phoenix" in row.facts_json
+
+    db.close()
+
+
 def test_summary_preserves_early_fact_after_many_turns(monkeypatch):
     """After 100 messages, summary still contains a fact from the first turn."""
     db = make_test_session()
@@ -240,17 +307,14 @@ def test_summary_preserves_early_fact_after_many_turns(monkeypatch):
 # ── Test 4: Context builder keeps conversation_memory under heavy evidence ─
 
 
-def test_context_builder_keeps_conversation_memory(monkeypatch):
-    """Even with heavy evidence, conversation_memory is a critical source and survives Select."""
-    from src.web_app.context.builder import ContextBuilder, CRITICAL_SOURCES
-
-    assert "conversation_memory" in CRITICAL_SOURCES
-    assert "conversation_history" in CRITICAL_SOURCES
+def test_context_builder_keeps_conversation_memory():
+    """Even with heavy evidence, conversation_history + segments survive Select."""
+    from src.web_app.context.builder import ContextBuilder
 
     builder = ContextBuilder(route="chat")
 
     payload = {
-        "conversation_memory": "<conversation_memory>\n[Running Summary]\nProject Phoenix is a deep research agent.\n[Stable Facts]\n- 项目代号 Phoenix\n</conversation_memory>",
+        "conversation_segments": "[Relevant Historical Conversation Segments]\n## Segment 1 | Score 0.95\nProject Phoenix is a deep research agent.\n## Key Facts\n- 项目代号 Phoenix\n",
         "conversation_history": "User: hello\nAssistant: Hi",
         "task": "What is my project name?",
         "evidence": "x" * 50000,  # massive evidence — would overflow budget
@@ -264,14 +328,12 @@ def test_context_builder_keeps_conversation_memory(monkeypatch):
     selected = builder.select(packets)
     context = builder.structure(selected)
 
-    # Critical sources must be present
+    # Conversation-related sources must be present
     selected_sources = builder._selected_sources
-    assert "conversation_memory" in selected_sources
-    assert "conversation_history" in selected_sources
+    assert "conversation_history" in selected_sources, f"selected: {selected_sources}"
     assert "task" in selected_sources
     assert "output_contract" in selected_sources
-    # evidence should have been dropped (too large)
-    assert "Conversation Memory" in context or "conversation_memory" in str(selected)
+    # evidence should have been dropped (too large) — it's >50K chars
     assert "Phoenix" in context
 
 
@@ -279,7 +341,7 @@ def test_context_builder_keeps_conversation_memory(monkeypatch):
 
 
 def test_conversation_recall_uses_summary_and_segments():
-    """The conversation_recall prompt builder includes conversation_memory and durable memory."""
+    """The conversation_recall prompt builder uses conversation_recall_context and user_input."""
     from src.web_app.agent.runtime.state import AgentRuntimeState
     from src.web_app.agent.runtime.node_groups.eval_final_nodes import EvalFinalNodesMixin
 
@@ -288,9 +350,8 @@ def test_conversation_recall_uses_summary_and_segments():
         "run_id": 1,
         "user_input": "我的项目叫什么?",
         "context": {
-            "conversation_memory": "<conversation_memory>\n[Running Summary]\nProject Phoenix\n</conversation_memory>",
-            "memory_text": "## Semantic Memory\n- 用户叫C\n- 项目代号 Phoenix",
             "conversation_history": "User: 记住我的项目代号\nAssistant: 记住了，项目代号 Phoenix",
+            "gssc_context": "[Conversation History]\nUser: 记住我的项目代号\nAssistant: 记住了，项目代号 Phoenix",
         },
         "conversation_recall_context": {
             "source": "AgentConversation/AgentMessage",
@@ -307,11 +368,9 @@ def test_conversation_recall_uses_summary_and_segments():
     prompt = mixin._build_conversation_recall_prompt(state)
 
     assert "Phoenix" in prompt
-    # The conversation memory section with running summary should be injected
-    assert "[Conversation Memory (running summary + older history)]" in prompt
-    assert "[Durable User Memory]" in prompt
-    assert "Running Summary" in prompt
-    assert "Project Phoenix" in prompt
+    assert "[Previous User Messages]" in prompt
+    assert "[Recent Conversation Messages]" in prompt
+    assert "conversation_recall" in prompt.lower()
 
 
 # ── Test 6: New run must have conversation_id ──────────────────────────
@@ -336,7 +395,7 @@ def test_new_run_has_conversation_id():
 
 
 def test_qdrant_down_fallback_to_postgres(monkeypatch):
-    """When Qdrant raises, search_relevant_segments falls back to PG ILIKE."""
+    """When Qdrant returns empty, search_relevant_segments falls back to PG ILIKE."""
     db = make_test_session()
     user = _make_user(db)
     conv = _make_conversation(db, user.id)
@@ -353,21 +412,33 @@ def test_qdrant_down_fallback_to_postgres(monkeypatch):
         facts_json=["Project is called Phoenix"],
     )
 
-    # Force Qdrant to fail
+    # Force Qdrant to return empty (triggers PG fallback)
     monkeypatch.setattr(
         "src.web_app.services.conversation_summary_service.ConversationSummaryService._search_segments_in_qdrant",
         lambda *a, **kw: [],
     )
+    monkeypatch.setattr(
+        "src.web_app.core.config.settings.enable_conversation_segment_recall",
+        True,
+    )
+    monkeypatch.setattr(
+        "src.web_app.core.config.settings.conversation_segment_min_score",
+        0.05,
+    )
 
     svc = ConversationSummaryService()
     results = svc.search_relevant_segments(
-        conv.conversation_id, user.id, "Phoenix project name",
-        top_k=5, db=db,
+        conversation_id=conv.conversation_id,
+        user_id=user.id,
+        query="Phoenix project name",
+        db=db,
+        limit=5,
     )
 
     assert len(results) >= 1
     result = results[0]
-    assert "Phoenix" in result["summary_text"] or "Phoenix" in result.get("keywords", [])
+    assert result.source == "pg_ilike"
+    assert "Phoenix" in result.summary_text
 
     db.close()
 
@@ -386,8 +457,18 @@ def test_format_for_context():
         "entities": ["src/web_app/agent", "PostgresSaver", "QdrantMemoryStore"],
     }
     segments = [
-        {"summary_text": "Early discussion about RAG architecture"},
-        {"summary_text": "User asked about MCP integration"},
+        RecalledConversationSegment(
+            id=1, conversation_id="c1",
+            summary_text="Early discussion about RAG architecture",
+            score=0.85, start_message_id=1, end_message_id=10,
+            start_time=None, end_time=None, message_count=10, source="qdrant",
+        ),
+        RecalledConversationSegment(
+            id=2, conversation_id="c1",
+            summary_text="User asked about MCP integration",
+            score=0.70, start_message_id=11, end_message_id=20,
+            start_time=None, end_time=None, message_count=10, source="qdrant",
+        ),
     ]
 
     text = svc.format_for_context(summary=summary, relevant_segments=segments)
@@ -400,7 +481,8 @@ def test_format_for_context():
     assert "[Decisions]" in text
     assert "[Open Threads / Unresolved Tasks]" in text
     assert "[Key Entities]" in text
-    assert "[Relevant Older History]" in text
+    assert "[Relevant Historical Conversation Segments]" in text
+    assert "[Output Instructions]" in text
     assert "Phoenix" in text
     assert "LangGraph" in text
     assert "Uses Chinese" in text
@@ -440,44 +522,37 @@ def test_create_segment(monkeypatch):
     user = _make_user(db)
     conv = _make_conversation(db, user.id)
 
-    # Create 24 user + 24 assistant messages + a summary
+    # Create 24 messages (segment_size=24 → 1 segment)
     for i in range(24):
         _make_message(db, user.id, conv.conversation_id, role="user", content=f"Q{i}")
-        _make_message(db, user.id, conv.conversation_id, role="assistant", content=f"A{i}")
-
-    # Create summary with covered_message_count=48
-    summary_repo = AgentConversationSummaryRepository(db)
-    summary_repo.upsert(
-        user.id, conv.conversation_id,
-        summary_text="Test summary with 48 messages covered.",
-        covered_message_count=48,
-        summary_version=1,
-        last_message_id=None,
-    )
 
     captured_prompt: list[str] = []
     def fake_llm(prompt: str) -> str:
         captured_prompt.append(prompt)
-        return '{"summary_text": "Segment covering Q0-Q23, A0-A23", "keywords": ["test"], "facts": ["fact1"]}'
+        return '{"summary_text": "Segment covering Q0-Q23", "keywords": ["test"], "facts": ["fact1"]}'
 
     monkeypatch.setattr("src.web_app.services.conversation_summary_service._llm_call", fake_llm)
     monkeypatch.setattr("src.web_app.core.config.settings.conversation_summary_segment_size", 24)
     monkeypatch.setattr(
         "src.web_app.services.conversation_summary_service.ConversationSummaryService._index_segment_to_qdrant",
-        lambda *a, **kw: None,
+        lambda *a, **kw: "",
     )
 
     svc = ConversationSummaryService()
-    result = svc.create_segment_if_needed(conv.conversation_id, user.id, db=db)
+    result = svc.create_segment_if_needed(
+        conversation_id=conv.conversation_id,
+        user_id=user.id,
+        db=db,
+    )
 
-    assert result is not None
-    assert result["summary_text"] == "Segment covering Q0-Q23, A0-A23"
-    assert result["keywords"] == ["test"]
+    assert len(result) == 1, f"Expected 1 segment, got {len(result)}"
+    seg_dict = result[0]
+    assert "Q0" in str(seg_dict.get("summary_text", ""))
+    assert seg_dict["message_count"] == 24
 
     # Verify persisted
     seg_repo = AgentConversationSummarySegmentRepository(db)
-    segments = seg_repo.list_by_conversation(user.id, conv.conversation_id)
-    assert len(segments) >= 1
+    assert seg_repo.count_by_conversation(user.id, conv.conversation_id) >= 1
 
     db.close()
 
@@ -516,7 +591,12 @@ def test_segment_recall_disabled(monkeypatch):
     monkeypatch.setattr("src.web_app.core.config.settings.enable_conversation_segment_recall", False)
 
     svc = ConversationSummaryService()
-    results = svc.search_relevant_segments(conv.conversation_id, user.id, "test", db=db)
+    results = svc.search_relevant_segments(
+        conversation_id=conv.conversation_id,
+        user_id=user.id,
+        query="test",
+        db=db,
+    )
     assert results == []
     db.close()
 
@@ -525,13 +605,13 @@ def test_segment_recall_disabled(monkeypatch):
 
 
 def test_rag_evidence_and_conversation_memory_both_survive():
-    """In RAG route, both evidence and conversation_memory make it into context."""
+    """In RAG route, both evidence and conversation_segments make it into context."""
     from src.web_app.context.builder import ContextBuilder
 
     builder = ContextBuilder(route="rag")
 
     payload = {
-        "conversation_memory": "<conversation_memory>\n[Running Summary]\nProject Phoenix\n</conversation_memory>",
+        "conversation_segments": "[Relevant Historical Conversation Segments]\n## Segment 1\nProject Phoenix is a deep research agent",
         "conversation_history": "User: what about RAG?\nAssistant: Let me check.",
         "task": "RAG query",
         "evidence": [
@@ -546,8 +626,8 @@ def test_rag_evidence_and_conversation_memory_both_survive():
     selected = builder.select(packets)
     context = builder.structure(selected)
 
-    assert "conversation_memory" in builder._selected_sources
-    assert "Conversation Memory" in context
+    assert "conversation_segments" in builder._selected_sources
+    assert "Conversation Continuity" in context
     # Evidence must also appear (not dropped)
     assert "evidence" in builder._selected_sources
     assert "Evidence" in context
@@ -587,24 +667,14 @@ def test_summary_llm_failure_does_not_crash(monkeypatch):
 
 
 def test_segment_not_duplicated(monkeypatch):
-    """Calling create_segment_if_needed twice with same covered_message_count is idempotent."""
+    """Calling create_segment_if_needed twice on same messages is idempotent."""
     db = make_test_session()
     user = _make_user(db)
     conv = _make_conversation(db, user.id)
 
-    # Create 24 messages
+    # Create exactly 24 messages (segment_size=24 → 1 segment)
     for i in range(24):
         _make_message(db, user.id, conv.conversation_id, role="user", content=f"Q{i}")
-        _make_message(db, user.id, conv.conversation_id, role="assistant", content=f"A{i}")
-
-    # Create summary covering exactly 24 messages
-    summary_repo = AgentConversationSummaryRepository(db)
-    summary_repo.upsert(
-        user.id, conv.conversation_id,
-        summary_text="24 messages covered.",
-        covered_message_count=24,
-        summary_version=1,
-    )
 
     call_count = [0]
 
@@ -616,19 +686,27 @@ def test_segment_not_duplicated(monkeypatch):
     monkeypatch.setattr("src.web_app.core.config.settings.conversation_summary_segment_size", 24)
     monkeypatch.setattr(
         "src.web_app.services.conversation_summary_service.ConversationSummaryService._index_segment_to_qdrant",
-        lambda *a, **kw: None,
+        lambda *a, **kw: "",
     )
 
     svc = ConversationSummaryService()
 
     # First call: segment created
-    result1 = svc.create_segment_if_needed(conv.conversation_id, user.id, db=db)
-    assert result1 is not None
+    result1 = svc.create_segment_if_needed(
+        conversation_id=conv.conversation_id,
+        user_id=user.id,
+        db=db,
+    )
+    assert len(result1) == 1
     assert call_count[0] == 1
 
-    # Second call: segment_count now 1, 24-1*24=0 < 24 → no segment
-    result2 = svc.create_segment_if_needed(conv.conversation_id, user.id, db=db)
-    assert result2 is None
+    # Second call: segment_exists returns True → no new segment created
+    result2 = svc.create_segment_if_needed(
+        conversation_id=conv.conversation_id,
+        user_id=user.id,
+        db=db,
+    )
+    assert len(result2) == 0
     assert call_count[0] == 1  # LLM not called again
 
     db.close()

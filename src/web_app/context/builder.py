@@ -8,6 +8,7 @@ SECTIONS = [
     "User Profile",
     "Task",
     "State",
+    "Conversation Continuity",
     "Conversation History",
     "Relevant Memory",
     "Evidence",
@@ -31,6 +32,7 @@ SOURCE_MAP = {
     "information_gap": "Information Gap Signals",
     "tool_state": "Tool State",
     "output_contract": "Output Contract",
+    "conversation_segments": "Conversation Continuity",
     "conversation_summary": "Conversation Summary",
     "checkpoint_summary": "Checkpoint Summary",
     "feed_card": "Feed Card Context",
@@ -42,43 +44,50 @@ SOURCE_MAP = {
 # Higher → more likely to survive Select phase within token budget.
 _ROUTE_WEIGHTS: dict[str, dict[str, float]] = {
     "chat": {
-        "conversation_history": 0.95, "conversation_summary": 0.80,
+        "conversation_history": 0.95, "conversation_segments": 0.70,
+        "conversation_summary": 0.80,
         "memory": 0.75, "profile": 0.60, "task": 0.70,
         "feed_card": 0.50, "evidence": 0.35, "checkpoint_summary": 0.40,
         "dynamic_preferences": 0.65, "graph_context": 0.62,
     },
     "feed": {
         "memory": 0.85, "dynamic_preferences": 0.80,
-        "conversation_history": 0.75, "profile": 0.65,
+        "conversation_history": 0.75, "conversation_segments": 0.55,
+        "profile": 0.65,
         "conversation_summary": 0.30, "evidence": 0.45,
         "feed_card": 0.55, "task": 0.60, "graph_context": 0.55,
     },
     "research": {
         "feed_card": 0.85, "evidence": 0.80,
-        "conversation_history": 0.75, "checkpoint_summary": 0.70,
+        "conversation_history": 0.75, "conversation_segments": 0.55,
+        "checkpoint_summary": 0.70,
         "memory": 0.65, "dynamic_preferences": 0.60,
         "task": 0.75, "conversation_summary": 0.55,
         "profile": 0.50, "graph_context": 0.60,
     },
     "rag": {
         "evidence": 0.90, "task": 0.75,
-        "conversation_history": 0.70, "feed_card": 0.65,
+        "conversation_history": 0.70, "conversation_segments": 0.50,
+        "feed_card": 0.65,
         "memory": 0.55, "checkpoint_summary": 0.40, "graph_context": 0.50,
     },
     "skill": {
         "memory": 0.80, "conversation_history": 0.80,
+        "conversation_segments": 0.60,
         "dynamic_preferences": 0.75, "task": 0.70,
         "conversation_summary": 0.65, "feed_card": 0.55,
         "evidence": 0.40, "checkpoint_summary": 0.50, "graph_context": 0.70,
     },
     "artifact": {
         "dynamic_preferences": 0.85, "conversation_history": 0.80,
+        "conversation_segments": 0.55,
         "feed_card": 0.75, "task": 0.70, "memory": 0.65,
         "evidence": 0.60, "conversation_summary": 0.55,
         "checkpoint_summary": 0.50, "graph_context": 0.65,
     },
     "tool": {
         "task": 0.80, "conversation_history": 0.75,
+        "conversation_segments": 0.50,
         "evidence": 0.70, "checkpoint_summary": 0.65,
         "memory": 0.45, "feed_card": 0.40, "graph_context": 0.55,
     },
@@ -169,10 +178,20 @@ class ContextBuilder:
             section = SOURCE_MAP.get(packet.metadata.get("source"), "State")
             if section in grouped:
                 grouped[section].append(packet.content)
-        return "\n\n".join(
+        result = "\n\n".join(
             f"[{section}]\n" + "\n".join(items)
             for section, items in grouped.items() if items
         )
+        # Append consistency instruction when historical segments are present
+        if grouped.get("Conversation Continuity"):
+            result += (
+                "\n\n[Output Instructions]\n"
+                "回答时必须优先保持与 Conversation Continuity 和 Conversation History 的一致性。"
+                "如果历史段、历史摘要、最近消息之间存在冲突，以最近消息为准；"
+                "如果最近消息没有覆盖，则以历史段和 running summary 为准。"
+                "不要声称记得没有出现在上下文中的信息。"
+            )
+        return result
 
     def compress(self, context: str) -> str:
         max_chars = self.config.max_tokens * 4

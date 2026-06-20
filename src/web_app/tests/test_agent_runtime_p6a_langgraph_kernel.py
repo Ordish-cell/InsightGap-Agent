@@ -10,7 +10,7 @@ from src.web_app.agent.runtime.dispatch import (
     END_SENTINEL,
     after_permission,
     dispatch_next_route_node,
-    legacy_next_route_node,
+    next_route_node,
     map_route_to_node,
 )
 from src.web_app.agent.runtime.graph import AgentRuntime
@@ -121,10 +121,10 @@ def test_dispatch_equivalence_with_legacy_cases():
 
     runtime = _runtime()
     for _name, state, expected in cases:
-        legacy_state = dict(state)
+        routing_state = dict(state)
         dispatch_state = dict(state)
 
-        assert legacy_next_route_node(legacy_state) == expected
+        assert next_route_node(routing_state) == expected
         assert runtime._dispatch_next_route_node(dispatch_state) == expected
         assert dispatch_next_route_node(dict(state)) == expected
 

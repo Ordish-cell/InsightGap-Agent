@@ -410,3 +410,61 @@ class ResearchRun(Base, TimestampMixin):
     error: Mapped[str] = mapped_column(Text, default="", nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class AgentConversationSummary(Base, TimestampMixin):
+    """Running summary progressively updated after each assistant turn."""
+
+    __tablename__ = "agent_conversation_summaries"
+    __table_args__ = (
+        Index("ix_agent_conv_summaries_user_conv", "user_id", "conversation_id"),
+        Index("ix_agent_conv_summaries_updated_at", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), unique=True, index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    summary_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    facts_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    decisions_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    open_threads_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    preferences_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    entities_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    last_message_id: Mapped[int | None] = mapped_column(ForeignKey("agent_chat_messages.id"), nullable=True)
+    covered_message_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    summary_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+
+class AgentConversationSummarySegment(Base, TimestampMixin):
+    """Frozen historical segment of a conversation — compressed by LLM for later recall.
+
+    Created every N messages (conversation_summary_segment_size) and indexed
+    into Qdrant for semantic search across long conversations.
+    """
+
+    __tablename__ = "agent_conversation_summary_segments"
+    __table_args__ = (
+        Index("ix_agent_conv_segments_user_conv", "user_id", "conversation_id"),
+        Index(
+            "ix_agent_conv_segments_msg_range",
+            "conversation_id",
+            "start_message_id",
+            "end_message_id",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    start_message_id: Mapped[int | None] = mapped_column(ForeignKey("agent_chat_messages.id"), nullable=True)
+    end_message_id: Mapped[int | None] = mapped_column(ForeignKey("agent_chat_messages.id"), nullable=True)
+    # Track message timestamps for the time-range header (added via migration 20260619_0010)
+    start_message_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    end_message_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    message_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    summary_text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    keywords_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    facts_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    # Qdrant vector point id; empty string when Qdrant is unavailable
+    embedding_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)

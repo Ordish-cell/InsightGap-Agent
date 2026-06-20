@@ -500,9 +500,7 @@ class AgentNodesMixin:
 
         L3/L4 tools pause via LangGraph interrupt(). On resume the
         graph continues from the interrupt point — this method does
-        NOT re-enter from the top.  Legacy END-based resume detection
-        has been removed.
-        """
+        NOT re-enter from the top."""
         route_plan = state.get("route_plan") or {}
         user_text = state.get("user_input", "")
         print(f"[TOOL_AGENT_TRACE] enter user_text={user_text[:200]} intent={route_plan.get('intent')} route={route_plan.get('route')}")
@@ -780,7 +778,7 @@ class AgentNodesMixin:
         tool_call_id: Any,
     ) -> AgentRuntimeState:
         """Shared pause entry point — creates audit records, then
-        dispatches to END-based or interrupt-based pause."""
+        pauses via LangGraph interrupt()."""
         logger.info(
             "[APPROVAL_FLOW] tool_agent pause for approval "
             "tool=%s tool_call_id=%s approval_id=%s run_id=%s",

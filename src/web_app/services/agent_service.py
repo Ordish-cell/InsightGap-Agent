@@ -602,7 +602,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                 )
                 # Build a minimal state reflecting the pause so the
                 # downstream code (SSE, DB persist, resume routing)
-                # can process it identically to an END-based pause.
+                # can process it identically to an interrupt-based pause.
                 interrupt_approval_id = graph_interrupt_payload.get("approval_id")
                 interrupt_tool_name = graph_interrupt_payload.get("tool_name", "")
                 interrupt_tcid = graph_interrupt_payload.get("tool_call_id")
@@ -698,7 +698,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         _emit_runtime_latency_trace_event(db, stream_queue, run.id, thread_id, user_id, state)
 
         if is_waiting:
-            pause_mode = state.get("approval_pause_mode", "end")
+            pause_mode = state.get("approval_pause_mode", "interrupt")
             gs_size = len(json.dumps(_json_safe(state), ensure_ascii=False, default=str))
             logger.info(
                 "[APPROVAL_FLOW] agent_service saving pause state "
@@ -717,7 +717,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                 "route_plan_snapshot": state.get("route_plan_snapshot"),
                 "resume_token": state.get("resume_token"),
                 "original_status": "waiting_approval",
-                "approval_pause_mode": state.get("approval_pause_mode", "end"),
+                "approval_pause_mode": state.get("approval_pause_mode", "interrupt"),
             }
             final_payload["_resume"] = resume_data
             state["final_payload"] = final_payload
@@ -772,7 +772,7 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                     "status": "waiting_approval",
                     "approval_id": approval_id_val,
                     "run_id": run.id,
-                    "approval_pause_mode": state.get("approval_pause_mode", "end"),
+                    "approval_pause_mode": state.get("approval_pause_mode", "interrupt"),
                 }, run_id=run.id, thread_id=thread_id)
                 state["_approval_events_emitted"] = True
 
@@ -806,6 +806,12 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                 last_run_id=run.id,
                 selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
                 selected_feed_card_title=selected_feed_card_title or None,
+            )
+            _update_conversation_summary_after_turn(
+                db=db,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                run_id=run.id,
             )
             record_event(db, run.id, "run_failed", {"status": "failed", "answer": answer, "error": state.get("error", "")}, user_id=user_id, thread_id=thread_id)
             _queue_stream_event(stream_queue, "run_failed", {"status": "failed", "answer": answer, "error": state.get("error", "")}, run_id=run.id, thread_id=thread_id)
@@ -841,6 +847,12 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
                 last_run_id=run.id,
                 selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
                 selected_feed_card_title=selected_feed_card_title or None,
+            )
+            _update_conversation_summary_after_turn(
+                db=db,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                run_id=run.id,
             )
 
             already_streamed = state.get("_answer_delta_emitted", False)
@@ -946,7 +958,7 @@ async def resume_run_after_approval(
     1. Load the run and find its pending approval.
     2. If approved: execute the tool via tool_executor, emit tool events.
     3. If rejected: inject a rejected tool_result, skip execution.
-    4. Re-run the graph via AgentRuntime.resume_from_approval.
+    4. Resume the graph via AgentRuntime.resume_from_interrupt.
     5. Persist the final state and emit run_completed.
     """
     import logging
@@ -1233,40 +1245,24 @@ async def resume_run_after_approval(
         graph_state["resume_token"] = f"rejected:{pending_approval_id}"
         graph_state["_resume_context"] = f"rejected:{pending_approval_id}"
 
-    # ── Branch: interrupt vs END-based resume ────────────────────
-    pause_mode = graph_state.get("approval_pause_mode", "end")
+    # ── Resume via interrupt (always) ────────────────────
+    pause_mode = graph_state.get("approval_pause_mode", "interrupt")
     effective_tool_result = graph_state.get("tool_result") if approval_status != "approved" else (
         tool_result if tool_succeeded else {"success": False, "error": "tool_execution_failed"}
     )
 
-    if pause_mode == "interrupt":
-        state = await _resume_interrupt_approval(
-            db=db, user_id=user_id, run_id=run_id,
-            graph_state=graph_state,
-            approval_status=approval_status,
-            pending_approval_id=pending_approval_id,
-            pending_tool_call_id=pending_tool_call_id,
-            tool_result=effective_tool_result,
-            tool_succeeded=tool_succeeded,
-            user_input=user_input,
-            conversation_id=conversation_id,
-            stream_queue=stream_queue,
-        )
-    else:
-        state = await _resume_legacy_end_based_approval(
-            db=db, user_id=user_id, run_id=run_id,
-            graph_state=graph_state,
-            approval_status=approval_status,
-            pending_approval_id=pending_approval_id,
-            pending_tool_name=pending_tool_name,
-            pending_tool_call_id=pending_tool_call_id,
-            tool_result=effective_tool_result,
-            tool_succeeded=tool_succeeded,
-            user_input=user_input,
-            conversation_id=conversation_id,
-            thread_id=thread_id,
-            stream_queue=stream_queue,
-        )
+    state = await _resume_interrupt_approval(
+        db=db, user_id=user_id, run_id=run_id,
+        graph_state=graph_state,
+        approval_status=approval_status,
+        pending_approval_id=pending_approval_id,
+        pending_tool_call_id=pending_tool_call_id,
+        tool_result=effective_tool_result,
+        tool_succeeded=tool_succeeded,
+        user_input=user_input,
+        conversation_id=conversation_id,
+        stream_queue=stream_queue,
+    )
 
     return await _finalize_resume(
         db=db,
@@ -1286,126 +1282,6 @@ async def resume_run_after_approval(
     )
 
 
-# ── Resume handler: END-based (old) ──────────────────────────────────
-
-
-async def _resume_legacy_end_based_approval(
-    *,
-    db: Session,
-    user_id: int,
-    run_id: int,
-    graph_state: dict[str, Any],
-    approval_status: str,
-    pending_approval_id: Any,
-    pending_tool_name: str,
-    pending_tool_call_id: Any,
-    tool_result: dict[str, Any] | None,
-    tool_succeeded: bool,
-    user_input: str,
-    conversation_id: str,
-    thread_id: str,
-    stream_queue: Any,
-) -> dict[str, Any]:
-    """[DEPRECATED] Re-run entire graph from entry_point for END-based approval.
-
-    This path exists ONLY for old DB runs with approval_pause_mode="end".
-    All new runs use _resume_interrupt_approval (Command resume from checkpoint).
-
-    DELETION CRITERIA:
-        This function (and _legacy_resume_from_approval in graph.py) can be
-        removed once ALL of these conditions are met:
-        1. No agent_runs rows exist with approval_pause_mode="end" AND
-           status IN ("waiting_approval", "paused").
-        2. No agent_runs rows exist with status="waiting_approval" that
-           were created before Phase 8 was deployed (2026-06-18).
-        3. The config flag agent_approval_interrupt_enabled has been True
-           (default) for at least 30 days in production.
-
-        Run this SQL to check:
-            SELECT COUNT(*) FROM agent_runs
-            WHERE graph_state->>'approval_pause_mode' = 'end'
-              AND status IN ('waiting_approval', 'paused');
-
-        When that query returns 0, the legacy path is safe to delete.
-
-    Injects resolved_tool_call_ids / tool_result / _resume_context into
-    graph_state so tool_agent can detect the resume path on re-entry.
-    Relies on sanitize_resume_final_state to clean stale approval fields
-    that may survive the graph re-run.
-    """
-    import logging
-    _log = logging.getLogger(__name__)
-
-    _log.warning(
-        "[LEGACY_APPROVAL_RESUME] END-based resume used — "
-        "this run was paused with approval_pause_mode='end'. "
-        "All new runs use interrupt-based resume. "
-        "run_id=%s", run_id,
-    )
-    graph_state.pop("route", None)
-    graph_state.pop("error", None)
-    graph_state.pop("errors", None)
-    graph_state.pop("_stream_queue", None)
-    graph_state["user_id"] = user_id
-    graph_state["run_id"] = run_id
-    graph_state["thread_id"] = graph_state.get("thread_id") or f"run:{run_id}"
-    graph_state["conversation_id"] = conversation_id
-    graph_state["user_input"] = user_input
-    graph_state["_answer_started_emitted"] = False
-    graph_state["_answer_delta_emitted"] = False
-    graph_state["_answer_completed_emitted"] = False
-
-    enriched_payload = {"user_input": user_input, "source": "resume_after_approval"}
-    _log.info(
-        "[APPROVAL_FLOW] _resume_legacy_end_based_approval (LEGACY graph replay) invoking graph "
-        "run_id=%s _resume_context=%s resolved_ids=%s approval_status=%s",
-        run_id,
-        graph_state.get("_resume_context"),
-        graph_state.get("resolved_tool_call_ids"),
-        approval_status,
-    )
-    try:
-        state = await AgentRuntime(db, enriched_payload, stream_queue)._legacy_resume_from_approval(graph_state)
-        _log.debug(
-            "[APPROVAL_RESUME_DEBUG] after_runtime run_id=%s status=%s error=%s "
-            "approval_required=%s final_answer_preview=%s tool_call.error=%s",
-            run_id,
-            state.get("status"), state.get("error"), state.get("approval_required"),
-            (state.get("final_answer") or "")[:120],
-            (state.get("tool_call") or {}).get("error"),
-        )
-        tc3 = state.get("tool_call") or {}
-        _log.info(
-            "[approval_resume_debug] stage=after_runtime_resume run_id=%s "
-            "state.status=%s approval_required=%s route=%s "
-            "state.error=%s tool_call.error=%s "
-            "pending_approval_id=%s pending_tool_call_id=%s "
-            "resolved_tool_call_ids=%s _resume_context=%s final_answer_preview=%s",
-            run_id, state.get("status"), state.get("approval_required"),
-            state.get("route"), state.get("error"),
-            tc3.get("error") if isinstance(tc3, dict) else "N/A",
-            state.get("pending_approval_id"), state.get("pending_tool_call_id"),
-            state.get("resolved_tool_call_ids"), state.get("_resume_context"),
-            (state.get("final_answer") or "")[:120],
-        )
-    except Exception as exc:
-        _log.exception("resume: graph re-run failed run=%s", run_id)
-        state = {
-            "user_id": user_id, "run_id": run_id, "thread_id": thread_id,
-            "conversation_id": conversation_id, "user_input": user_input,
-            "status": "failed", "error": str(exc),
-            "final_output": f"恢复执行失败: {exc}",
-            "langgraphstatus": {"status": "failed", "summary": str(exc)},
-        }
-
-    # ── END-based needs aggressive stale-state cleanup ────────────
-    state = sanitize_resume_final_state(
-        state,
-        approval_id=pending_approval_id,
-        tool_name=pending_tool_name,
-        tool_result=state.get("tool_result"),
-        tool_error=state.get("_tool_error"),
-    )
     if state.get("error") == "approval_required" or state.get("status") == "waiting_approval" or state.get("approval_required"):
         _log.warning(
             "[approval_resume_debug] SAFETY_CLEANUP forcing cleanup of stale fields "
@@ -1514,12 +1390,10 @@ async def _finalize_resume(
     pending_tool_name: str,
     stream_queue: Any,
 ) -> dict[str, Any]:
-    """Shared final step for both resume paths.
+    """Shared final step for resume.
 
     Builds answer, persists run + message + conversation, streams
-    answer deltas and run_completed SSE.  Only applies stale-approval
-    guard for END-based runs (interrupt runs don't replay the graph so
-    they can't carry stale approval state).
+    answer deltas and run_completed SSE.
     """
     import logging
     _log = logging.getLogger(__name__)
@@ -1531,7 +1405,7 @@ async def _finalize_resume(
     elapsed_ms = max(0, int((datetime.now() - started_at).total_seconds() * 1000))
     answer = build_user_facing_answer(state)
 
-    # Stale-approval guard (primarily needed for END-based replay)
+    # Stale-approval guard
     if is_approval_placeholder(answer) or "Run failed: approval_required" in (answer or ""):
         _log.info(
             "[APPROVAL_FLOW] _finalize_resume regenerating stale answer "
@@ -1623,6 +1497,38 @@ async def _finalize_resume(
     conversation = conversation_repo.get_by_conversation_id(user_id, conversation_id) if conversation_id else None
     if conversation:
         conversation_repo.touch(conversation, preview=answer, last_run_id=run_id)
+    _update_conversation_summary_after_turn(
+        db=db,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        run_id=run_id,
+    )
+
+    # ── Trigger segment creation after messages are persisted ──────
+    # Deliberately created in a background thread WITHOUT the caller's db session:
+    # SQLAlchemy sessions are not thread-safe, so create_segment_if_needed opens
+    # its own session when db=None. Do NOT pass db here.
+    if conversation_id and run_id:
+        try:
+            from src.web_app.services.conversation_summary_service import conversation_summary_service
+
+            def _segment_job():
+                return conversation_summary_service.create_segment_if_needed(
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    db=None,
+                )
+
+            await asyncio.to_thread(_segment_job)
+        except Exception:
+            logger.exception(
+                "conversation_segment_creation_failed",
+                extra={
+                    "conversation_id": conversation_id,
+                    "run_id": run_id,
+                    "user_id": user_id,
+                },
+            )
 
     # Stream answer + run_completed
     already_streamed = state.get("_answer_delta_emitted", False)
@@ -2026,98 +1932,50 @@ def extract_user_visible_answer(value: Any) -> str:
     return str(value)
 
 
-def sanitize_resume_final_state(
-    state: dict[str, Any],
+
+def _update_conversation_summary_after_turn(
     *,
-    approval_id: Any = None,
-    tool_name: str = "",
-    tool_result: dict[str, Any] | None = None,
-    tool_error: str | None = None,
-) -> dict[str, Any]:
-    """Hard sanitizer — MUST be called after every resume (approve/reject).
+    db: Session,
+    user_id: int,
+    conversation_id: str,
+    run_id: int,
+) -> None:
+    if not conversation_id or not run_id:
+        return
+    try:
+        messages = [
+            message
+            for message in AgentChatMessageRepository(db).list_by_conversation(user_id, conversation_id)
+            if getattr(message, "run_id", None) == run_id
+            and getattr(message, "role", "") in {"user", "assistant"}
+            and str(getattr(message, "content", "") or "").strip()
+        ]
+        if not messages:
+            return
+        new_messages = [
+            {
+                "role": str(getattr(message, "role", "") or ""),
+                "content": str(getattr(message, "content", "") or ""),
+            }
+            for message in messages
+        ]
+        from src.web_app.services.conversation_summary_service import conversation_summary_service
 
-    Removes ALL stale approval_required artifacts regardless of where
-    they are hiding.  This is the final safety net.
-    """
-    logger.debug(
-        "[APPROVAL_RESUME_DEBUG] sanitize_resume_final_state approval_id=%s "
-        "tool_name=%s tool_success=%s tool_error=%s",
-        approval_id,
-        tool_name,
-        tool_result.get("success") if tool_result else "N/A",
-        tool_error,
-    )
-
-    state["approval_required"] = False
-    state["approval_payload"] = None
-    state["pending_approval_id"] = None
-    state["pending_tool_name"] = None
-    state["pending_tool_args"] = None
-    state["pending_tool_call_id"] = None
-
-    # Clear route if it was "approval"
-    route = state.get("route", "")
-    if route == "approval":
-        state["route"] = ""
-
-    # Clear error if it contains approval_required
-    err = state.get("error", "")
-    if err and "approval_required" in str(err).lower():
-        logger.debug("[APPROVAL_RESUME_DEBUG] sanitizer cleared state.error=%s", err)
-        state["error"] = ""
-        state.pop("error", None)
-
-    # Clear errors list
-    errors = state.get("errors", [])
-    if errors:
-        filtered = [e for e in errors if "approval_required" not in str(e).lower()]
-        if len(filtered) != len(errors):
-            logger.debug(
-                "[APPROVAL_RESUME_DEBUG] sanitizer filtered errors from %s to %s",
-                len(errors),
-                len(filtered),
-            )
-        state["errors"] = filtered or None
-
-    # Clear tool_call.error
-    tc = state.get("tool_call") or {}
-    if isinstance(tc, dict):
-        tc_err = tc.get("error", "")
-        if tc_err and "approval_required" in str(tc_err).lower():
-            logger.debug("[APPROVAL_RESUME_DEBUG] sanitizer cleared tool_call.error=%s", tc_err)
-            tc["error"] = ""
-            state["tool_call"] = tc
-
-    # Clear final_answer / final_output / answer / final_payload.answer
-    # if they contain approval_required
-    for key in ("final_answer", "final_output", "answer"):
-        val = state.get(key, "")
-        if isinstance(val, str) and ("Run failed: approval_required" in val or "Approval required:" in val):
-            logger.debug("[APPROVAL_RESUME_DEBUG] sanitizer cleared state.%s=%s", key, val[:120])
-            state[key] = ""
-    # Also clean final_payload.answer — this is the 2nd candidate in build_user_facing_answer
-    fp = state.get("final_payload") or {}
-    if isinstance(fp, dict):
-        fp_ans = fp.get("answer", "")
-        if isinstance(fp_ans, str) and ("Run failed: approval_required" in fp_ans or "Approval required:" in fp_ans):
-            logger.debug(
-                "[APPROVAL_RESUME_DEBUG] sanitizer cleared final_payload.answer=%s",
-                fp_ans[:120],
-            )
-            fp["answer"] = ""
-            state["final_payload"] = fp
-
-    # Set resume context
-    state["_resume_context"] = {
-        "approval_id": str(approval_id) if approval_id else "",
-        "approval_status": "approved",
-        "tool_name": tool_name,
-        "tool_status": "completed" if (tool_result or {}).get("success") is not False else "failed",
-    }
-    if tool_error:
-        state["_tool_error"] = tool_error
-
-    return state
+        conversation_summary_service.update_after_turn(
+            conversation_id,
+            user_id,
+            new_messages,
+            db=db,
+        )
+    except Exception:
+        logger.exception(
+            "conversation_summary_update_failed",
+            extra={
+                "conversation_id": conversation_id,
+                "run_id": run_id,
+                "user_id": user_id,
+            },
+        )
 
 
 def _inject_conversation_history_snapshot(
@@ -2135,10 +1993,13 @@ def _inject_conversation_history_snapshot(
     if context.get("conversation_history"):
         return
     try:
+        from src.web_app.core.config import settings as _settings
+
+        recent_limit = getattr(_settings, "conversation_recent_message_limit", 24)
         recent_messages = AgentChatMessageRepository(db).list_recent_by_conversation(
             user_id=user_id,
             conversation_id=conversation_id,
-            limit=12,
+            limit=recent_limit,
         )
     except Exception:
         return
@@ -2614,7 +2475,7 @@ def _build_approval_sse_payload(state: dict[str, Any], run_id: int) -> dict[str,
         "safety_notes": safety_notes,
         "status": "pending",
         "user_id": state.get("user_id"),
-        "approval_pause_mode": state.get("approval_pause_mode") or approval_payload.get("approval_pause_mode") or "end",
+        "approval_pause_mode": state.get("approval_pause_mode") or approval_payload.get("approval_pause_mode") or "interrupt",
     }
 
 

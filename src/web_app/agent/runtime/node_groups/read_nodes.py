@@ -137,11 +137,14 @@ class ReadNodesMixin:
         try:
             conversation_id = state.get("conversation_id")
             if conversation_id and state.get("user_id"):
+                from src.web_app.core.config import settings as _settings
+
+                recent_limit = getattr(_settings, "conversation_recent_message_limit", 24)
                 message_repo = AgentChatMessageRepository(self.db)
                 recent_messages = message_repo.list_recent_by_conversation(
                     user_id=state["user_id"],
                     conversation_id=conversation_id,
-                    limit=12,
+                    limit=recent_limit,
                 )
                 conversation_history_text = self._format_recent_chat_messages_for_context(recent_messages)
                 conversation_history_debug = {
@@ -270,6 +273,55 @@ class ReadNodesMixin:
             "qdrant_hits": memory_qdrant_hits,
         }
 
+        # ── Recall relevant historical segments ──────────────────────
+        recalled_segments: list[Any] = []
+        segment_recall_debug: dict[str, Any] = {
+            "enabled": False,
+            "queried": False,
+            "recalled": 0,
+            "source": "not_queried",
+        }
+        if not is_conversation_recall and conversation_id and user_input.strip():
+            from src.web_app.core.config import settings as _seg_settings
+            from src.web_app.services.conversation_summary_service import (
+                conversation_summary_service as _seg_service,
+            )
+            seg_enabled = getattr(_seg_settings, "enable_conversation_segment_recall", True)
+            segment_recall_debug["enabled"] = seg_enabled
+            if seg_enabled:
+                try:
+                    recalled = _seg_service.search_relevant_segments(
+                        conversation_id=conversation_id,
+                        query=user_input,
+                        user_id=state["user_id"],
+                        db=self.db,
+                    )
+                    recalled_segments = recalled
+                    segment_recall_debug.update({
+                        "queried": True,
+                        "recalled": len(recalled),
+                        "source": recalled[0].source if recalled else "no_results",
+                        "segment_ids": [r.id for r in recalled],
+                        "scores": [round(r.score, 3) for r in recalled],
+                    })
+                except Exception as exc:
+                    logger.warning(
+                        "context_builder.segment_recall_failed",
+                        extra={
+                            "conversation_id": conversation_id,
+                            "error": str(exc),
+                        },
+                    )
+                    segment_recall_debug.update({
+                        "queried": True,
+                        "error": str(exc)[:200],
+                    })
+
+        # ── Format recalled segments as ContextPacket-compatible text ──
+        conversation_segments_text = _format_recalled_segments_for_context(
+            recalled_segments,
+        )
+
         builder = ContextBuilder(route=route)
         context_text, gssc_debug = builder.build_with_debug({
             "task": user_input,
@@ -284,6 +336,7 @@ class ReadNodesMixin:
             "conversation_summary": "" if is_conversation_recall else conversation_summary,
             "checkpoint_summary": "" if is_conversation_recall else checkpoint_summary,
             "dynamic_preferences": "" if is_conversation_recall else dynamic_prefs.get("preference_summary", ""),
+            "conversation_segments": conversation_segments_text,
             "output_contract": "Return structured status, final_output, artifacts, memory_updates, skill_drafts, and evidence when available.",
         })
         # Merge with existing context (don't overwrite fields set by earlier nodes)
@@ -303,6 +356,8 @@ class ReadNodesMixin:
             "conversation_history": conversation_history_text,
             "conversation_summary": conversation_summary,
             "checkpoint_summary": checkpoint_summary,
+            "conversation_segments": recalled_segments,
+            "segment_recall_debug": segment_recall_debug,
             "profile": {"segment": profile.segment, "goals": profile.goals, "interests": profile.explicit_interests},
             "dynamic_preferences": dynamic_prefs.get("preference_summary", ""),
             "rag_evidence": rag_evidence,
@@ -321,6 +376,11 @@ class ReadNodesMixin:
                      "memory_qdrant_hits": memory_qdrant_hits,
                      "memory_context_loader_read_only": True,
                      "conversation_recall_memory_skipped": is_conversation_recall,
+                     "segment_recall_enabled": segment_recall_debug.get("enabled", False),
+                     "segment_recall_queried": segment_recall_debug.get("queried", False),
+                     "segment_recall_count": segment_recall_debug.get("recalled", 0),
+                     "segment_recall_source": segment_recall_debug.get("source", "not_queried"),
+                     "segment_recall_ids": segment_recall_debug.get("segment_ids", []),
                      **conversation_history_debug})
         append_pipeline_step(
             state,
@@ -633,4 +693,67 @@ class ReadNodesMixin:
         "don't forget", "do not forget",
     ]
 
+
+def _format_recalled_segments_for_context(segments: list[Any]) -> str:
+    """Format RecalledConversationSegment list into ContextBuilder-compatible text.
+
+    Enforces conversation_segment_max_tokens budget: truncates lowest-score segments
+    first, and truncates individual segment summaries if needed.
+    """
+    if not segments:
+        return ""
+
+    from src.web_app.core.config import settings as _cfg
+    max_tokens = getattr(_cfg, "conversation_segment_max_tokens", 1800)
+
+    # Sort by score descending (highest-score segments get priority)
+    sorted_segs = sorted(segments, key=lambda s: getattr(s, "score", 0), reverse=True)
+
+    lines: list[str] = ["[Relevant Historical Conversation Segments]"]
+    header_tokens = len(lines[0]) // 4  # header itself costs tokens
+    budget_remaining = max_tokens - header_tokens
+    seg_index = 0
+
+    for seg in sorted_segs:
+        if budget_remaining <= 0:
+            break
+
+        score = getattr(seg, "score", 0)
+        summary = str(getattr(seg, "summary_text", "") or "").strip()
+        source = getattr(seg, "source", "unknown")
+        msg_count = getattr(seg, "message_count", 0)
+        start_id = getattr(seg, "start_message_id", None)
+        end_id = getattr(seg, "end_message_id", None)
+
+        if not summary:
+            continue
+
+        seg_index += 1
+        header = (
+            f"## Segment {seg_index} | Score {score:.2f} | Source {source}"
+            f" | Messages {msg_count}"
+        )
+        if start_id is not None and end_id is not None:
+            header += f" | Range #{start_id}-#{end_id}"
+
+        header_cost = len(header) // 4 + 2  # +2 for newlines
+        available = budget_remaining - header_cost
+
+        if available <= 0:
+            break
+
+        # Truncate summary if it exceeds available budget
+        max_summary_chars = available * 4
+        if len(summary) > max_summary_chars:
+            cutoff = max(0, max_summary_chars - len("[segment truncated]"))
+            summary = summary[:cutoff] + "[segment truncated]"
+
+        lines.append(header)
+        lines.append(summary)
+        lines.append("")
+
+        block_cost = header_cost + len(summary) // 4 + 1
+        budget_remaining -= block_cost
+
+    return "\n".join(lines)
 

@@ -1,2661 +1,455 @@
-# Open Deep Research 简历真实性审计报告
+# Deep Research 信息差 Agent OS：面试深度讲解手册
 
-> 审计日期：2026-06-15  
-> 审计标准：只以当前代码、测试、历史评估产物为依据；不把“配置存在”“目录存在”“概念命名存在”等同于完整实现。
-
----
-
-## 0. 总体结论
-
-这个项目不是空壳。代码中确实存在一个围绕 **LangGraph StateGraph、多 Agent 节点、MCP 工具治理、Parent-Child RAG、Qdrant Hybrid Search、Memory/GSSC/Skill** 搭建的工程化 Agent 平台。
-
-但简历描述需要控制措辞：有些模块已经能大胆讲，有些只能讲“实现了工程闭环的一版”，不能讲成生产级、论文级或完整平台级能力。
-
-### 一句话判断
-
-| 方向 | 真实性判断 | 面试可讲强度 |
-|---|---|---|
-| LangGraph 节点化运行时 | 代码中明确实现 | 可以重点讲 |
-| planner/tool/rag/memory 节点 | 代码中明确实现 | 可以重点讲 |
-| 独立 router 节点 | 代码中没有发现 | 改说“条件路由/dispatcher” |
-| checkpoint 可恢复 | 代码中完整实现 | 可以重点讲，PostgresSaver 生产级 |
-| MCP 注册、风险分级、审批 | 代码中明确实现 | 可以重点讲 |
-| 完整 JSON Schema 校验 | 代码中部分实现 | 改说“required 字段和格式校验” |
-| L3/L4 阻断或审批 | 代码中明确实现 | 可以重点讲 |
-| Parent-Child Chunking | 代码中明确实现 | 可以重点讲 |
-| Qdrant Hybrid Search | 代码中明确实现 | 可以重点讲 |
-| Qdrant RRF | 代码中明确实现 | 可以重点讲，但限定在 native Qdrant hybrid |
-| hit@5 评估脚本 | 代码中明确实现 | 可以重点讲 |
-| hit@5 0.54 → 0.92 记录 | 代码中明确实现 | 可以讲，但要说明是 synthetic eval 的 backend 对比 |
-| 三层记忆 | 代码中明确实现 | 可以讲，但说明主实现在 service/repository 层 |
-| GSSC 动态上下文 | 代码中明确实现 | 可以讲成启发式上下文工程 |
-| Memory 抽取/去重/固化/筛选 | 代码中明确实现 | 可以重点讲 |
-| Skill 复用 | 代码中部分实现 | 改说“Skill 匹配、上下文注入、草稿生成与统计” |
+> 更新日期：2026-06-20  
+> 使用方式：这不是简历上的短项目描述，而是你面试前用来“把项目讲透”的底稿。面试时先用 60 秒版本开场，再按面试官追问进入 Runtime、MCP、RAG、Memory/GSSC 四个核心模块。  
+> 审计原则：以当前代码、测试、迁移和评估产物为准；能讲的讲透，不能夸的地方明确边界。
 
 ---
 
-## 1. 项目整体描述与工作流
+## 0. 先给你一个总判断
 
-这个项目可以理解为：**基于 Open Deep Research 二次开发的一套工程化 Agent OS 原型**。它不是单纯的聊天机器人，也不是单独的 RAG Demo，而是围绕“用户请求进入系统后，Agent 如何规划、检索、调用工具、写记忆、复用经验、生成最终回答”做了一套完整运行链路。
+这个项目最适合被讲成一个 **工程化 Agent OS 原型**，而不是“我做了一个 RAG 问答”。它有四个最能打的模块：
 
-如果用一句话概括：
+1. **Agent Runtime 编排**：用 LangGraph StateGraph 把一次用户请求拆成可观察、可恢复、可路由的多节点执行链路。
+2. **MCP 工具治理**：把工具注册、参数校验、风险分级、人工审批、审计记录和执行恢复串成闭环。
+3. **结构化 RAG 检索**：用 Parent-Child Chunking、Qdrant dense/sparse hybrid、RRF 和 parent context enrichment 解决检索精度与回答完整性的矛盾。
+4. **Memory / GSSC 上下文工程**：用三层 Memory、最近对话、running summary、conversation segment、GSSC 选择器和 Skill 复用雏形解决长上下文污染、token 膨胀和多轮连续性。
 
-> 这是一个以 LangGraph 为执行运行时、以 MCP 为工具治理层、以 Parent-Child + Qdrant Hybrid 为文档检索层、以 Memory/GSSC/Skill 为上下文与复用层的 Agent 平台工程。
+你面试时的核心表达应该是：
 
-它的核心目标不是让模型自由发挥，而是把 Agent 的行为拆成可控流程：
+> 我不是只调了一个 LLM 接口，而是把 Agent 平台里最容易出事故的四件事做成了工程闭环：执行流程可控、工具调用安全、文档检索可评估、上下文记忆可治理。Runtime 管流程，MCP 管工具，RAG 管知识，Memory/GSSC 管上下文；它们通过 AgentRun、AgentRuntimeState、ContextBuilder 和持久化表连接起来。
 
-1. 用户输入先进入后端服务，创建一次可追踪的 AgentRun。
-2. LangGraph Runtime 接管执行，把请求拆成多个节点。
-3. Planner 判断任务类型、风险等级和执行路线。
-4. Parallel Read / GSSC 准备结构化上下文。
-5. 根据 RoutePlan 分发到 RAG、Tool、Memory、Skill、Research、Artifact 等能力节点。
-6. MCP 对工具调用做注册、参数校验、风险分级、审批或阻断。
-7. RAG 对用户文档做 Parent-Child 检索和 Qdrant Hybrid 召回。
-8. Memory 抽取并沉淀用户偏好、任务事件和长期事实。
-9. Skill 识别可复用 workflow，生成草稿并在后续请求中匹配复用。
-10. Evaluator 做最终前一致性检查，Final Response 输出用户可读答案。
+---
 
-### 1.1 项目在做什么
+## 1. 项目一句话与简历写法
 
-这个项目的产品形态可以想象成一个“信息差 Agent 工作台”。用户在前端可以和 Agent 对话，也可以上传文档、围绕 FeedCard 发起研究、让 Agent 生成报告、调用工具、沉淀记忆和复用流程。
+### 1.1 一句话版本
 
-后端不是简单把用户输入转发给 LLM，而是维护一套 Agent Runtime：
+> 基于 LangGraph + FastAPI 构建 Deep Research Agent OS 原型，支持任务规划、RAG 问答、MCP 工具治理、人类审批、Checkpoint 恢复、长期记忆与 Skill 复用；围绕 Agent 执行可控性、工具安全、长上下文管理和文档检索效果做工程化闭环。
 
-| 层级 | 作用 | 项目中的实现 |
-|---|---|---|
-| API / Service 层 | 接收用户请求、创建运行记录、流式返回结果 | `AgentService`、FastAPI routes |
-| Runtime 层 | 编排 Agent 执行流程 | LangGraph `StateGraph` |
-| Planner 层 | 判断意图、风险、路线 | `planner.py`、`RoutePlan` |
-| Context 层 | 汇总 Memory、RAG、History、Feed 等上下文 | `ContextBuilder` / GSSC |
-| RAG 层 | 文档解析、切分、检索、证据返回 | Parent-Child + Qdrant Hybrid |
-| Tool 层 | 工具注册、调用、审批、审计 | MCP Registry / ToolExecutor |
-| Memory 层 | 记忆抽取、去重、固化、召回 | `MemoryService` |
-| Skill 层 | 工作流复用、草稿生成、匹配注入 | `SkillService` |
-| Eval / Final 层 | 结果检查、最终回复 | `evaluator` / `final_response` |
-
-也就是说，这个项目最重要的价值不是“某一个模型回答得好”，而是它把 Agent 平台常见的工程问题串成了闭环：
+### 1.2 简历项目描述建议
 
 ```text
-执行流程可控
-工具调用安全
-文档检索可评估
-上下文注入可治理
-用户记忆可沉淀
-重复 workflow 可复用
-最终回复可约束
+Deep Research 信息差 Agent 平台
+
+基于 LangGraph + FastAPI 构建 Deep Research Agent OS 原型，支持任务规划、RAG 问答、
+MCP 工具治理、人类审批、Checkpoint 恢复、长期记忆与 Skill 复用；围绕 Agent 执行
+可控性、工具安全、长上下文管理和文档检索效果做工程化闭环。
+
+- Agent Runtime 编排：基于 LangGraph StateGraph 构建可恢复 Agent Runtime，由 LLM Supervisor
+  接管 route_plan，实现多 Agent 动态路由、审批安全、checkpoint 恢复与链路可观测。
+- MCP 工具治理：抽象工具注册、参数校验、风险分级、人工审批与审计记录流程，对 L3/L4
+  高风险工具调用进行阻断或审批，降低 Agent 外部操作风险。
+- 结构化 RAG 检索：采用 Parent-Child Chunking + Qdrant Hybrid Search + RRF 融合排序，
+  child 负责精准召回、parent 回填回答上下文；在自建 RAG eval 中将 hit@5 从 0.54 提升至 0.92。
+- Memory 上下文工程：构建三层记忆 + GSSC 动态上下文选择，接入 conversation running summary
+  + 可检索历史段，缓解百轮对话中早期事实丢失、上下文污染和 token 浪费问题。
 ```
 
-### 1.2 一次普通请求的整体工作流
+### 1.3 面试开场 60 秒版
 
-下面是一条最典型的用户请求链路。你可以把它当成面试时讲项目的主线。
+> 这个项目是一个 Deep Research Agent OS 原型。用户进来后，服务层会创建 conversation、AgentRun 和 chat message，然后交给 LangGraph Runtime 执行。Runtime 不是一个大 if/else，而是把任务拆成 permission、intent、planner、parallel read、context builder、LLM supervisor、RAG、tool、memory、skill、evaluator 和 final response。  
+> 工具侧，我做了 MCP 治理：工具统一注册成 spec，执行前做参数校验和 L0-L4 风险分级，L3 进入人工审批，L4 直接阻断；审批用 LangGraph interrupt 暂停，用 PostgresSaver checkpoint 保存状态，再用 Command(resume) 恢复。  
+> 知识侧，我做了 Parent-Child + Qdrant Hybrid RAG。child chunk 负责精准命中，parent chunk 负责补回答上下文；dense 负责语义，sparse/RRF 负责关键词和编号类精确匹配。  
+> 上下文侧，我做了 Memory/GSSC：working、episodic、semantic 三层记忆，结合最近对话、running summary、可检索 historical segment、RAG evidence 和 FeedCard，根据 route 和 answer_mode 选择注入，避免 token 爆炸和上下文污染。
+
+---
+
+## 2. 全项目端到端工作流
+
+这一节是最重要的“总图”。你要先让面试官知道这个项目不是几个功能散点，而是一条完整链路。
+
+### 2.1 总体架构图
 
 ```mermaid
 flowchart TD
-    A["用户输入"] --> B["AgentService 创建 AgentRun"]
-    B --> C["构造初始 AgentRuntimeState"]
-    C --> D["LangGraph StateGraph 启动"]
-    D --> E["permission_guard"]
-    E --> F["home_intent_react"]
-    F --> G["planner 生成 RoutePlan"]
-    G --> H["parallel_prefetch 并行预取"]
-    H --> I["parallel_read_stage / GSSC 构建上下文"]
-    I --> J["supervisor_observer"]
-    J --> J2["llm_supervisor_route<br/>(LLM接管路由,可改写route_plan)"]
-    J2 --> K{"dispatch_next_route_node"}
+    U["用户输入 / 上传文件 / 选择 FeedCard"] --> API["FastAPI API 层"]
+    API --> AS["AgentService"]
+    AS --> DB1["PostgreSQL<br/>Conversation / Run / Message"]
+    AS --> RT["AgentRuntime"]
 
-    K --> L["rag_agent"]
-    K --> M["tool_agent"]
-    K --> N["memory_agent"]
-    K --> O["skill_agent"]
-    K --> P["research_agent / artifact_agent"]
+    RT --> LG["LangGraph StateGraph"]
+    LG --> P0["permission_guard"]
+    P0 --> I0["home_intent_react"]
+    I0 --> PL["planner<br/>生成 RoutePlan"]
+    PL --> PR["parallel_prefetch"]
+    PR --> RS["parallel_read_stage"]
+    RS --> CB["context_builder / GSSC"]
+    RS --> SKM["skill_matcher"]
+    CB --> SUP["supervisor_observer"]
+    SUP --> LSUP["llm_supervisor_route"]
+    LSUP --> DSP{"dispatch_next_route_node"}
 
-    L --> Q["evaluator"]
-    M --> Q
-    N --> Q
-    O --> Q
-    P --> Q
-    Q --> R["final_response"]
-    R --> S["流式/最终返回给用户"]
+    DSP --> RAG["rag_agent"]
+    DSP --> TOOL["tool_agent"]
+    DSP --> MEM["memory_agent"]
+    DSP --> SK["skill_agent"]
+    DSP --> RES["research_agent"]
+    DSP --> ART["artifact_agent"]
+
+    RAG --> EVAL["evaluator"]
+    TOOL --> EVAL
+    MEM --> EVAL
+    SK --> EVAL
+    RES --> EVAL
+    ART --> EVAL
+    EVAL --> FINAL["final_response"]
+    FINAL --> AS
+    AS --> OUT["SSE 流式事件 + 最终回答"]
+
+    CB --> MEMDB["Memory / Conversation Summary / Segments"]
+    RAG --> QD["Qdrant 文档向量库"]
+    TOOL --> MCP["MCP Tool Registry / Executor"]
+    MCP --> APPROVAL["Approval / ToolCall 审计表"]
 ```
 
-这条链路可以拆成八个阶段。
-
-#### 阶段一：用户请求进入服务层
-
-用户在前端输入问题，比如：
-
-```text
-帮我总结一下当前上传的文档
-```
-
-或者：
-
-```text
-帮我把这段内容写入本地文件
-```
-
-请求进入后端 `AgentService`。服务层会做几件事：
-
-1. 确定 `user_id`。
-2. 创建或复用 `conversation_id`。
-3. 创建本次执行的 `AgentRun`。
-4. 生成或读取 `thread_id`。
-5. 把 `user_input`、`page_context`、`conversation_id` 等放进初始 state。
-
-这一步的意义是：**每一次 Agent 执行都有数据库身份**。后续的节点事件、工具调用、审批记录、最终答案都能挂到同一个 run 上。
-
-#### 阶段二：LangGraph Runtime 接管执行
-
-服务层不会自己写一堆 if/else 把任务跑完，而是调用 `AgentRuntime.run()`。Runtime 内部使用 LangGraph `StateGraph`，共享状态是 `AgentRuntimeState`。
-
-初始 state 大概是：
-
-```python
-{
-    "user_id": 1,
-    "run_id": 123,
-    "thread_id": "user:1:conversation:abc",
-    "conversation_id": "abc",
-    "user_input": "帮我总结一下当前上传的文档",
-    "page_context": {...},
-    "mode": "react"
-}
-```
-
-LangGraph 的作用是把这份 state 依次传给不同节点，每个节点读取一部分、写回一部分。
-
-#### 阶段三：权限检查、意图识别和规划
-
-前几个节点属于 setup 阶段：
-
-```text
-permission_guard
-  -> home_intent_react
-  -> planner
-```
-
-`permission_guard` 是入口安全检查。  
-`home_intent_react` 判断用户大概想做什么。  
-`planner` 生成结构化 `RoutePlan`。
-
-例如文档问答可能生成：
-
-```python
-{
-    "intent": "document_qa",
-    "route": ["rag_agent", "evaluator", "final_response"],
-    "risk_level": "L1",
-    "needs_approval": False,
-    "answer_mode": "rag_qa"
-}
-```
-
-如果是工具写文件，可能生成：
-
-```python
-{
-    "intent": "tool.local_file_write",
-    "route": ["tool_agent", "evaluator", "final_response"],
-    "risk_level": "L3",
-    "needs_approval": True,
-    "answer_mode": "tool_action"
-}
-```
-
-这里的重点是：**Planner 只负责规划，不直接执行工具、不直接检索、不直接写记忆。**
-
-#### 阶段四：并行预取和 GSSC 上下文构建
-
-Planner 之后进入 read 阶段：
-
-```text
-parallel_prefetch
-  -> parallel_read_stage
-```
-
-这一阶段会提前准备后面可能需要的上下文，包括：
-
-| 上下文来源 | 说明 |
-|---|---|
-| 当前任务 | 用户本轮输入 |
-| Conversation History | 最近对话 |
-| Memory | 用户偏好、历史任务、长期事实 |
-| RAG Evidence | 当前文档相关证据 |
-| FeedCard Context | 用户当前选中的信息卡片 |
-| Page Context | 前端页面状态 |
-| Dynamic Preferences | 动态偏好 |
-| Graph Context | 图谱或关联上下文 |
-| Output Contract | 最终输出要求 |
-
-这些上下文不是无脑拼进 prompt，而是进入 GSSC：
-
-```text
-Gather -> Select -> Structure -> Compress
-```
-
-GSSC 会根据 route 和 answer_mode 决定什么重要。例如：
-
-| 场景 | 优先上下文 |
-|---|---|
-| 文档问答 | RAG Evidence、Task、Conversation History |
-| 普通聊天 | Conversation History、Memory、Profile |
-| 工具动作 | Task、Tool State、Boundary Memory |
-| 项目建议 | Project Goal、Tech Stack、Workflow Pattern |
-| Skill 复用 | Matched Skill、Memory、Output Contract |
-
-最后它会生成 `state["context"]["gssc_context"]`，给后续 agent 和 final_response 使用。
-
-#### 阶段五：LLM Supervisor + Dispatcher 选择具体 Agent 节点
-
-上下文准备好以后，`supervisor_observer` 会观察当前 state。然后 `llm_supervisor_route` 节点（当 `agent_llm_supervisor_enabled=true` 且 `mode=full` 时）会调用 LLM 分析当前 state，生成路由决策并**替换** `route_plan`。之后 `dispatch_next_route_node` 根据（可能已被 LLM 改写后的）`RoutePlan` 和 `completed_nodes` 选择下一个节点。
-
-这里要注意：项目里没有一个独立命名为 `router` 的 StateGraph 节点。真实实现是：
-
-```text
-planner 负责生成初始路线
-supervisor_observer 负责观察状态
-llm_supervisor_route 负责 LLM 接管路由（可选，full 模式下可改写 route_plan）
-dispatch_next_route_node 负责条件跳转
-```
-
-LLM supervisor 的三种模式：
-- `off`: 完全跳过
-- `shadow`: LLM 做决策并记录 trace，但不改变 route_plan（纯观测）
-- `full`: LLM 的决策真正替换 route_plan，控制后续 dispatch
-
-例如：
-
-```text
-route = ["rag_agent", "evaluator", "final_response"]
-completed_nodes = ["permission_guard", "planner", "parallel_read_stage"]
-next = "rag_agent"
-```
-
-如果遇到工具审批：
-
-```text
-tool_agent 内调用 LangGraph interrupt() 暂停
--> checkpoint 写入 PostgresSaver（AsyncPostgresSaver，四表持久化）
--> GraphInterrupt 被 agent_service 捕获
--> SSE: approval_required + run_paused
--> 用户批准后：agent_service 先执行工具（execute_approved_tool），再 Command(resume=...) 从 checkpoint 恢复
--> 用户拒绝：Command(resume={"action":"rejected"})，不执行工具
-```
-
-这保证了危险工具在审批前不会继续执行，且 checkpoint 可跨进程恢复。
-
-#### 阶段六：能力节点执行
-
-根据 RoutePlan，系统会进入不同 agent 节点。
-
-##### RAG Agent
-
-如果用户问当前文档：
-
-```text
-rag_agent
-  -> ParentChildRetriever
-  -> Qdrant Hybrid Search
-  -> Parent Context Enrichment
-  -> 返回 evidence 和初步答案
-```
-
-RAG 的底层链路是：
-
-1. 文档摄入时做 Parent-Child Chunking。
-2. 只有 child chunk 写入 Qdrant。
-3. 查询时 dense + sparse hybrid 检索。
-4. Qdrant native hybrid 使用 Fusion.RRF。
-5. 命中 child 后根据 parent_id 回查 parent context。
-
-##### Tool Agent
-
-如果用户要求工具动作：
-
-```text
-tool_agent
-  -> 选择工具
-  -> validate_tool_input
-  -> MCPService.call_tool
-  -> ToolExecutor
-  -> PermissionGuard
-```
-
-如果是 L0-L2 工具，可能自动执行。  
-如果是 L3 工具，创建 Approval，进入 `waiting_approval`。  
-如果是 L4 工具，直接 blocked。
-
-##### Memory Agent
-
-如果需要写记忆：
-
-```text
-memory_agent
-  -> LLM/regex extractor
-  -> confidence / importance filter
-  -> add_with_dedup
-  -> consolidate_memory
-  -> PG + Qdrant Memory
-```
-
-它会把记忆分为 working、episodic、semantic。
-
-##### Skill Agent
-
-如果一次任务具有复用价值：
-
-```text
-skill_agent
-  -> evaluate_reusability
-  -> create_skill_draft_from_run
-  -> 后续请求中 match_skill
-  -> 命中后注入 GSSC
-```
-
-当前 Skill 是“复用雏形”，主要实现草稿生成、匹配和上下文注入，还不是完整自动执行引擎。
-
-#### 阶段七：Evaluator 做最终前检查
-
-所有能力节点执行后，会进入 `evaluator`。它的作用是检查最终回答不能乱说。
-
-典型约束包括：
-
-| 场景 | evaluator 约束 |
-|---|---|
-| RAG 没有 evidence | 不能声称“根据文档” |
-| 工具等待审批 | 不能说“已经执行” |
-| 工具失败 | 必须告诉用户失败 |
-| Memory 写入失败 | 不能说“已记住” |
-| 输出包含内部 JSON | final_response 要清理 |
-
-Evaluator 的价值是让 Agent 的最终回答和真实执行状态一致。
-
-#### 阶段八：Final Response 生成最终回答
-
-`final_response` 会基于：
-
-1. `gssc_context`
-2. 各 agent result
-3. evaluator constraints
-4. errors/warnings
-5. output rules
-
-生成用户最终看到的自然语言回答。
-
-它不是简单把内部 JSON 贴给用户，而是把 Agent 的执行结果转成产品化回答，并避免泄露内部字段，例如 `status`、`node_results`、`evidence item`、`chunk` 等。
-
-### 1.3 四个核心模块如何协同
-
-整个项目可以抽象成四个核心模块，每个模块解决 Agent 平台的一类关键问题。
+### 2.2 请求从进入到返回的 12 步
+
+| 步骤 | 发生什么 | 关键产物 |
+|---|---|---|
+| 1 | 前端发起用户请求 | `user_input`、`page_context`、附件信息 |
+| 2 | `AgentService` 创建或复用 conversation | `conversation_id` |
+| 3 | 创建本次运行记录 | `AgentRun`、`run_id` |
+| 4 | 写入用户消息和 assistant thinking 消息 | `AgentChatMessage` |
+| 5 | 构造初始 `AgentRuntimeState` | `user_id`、`run_id`、`thread_id`、`conversation_id` |
+| 6 | LangGraph 从 `permission_guard` 进入 | 风险、权限初筛 |
+| 7 | planner 生成 `RoutePlan` | intent、route、risk_level、answer_mode |
+| 8 | parallel read 阶段加载上下文 | memory、history、RAG evidence、feed、segments |
+| 9 | GSSC 选择并组织上下文 | `gssc_context`、`gssc_debug` |
+| 10 | dispatcher 路由到能力节点 | rag/tool/memory/skill/research/artifact |
+| 11 | evaluator 检查结果，final_response 生成回答 | `final_payload` |
+| 12 | 服务层持久化结果并流式返回 | `answer_delta`、`run_completed` |
+
+### 2.3 AgentRuntimeState 是模块交互的“总线”
+
+项目里各模块不是互相乱调，而是通过 state 传递信息。可以这样理解：
 
 ```mermaid
 flowchart LR
-    A["LangGraph Runtime<br/>管执行流程"] --> B["MCP Governance<br/>管工具安全"]
-    A --> C["RAG Retrieval<br/>管知识检索"]
-    A --> D["Memory / GSSC / Skill<br/>管上下文与复用"]
-    B --> E["Evaluator / Final Response"]
-    C --> E
-    D --> E
+    A["planner"] -->|写入 route_plan| S["AgentRuntimeState"]
+    B["context_builder"] -->|写入 context.gssc_context| S
+    C["rag_agent"] -->|写入 rag_result / evidence| S
+    D["tool_agent"] -->|写入 tool_call / approval_payload| S
+    E["memory_agent"] -->|写入 memory_updates| S
+    F["skill_agent"] -->|写入 skill_drafts| S
+    S --> G["evaluator"]
+    G --> H["final_response"]
 ```
 
-#### LangGraph Runtime：管执行流程
+面试解释：
 
-Runtime 决定一次请求怎么跑：
+> 我把 AgentRuntimeState 当成所有节点共享的执行上下文。planner 不直接执行工具，它只写 route_plan；context_builder 不负责回答，它只写 gssc_context；rag_agent 不改 route，它只写 evidence 和 rag_result；tool_agent 只处理工具调用和审批状态。这样每个节点职责单一，运行轨迹也能通过 AgentStep、AgentEvent、LLMCall、ToolCall 追踪。
 
-```text
-入口 -> 规划 -> 上下文 -> 分发 -> 节点执行 -> 评估 -> 最终回答
-```
+---
 
-它解决的是：
+## 3. 四个核心模块总览
 
-| 问题 | Runtime 的处理 |
-|---|---|
-| 流程不可控 | StateGraph 节点化 |
-| 状态难传递 | AgentRuntimeState |
-| 动态路由 | RoutePlan + Dispatcher |
-| 审批中断 | waiting_approval -> END |
-| 过程不可观测 | AgentEvent / node_results / completed_nodes |
-
-#### MCP Governance：管工具安全
-
-Tool Agent 不直接执行函数，而是走 MCP 治理层：
-
-```text
-工具选择 -> 参数校验 -> 风险分级 -> 审批/阻断/执行 -> 审计
-```
-
-它解决的是：
-
-| 问题 | MCP 的处理 |
-|---|---|
-| 模型误调用工具 | registry + tool selection |
-| 参数缺失 | validate_tool_input |
-| 外部写入风险 | L3 approval |
-| 高危操作 | L4 blocked |
-| 无法追踪 | ToolCall / Approval / AgentEvent |
-
-#### RAG Retrieval：管知识检索
-
-RAG 不是简单向量搜索，而是完整文档检索链：
-
-```text
-parse -> Parent-Child Chunking -> child-only vector -> Qdrant Hybrid -> RRF -> parent enrichment -> evidence
-```
-
-它解决的是：
-
-| 问题 | RAG 的处理 |
-|---|---|
-| chunk 太大召回不准 | child chunk 检索 |
-| chunk 太小上下文不足 | parent context enrichment |
-| 纯 dense 对编号不稳 | dense + sparse hybrid |
-| 融合分数不可比 | Qdrant Fusion.RRF |
-| 优化没证据 | hit@5 eval runner |
-
-#### Memory / GSSC / Skill：管上下文与复用
-
-这层负责让 Agent “记得合适的东西，并复用成功经验”：
-
-```text
-Memory 抽取/去重/固化
-GSSC 动态上下文选择
-Skill workflow 草稿/匹配/注入
-```
-
-它解决的是：
-
-| 问题 | 处理方式 |
-|---|---|
-| 用户偏好丢失 | semantic memory |
-| 历史任务不可用 | episodic memory |
-| 当前上下文不稳定 | working memory |
-| 上下文污染 | MEMORY_CONTEXT_POLICY |
-| token 爆炸 | GSSC Select/Compress |
-| 重复 workflow 每次重做 | Skill draft/match |
-
-### 1.4 三条典型业务工作流
-
-为了更容易理解，可以把项目拆成三条典型业务流。
-
-#### 业务流一：用户问文档问题
-
-用户输入：
-
-```text
-这份合同的编号是多少？
-```
-
-工作流：
+### 3.1 四模块职责边界
 
 ```mermaid
 flowchart TD
-    A["用户问文档问题"] --> B["planner: intent=document_qa"]
-    B --> C["RoutePlan: rag_agent -> evaluator -> final_response"]
-    C --> D["GSSC 准备 task/history/document context"]
-    D --> E["rag_agent"]
-    E --> F["Qdrant Hybrid dense+sparse"]
-    F --> G["Fusion.RRF 返回 child hits"]
-    G --> H["根据 parent_id 回查 parent_context"]
-    H --> I["evaluator 检查 evidence"]
-    I --> J["final_response 基于证据回答"]
+    Runtime["模块一：Agent Runtime<br/>管执行流程"]
+    MCP["模块二：MCP 工具治理<br/>管工具安全"]
+    RAG["模块三：结构化 RAG<br/>管外部知识"]
+    Memory["模块四：Memory/GSSC<br/>管上下文和长期状态"]
+
+    Runtime --> MCP
+    Runtime --> RAG
+    Runtime --> Memory
+    MCP --> Runtime
+    RAG --> Memory
+    Memory --> Runtime
 ```
 
-这条链路体现的是 RAG 能力。
-
-#### 业务流二：用户要求执行工具
-
-用户输入：
-
-```text
-帮我把这段总结写入本地文件
-```
-
-工作流：
-
-```mermaid
-flowchart TD
-    A["用户要求写文件"] --> B["planner: tool intent, risk=L3"]
-    B --> C["tool_agent 选择 local_file.write"]
-    C --> D["validate_tool_input"]
-    D --> E["MCP ToolExecutor"]
-    E --> F["PermissionGuard 判断 L3"]
-    F --> G["创建 ToolCall + Approval"]
-    G --> H["tool_agent 调用 LangGraph interrupt()"]
-    H --> I["checkpoint 写入 PostgresSaver (4 表)"]
-    I --> J["GraphInterrupt，agent_service 捕获"]
-    J --> K["SSE: approval_required + run_paused"]
-    K --> L["用户批准"]
-    L --> M["agent_service: execute_approved_tool (图外)"]
-    M --> N["Command(resume=...) 从 checkpoint 恢复"]
-    N --> O["graph 从 interrupt() 点继续"]
-    O --> P["final_response 告知执行结果"]
-```
-
-这条链路体现的是 MCP 安全治理和人类在环。
-
-#### 业务流三：用户表达长期偏好并后续复用
-
-用户输入：
-
-```text
-以后回答我尽量用中文，结构清晰一点
-```
-
-工作流：
-
-```mermaid
-flowchart TD
-    A["用户表达偏好"] --> B["planner: memory intent"]
-    B --> C["memory_agent"]
-    C --> D["LLM/regex extractor"]
-    D --> E["semantic memory candidate"]
-    E --> F["importance/confidence filter"]
-    F --> G["add_with_dedup"]
-    G --> H["PostgreSQL + Qdrant Memory"]
-    H --> I["后续请求"]
-    I --> J["memory search + baseline memories"]
-    J --> K["GSSC 根据 answer_mode 注入"]
-    K --> L["final_response 按用户偏好回答"]
-```
-
-如果某次任务有复用价值，还会进入 Skill：
-
-```text
-successful run -> skill_agent -> reusable_score -> Skill draft -> 后续 match -> 注入 GSSC
-```
-
-这条链路体现的是 Memory/GSSC/Skill。
-
-### 1.5 你在面试中应该如何整体介绍这个项目
-
-下面这段可以直接作为项目总介绍：
-
-> 我这个项目是基于 Open Deep Research 做的二次开发，目标是把它从一个研究型应用扩展成更工程化的 Agent OS 原型。  
-> 
-> 整体上我做了四层：第一层是 LangGraph Runtime，把一次用户请求拆成权限检查、意图识别、规划、上下文读取、RAG、工具、Memory、Skill、评估和最终回复等节点；第二层是 MCP 工具治理，把工具统一注册成 spec，执行前做参数校验、L0-L4 风险分级，L3 进入人工审批，L4 直接阻断，并记录 ToolCall 和 Approval；第三层是 RAG 检索，把文档做 Parent-Child Chunking，只让 child chunk 入 Qdrant，并用 dense+sparse hybrid 和 RRF 融合召回；第四层是 Memory/GSSC/Skill，上层负责记忆抽取、去重、固化、动态上下文选择和可复用 workflow 草稿。  
-> 
-> 一次请求进来后，后端先创建 AgentRun，然后 LangGraph 根据 Planner 的 RoutePlan 决定走 RAG、Tool、Memory 还是 Skill。执行过程中所有节点都通过 AgentRuntimeState 共享状态，工具动作由 MCP 层控制风险，文档问题由 RAG 层返回证据，用户偏好由 Memory 层沉淀，最终由 evaluator 检查一致性，再由 final_response 生成用户可读回答。
-
-这段介绍的好处是：它不是堆技术名词，而是把项目的“输入、执行、能力、约束、输出”讲成了一条完整链路。
-
----
-
-## 2. 系统真实结构
-
-```mermaid
-flowchart LR
-    User["用户请求"] --> API["Agent Service / API"]
-    API --> Graph["LangGraph StateGraph"]
-
-    Graph --> Guard["permission_guard"]
-    Guard --> Intent["home_intent_react"]
-    Intent --> Planner["planner"]
-    Planner --> Prefetch["parallel_prefetch"]
-    Prefetch --> Read["parallel_read_stage"]
-    Read --> SupObs["supervisor_observer"]
-    SupObs --> LLMSup["llm_supervisor_route<br/>(LLM路由接管)"]
-
-    LLMSup --> Research["research_agent"]
-    LLMSup --> RAG["rag_agent"]
-    LLMSup --> Tool["tool_agent"]
-    LLMSup --> Memory["memory_agent"]
-    LLMSup --> Skill["skill_agent"]
-    LLMSup --> Artifact["artifact_agent"]
-
-    Tool --> MCP["MCP Service / ToolExecutor"]
-    MCP --> Registry["Tool Registry"]
-    MCP --> Risk["PermissionGuard L0-L4"]
-    MCP --> Approval["Approval Queue"]
-
-    RAG --> Chunking["Parent-Child Chunking"]
-    RAG --> Qdrant["Qdrant Dense + Sparse"]
-    Qdrant --> RRF["Qdrant Fusion.RRF"]
-
-    Memory --> MemSvc["MemoryService"]
-    MemSvc --> PG["PostgreSQL Memory"]
-    MemSvc --> MQ["Qdrant Memory"]
-    MemSvc --> GSSC["GSSC Context"]
-
-    Skill --> SkillSvc["SkillService"]
-    SkillSvc --> GSSC
-
-    Research --> Eval["evaluator"]
-    RAG --> Eval
-    Tool --> Eval
-    Memory --> Eval
-    Skill --> Eval
-    Eval --> Final["final_response"]
-```
-
----
-
-## 3. 简历亮点逐项审计
-
-### 3.1 LangGraph StateGraph 是否真的节点化编排 planner/router/tool/rag/memory
-
-**结论：代码中部分实现。**
-
-节点化编排本身是真实的，但如果简历写成”planner/router/tool/rag/memory 全部作为独立 LangGraph 节点”，需要修正。代码里有 `planner`、`tool_agent`、`rag_agent`、`memory_agent`、`llm_supervisor_route` 等节点；但是没有发现一个独立名为 `router` 的 StateGraph 节点，路由由 `planner + supervisor_observer + llm_supervisor_route + dispatch_next_route_node` 完成。
-
-关键证据：
-
-| 证据 | 说明 |
-|---|---|
-| `src/web_app/agent/runtime/graph_builder.py` | 使用 `StateGraph(AgentRuntimeState)`，注册节点并编译 LangGraph |
-| `src/web_app/agent/runtime/graph_registry.py` | 定义 `permission_guard`、`planner`、`parallel_read_stage`、`llm_supervisor_route`、`research_agent`、`rag_agent`、`tool_agent`、`memory_agent`、`skill_agent`、`evaluator`、`final_response` 等节点 |
-| `src/web_app/agent/runtime/dispatch.py` | 使用 `dispatch_next_route_node` 做条件路由 |
-| `src/web_app/agent/runtime/planner.py` | 生成 `RoutePlan`，决定 route、risk_level、needs_approval、answer_mode |
-| `src/web_app/agent/runtime/llm_supervisor.py` | LLM 接管路由节点，full 模式下可改写 planner 的 route_plan |
-
-推荐简历说法：
-
-> 基于 LangGraph StateGraph 实现 Agent Runtime，将权限检查、意图识别、规划、上下文构建、LLM 路由接管、RAG、工具调用、Memory、Skill 和最终回复拆成可观测节点；路由由 Planner 生成 RoutePlan，经 LLM Supervisor 可选改写后，通过 dispatcher 做条件分发。
-
-不要硬讲：
-
-> 我实现了独立 router 节点统一调度所有 Agent。
-
-面试官如果追问“router 在哪”：
-
-> 严格说没有单独做一个 router node。我把路由能力拆成了四层：planner 负责生成 route plan，supervisor_observer 负责运行时观察，llm_supervisor_route 可选地让 LLM 接管并重写 route plan（full 模式），dispatch_next_route_node 负责 LangGraph conditional edge 的实际跳转。这样做的好处是 planner 可解释，dispatcher 简单稳定，LLM supervisor 可以在需要时动态调整执行计划。
-
----
-
-### 3.2 checkpoint 是否真的可恢复，不只是配置
-
-**结论：代码中完整实现。生产级 PostgresSaver 已闭环。**
-
-项目已从”可选 checkpointer + 默认关闭”升级到”生产默认开启 PostgresSaver + interrupt-based 审批暂停/恢复”。这是 Phase 8-14 的核心成果。
-
-**架构演进：**
-
-| 阶段 | 方式 | 状态 |
+| 模块 | 一句话职责 | 解决的问题 |
 |---|---|---|
-| 旧（Phase 1-7） | END-based：waiting_approval → dispatch 返回 END → graph 终止 → DB graph_state 保存 → 恢复时从头 replay | 已废弃，仅保留兼容旧 run |
-| 新（Phase 8+） | interrupt-based：langgraph.types.interrupt() → checkpoint 写入 PostgresSaver → Command(resume=...) 从 checkpoint 恢复 | 生产默认 |
-
-**新架构的完整流程：**
-
-```text
-Pause: graph.ainvoke() → tool_agent → interrupt({“type”:”approval_required”,...})
-       → AsyncPostgresSaver 保存 checkpoint 到 4 张 PG 表
-       → GraphInterrupt 被 agent_service 捕获
-       → SSE: approval_required + run_paused
-
-Resume: agent_service 调用 tool_executor.execute_approved_tool() (图外执行)
-       → Command(resume={“action”:”approved”,”tool_result”:...})
-       → AsyncPostgresSaver 加载 checkpoint
-       → graph 从 interrupt() 调用点继续执行
-       → 不重跑 graph，无 stale state 清理需求
-```
-
-**关键证据：**
-
-| 能力 | 状态 | 证据 |
-|---|---|---|
-| PostgresSaver 接入 | 已实现 | `checkpointers.py` — `_AsyncPostgresSaverHandle.create()` |
-| 四张 checkpoint 表 | 已确认 | `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`、`checkpoint_migrations` |
-| 启动健康检查 | 已实现 | `check_checkpointer_health()` 验证 PostgresSaver + 4 表存在 |
-| require_durable fail-fast | 已实现 | 生产默认 `agent_checkpointer_require_durable=True`，backend 不可用时启动报错 |
-| interrupt() + Command(resume) | 已实现 | `agent_nodes.py:_interrupt_approval()` + `graph.py:resume_from_interrupt()` |
-| 跨进程 E2E | 已验证 | `test_postgres_checkpoint_e2e.py` — 7 passed，restart recovery 通过 |
-| 回归测试 | 已通过 | 59 passed (regression + tool_node + E2E + expiry) |
-| 审批超时自动过期 | 已实现 | `approval_expiry.py` — `expire_stale_approvals()` |
-| Checkpoint 定期清理 | 已实现 | `checkpoint_cleanup.py` — TTL-based cleanup (completed=7d, failed=30d, expired=7d) |
-| waiting_approval 保护 | 已实现 | 清理逻辑永不删除 waiting_approval/paused/resuming 的 checkpoint |
-| MemorySaver fallback | 仅 dev/test | `require_durable=True` 时不允许 fallback |
-| RedisSaver | experimental | `langgraph-checkpoint-redis==0.4.1` 有 Command(resume) 内部 bug，标记 experimental |
-
-**推荐简历说法：**
-
-> 接入 LangGraph checkpointer，以 PostgresSaver 为生产后端（AsyncPostgresSaver），实现 interrupt() + Command(resume=...) 的审批暂停/恢复机制。启动时自动健康检查 4 张 checkpoint 表，require_durable 确保生产不会静默降级到内存模式。审批支持超时自动过期（默认 24h），completed/failed/expired run 的 checkpoint 按 TTL 自动清理（7d/30d/7d），waiting_approval 永远受保护。
-
-**面试官追问”服务重启后一定能恢复吗”：**
-
-> 能。当前生产默认配置是 agent_checkpointer_backend=postgres，agent_checkpointer_require_durable=True。PostgresSaver 把 checkpoint 写在 PG 的 checkpoints、checkpoint_blobs、checkpoint_writes 三张表里，thread_id=run:{run_id} 是稳定的 key。跨进程 recovery E2E 测试已验证：Process 1 在 interrupt() 处暂停，Process 2 用同一个 PG 数据库的 AsyncPostgresSaver + Command(resume=...) 可以继续执行。同时 agent_approval_pending_ttl_hours=24 确保悬挂审批不会永久卡住，超时自动过期后 checkpoint 进入 7 天清理 TTL。
-
-不要说：
-> checkpoint 默认关闭，生产恢复靠 DB 状态。
-
----
-
-### 3.3 MCP 工具治理是否真的有注册、Schema 校验、风险分级、审批、审计
-
-**结论：代码中明确实现大部分；Schema 校验属于部分实现。**
-
-MCP 治理不是只写了接口。它有 registry、tool spec、DB 持久化、风险等级、permission guard、approval flow、tool call 记录和红action相关审计输出。
-
-关键证据：
-
-| 能力 | 状态 | 证据 |
-|---|---|---|
-| 工具注册 | 已在代码中明确实现 | `src/web_app/mcp/registry.py` 的 `BUILTIN_TOOLS` 和 `ensure_builtin_tools()` |
-| 工具 Schema 描述 | 已在代码中明确实现 | `src/web_app/mcp/schemas.py` 的 `MCPToolSpec.input_schema/output_schema` |
-| Schema 校验 | 代码中部分实现 | `src/web_app/mcp/tool_router.py` 的 `validate_tool_input()` 校验 required 字段和 email 格式 |
-| 风险分级 | 已在代码中明确实现 | L0/L1/L2/L3/L4 常量和 tool spec 的 `safety_level` |
-| 审批 | 已在代码中明确实现 | `src/web_app/mcp/tool_executor.py` 创建 Approval，`approval_service.py` 更新审批状态 |
-| 审计 | 已在代码中明确实现 | `ToolCall`、`Approval`、`AgentEvent` DB 模型，以及 `mcp/audit.py` 的脱敏 helper |
-| 测试 | 已通过 | `test_mcp_stage7.py` 9 passed |
-
-真实边界：
-
-`validate_tool_input()` 并不是完整 JSON Schema validator。它更像工程实用型校验：检查 required 字段、清理参数、校验 email 等。如果简历写“完整 JSON Schema 校验引擎”，会过度包装。
-
-推荐简历说法：
-
-> 设计 MCP 工具治理层：工具统一注册到 registry/DB，工具 spec 包含 input_schema、output_schema、safety_level、approval_required；执行前由 ToolExecutor 做参数必填校验、风险分级、审批拦截和 ToolCall/Approval 审计记录。
-
-面试官如果问“Schema 校验怎么做的”：
-
-> 当前不是完整 JSON Schema validator，而是根据 tool spec 的 required 字段做运行前校验，并补充了 email 等格式校验。这样能覆盖本项目内置工具的主要安全边界。下一步如果接入外部 MCP server，我会引入 `jsonschema` 或 Pydantic 动态模型做标准 JSON Schema 校验。
-
----
-
-### 3.4 L3/L4 是否真的会阻断或审批
-
-**结论：代码中明确实现。**
-
-代码中的策略是：**L3 进入人工审批；L4 默认阻断。**
-
-关键证据：
-
-| 证据 | 说明 |
-|---|---|
-| `src/web_app/services/permission_service.py` | `L4` 返回 `allowed=False`、`requires_approval=False`、`reason=high_risk_denied`；`L3` 返回 `requires_approval=True` |
-| `src/web_app/mcp/tool_executor.py` | L3 创建 `Approval` 并返回 `waiting_approval`，L4 直接 `blocked` |
-| `src/web_app/agent/runtime/node_groups/agent_nodes.py` | `tool_agent` 遇到 `waiting_approval` 会保存 `pending_*`、设置 `status=waiting_approval`，不标记节点完成 |
-| `src/web_app/agent/runtime/dispatch.py` | `waiting_approval` 路由到 `END`，形成中断 |
-| `src/web_app/tests/test_mcp_stage7.py` | 覆盖 L3 等待审批、L4 high_risk_denied |
-
-面试说法：
-
-> 我把工具风险分为 L0-L4。L0/L1/L2 可以自动执行或低风险执行；L3 是外部写入、发邮件、本地文件写入等，需要生成 Approval，由用户确认后再走 `execute_approved_tool`；L4 是高危操作，比如删除或破坏性动作，当前策略是默认拒绝，不进入审批队列。这是一个保守安全模型。
-
----
-
-### 3.5 Parent-Child Chunking 是否真的实现
-
-**结论：代码中明确实现。**
-
-项目实现了 overview、parent、child 三类 chunk，并且只把 child chunk 写入 Qdrant，parent/overview 保存在 PostgreSQL 中用于上下文扩展。
-
-关键证据：
-
-| 证据 | 说明 |
-|---|---|
-| `src/web_app/rag/structured_chunker.py` | `build_structured_chunks()` 生成 overview、parent、child；child 带 `parent_id` |
-| `src/web_app/services/document_service.py` | ingest 时只 embedding/upsert `vector_chunks`，也就是 child chunks |
-| `src/web_app/rag/retriever.py` | `_enrich_parent_context()` 根据 child 的 `parent_id` 回查 parent chunk |
-| `src/web_app/tests/test_rag_stage3.py` | 29 passed，覆盖 child vector、parent enrichment 等 |
-| `scripts/run_rag_hybrid_eval.py` | `validate_ingestion()` 检查 child 有 qdrant_point_id，non-child 没有 vector |
-
-面试说法：
-
-> 我没有把大段文档直接切成等长 chunk 丢进向量库，而是做了 Parent-Child Chunking。child chunk 负责检索召回，parent chunk 负责补上下文。这样能兼顾命中精度和回答完整性。代码里约束也比较明确：只有 `chunk_role=child` 的片段会写入 Qdrant，parent/overview 保存在数据库，用于检索后 enrich。
-
----
-
-### 3.6 Qdrant Hybrid Search 是否真的实现
-
-**结论：代码中明确实现。**
-
-Qdrant Hybrid Search 是真实现，不只是配置名。
-
-关键证据：
-
-| 证据 | 说明 |
-|---|---|
-| `src/web_app/rag/vector_store.py` | hybrid collection 同时创建 dense named vector 和 sparse vector |
-| `src/web_app/rag/sparse_encoder.py` | 稀疏向量编码，包括 hash sparse encoder 和 Qdrant Cloud BM25 兼容 |
-| `src/web_app/rag/vector_store.py` | upsert 时写入 dense + sparse 两套向量 |
-| `src/web_app/rag/vector_store.py` | `search_hybrid()` 使用 dense prefetch + sparse prefetch |
-| `src/web_app/rag/retriever.py` | `ParentChildRetriever` 支持 `qdrant_hybrid` backend，失败时可 fallback |
-| `src/web_app/tests/test_rag_qdrant_hybrid.py` | 13 passed，覆盖 schema、upsert、fallback、hybrid result |
-
-面试说法：
-
-> 我把 Qdrant 从单纯 dense vector 检索升级到 hybrid。写入时 child chunk 同时写 dense embedding 和 sparse representation；查询时 dense 与 sparse 分别 prefetch，最后在 Qdrant 内部做融合。这样中文关键词、编号、合同号这类精确信号不完全依赖 embedding。
-
----
-
-### 3.7 RRF 是否真的实现
-
-**结论：代码中明确实现，但限定在 Qdrant native hybrid 路径。**
-
-关键证据：
-
-| 证据 | 说明 |
-|---|---|
-| `src/web_app/rag/vector_store.py` | `search_hybrid()` 使用 `FusionQuery(fusion=Fusion.RRF)` |
-| `src/web_app/rag/retriever.py` | `qdrant_hybrid` 路径调用 `vector_store.search_hybrid()` |
-
-真实边界：
-
-Python fallback 路径不是 RRF，而是本地 BM25 + vector merge，再经过 weighted reranker。
-
-推荐简历说法：
-
-> 在 Qdrant native hybrid 检索路径使用 Fusion.RRF 融合 dense 与 sparse 召回；同时保留 Python BM25 fallback，用于 Qdrant hybrid 不可用时降级。
-
-不要说：
-
-> 所有 hybrid 检索都用 RRF。
-
----
-
-### 3.8 hit@5 评估脚本是否存在
-
-**结论：代码中明确实现。**
-
-关键证据：
-
-| 证据 | 说明 |
-|---|---|
-| `scripts/run_rag_hybrid_eval.py` | 评估 `python_bm25` 与 `qdrant_hybrid`，计算 hit@1、hit@3、hit@5、keyword_hit_rate |
-| `src/web_app/tests/test_rag_hybrid_eval_runner.py` | 7 passed |
-| `uploads/artifacts/rag_eval/*.md` | 存在历史评估报告 |
-| `uploads/artifacts/rag_eval/*.jsonl` | 存在逐 query 结果记录 |
-
-面试说法：
-
-> 我做了一个 synthetic RAG eval runner，不只是主观看结果。它会准备固定测试文档、执行多组 query、比较 Python BM25 fallback 与 Qdrant hybrid，然后输出 Markdown 和 JSONL，包括 hit@1、hit@3、hit@5、keyword_hit_rate、fallback_count 和 latency。
-
----
-
-### 3.9 hit@5 从 0.54 到 0.92 是否有实验记录支撑
-
-**结论：代码中明确实现，但要限定表述。**
-
-历史报告中存在 `python_bm25 hit@5 = 0.54` 与 `qdrant_hybrid hit@5 = 0.92` 的记录。
-
-关键证据：
-
-| 文件 | 记录 |
-|---|---|
-| `uploads/artifacts/rag_eval/rag_hybrid_eval_20260611_145414.md` | `python_bm25 hit@5 0.54`，`qdrant_hybrid hit@5 0.92` |
-| `uploads/artifacts/rag_eval/rag_hybrid_eval_20260611_105403.md` | 同样记录 `0.54 → 0.92` |
-| `uploads/artifacts/rag_eval/rag_hybrid_eval_20260611_104345.md` | 更早一版中 `qdrant_hybrid hit@5 0.00`，说明有调试演进过程 |
-
-真实边界：
-
-这不是生产线上真实用户日志的长期 A/B 数据，而是 synthetic eval 上的 backend 对比。面试时必须讲清楚。
-
-推荐简历说法：
-
-> 在自建 synthetic RAG benchmark 上，将默认 Python BM25 hybrid baseline 的 hit@5 0.54 提升到 Qdrant native hybrid 的 0.92，并保留 Markdown/JSONL 实验记录。
-
-面试官如果追问数据集：
-
-> 这是项目内的 synthetic benchmark，不是线上真实流量。测试集包含中文风险说明、合同类精确信息、技术配置等文档，用来验证中文关键词、编号类 query 和摘要类 query 的召回能力。它的价值是可复现和能防回归；如果做生产化，我会继续接入真实 query log 和人工标注集。
-
----
-
-### 3.10 三层记忆是否真的存在
-
-**结论：代码中明确实现，但主实现不在 `memory/*.py` 的 store 类里，而在 service/repository/vector store 层。**
-
-关键证据：
-
-| 证据 | 说明 |
-|---|---|
-| `src/web_app/models/orm.py` | `Memory.memory_type` 支持 working/episodic/semantic 等类型 |
-| `src/web_app/services/memory_service.py` | 对 working、episodic、semantic 做不同写入、检索、固化逻辑 |
-| `src/web_app/memory/qdrant_memory_store.py` | semantic/episodic 写入 Qdrant，PG 作为 authoritative store |
-| `src/web_app/memory/extractor.py` | LLM/regex extraction 输出 working、episodic、semantic |
-| `src/web_app/agent/runtime/node_groups/read_nodes.py` | context 中按 Semantic/Episodic/Working Memory 格式化 |
-
-真实边界：
-
-`src/web_app/memory/working.py`、`episodic.py`、`semantic.py` 这些类本身很薄；真正的工程逻辑集中在 `MemoryService`。所以不要讲成“三套独立复杂 memory engine”，应该讲成“一套 service 层实现的三层记忆模型”。
-
-面试说法：
-
-> 我把记忆按生命周期和用途分成 working、episodic、semantic 三层。working 主要承接当前页面和当前任务上下文；episodic 记录任务事件和历史行为；semantic 记录长期偏好、技术栈、边界约束等稳定事实。PostgreSQL 是权威存储，semantic/episodic 额外写 Qdrant 做语义召回。
-
----
-
-### 3.11 GSSC 动态上下文是否真的有代码实现
-
-**结论：代码中明确实现。**
-
-GSSC 可以理解为 **Gather / Select / Structure / Compress** 的上下文工程流程。代码中确实有 gather、select、structure、compress 四段。
-
-关键证据：
-
-| 证据 | 说明 |
-|---|---|
-| `src/web_app/context/builder.py` | `ContextBuilder.gather/select/structure/compress/build_with_debug()` |
-| `src/web_app/context/builder.py` | `_ROUTE_WEIGHTS` 根据 route 对 memory、evidence、feed、history 等设置不同权重 |
-| `src/web_app/context/builder.py` | `MEMORY_CONTEXT_POLICY` 根据 answer_mode 过滤记忆类别 |
-| `src/web_app/agent/runtime/node_groups/read_nodes.py` | `context_builder` 调用 `build_with_debug()`，写入 `gssc_context` 和 `gssc_debug` |
-| `src/web_app/agent/runtime/node_groups/eval_final_nodes.py` | final response 优先使用 `Structured GSSC Context` |
-
-真实边界：
-
-它是启发式上下文工程实现，不是复杂学习型 context optimizer。动态主要体现在 route-aware source weight、answer_mode memory policy、token budget、selected/dropped debug。
-
-面试说法：
-
-> 我实现的 GSSC 是工程化上下文构建流程：Gather 汇总用户任务、历史对话、Memory、RAG evidence、FeedCard、Graph context；Select 根据 route 权重和 token budget 选择上下文；Structure 把上下文组织成固定 section；Compress 在超过预算时压缩。它不是论文里的学习型优化器，但能稳定控制上下文污染和 token 膨胀。
-
----
-
-### 3.12 Memory 抽取、去重、固化、任务感知筛选是否真的实现
-
-**结论：代码中明确实现。**
-
-关键证据：
-
-| 能力 | 状态 | 证据 |
-|---|---|---|
-| LLM 抽取 | 已实现 | `src/web_app/memory/extractor.py` 的 `LlmMemoryExtractor` |
-| regex fallback | 已实现 | `MemoryExtractor.extract()` |
-| working/episodic/semantic 输出 | 已实现 | extractor 输出三类 memory |
-| 去重 | 已实现 | `MemoryService.add_with_dedup()`、`_find_similar()`、`_update_existing()` |
-| 固化/晋升 | 已实现 | `MemoryService.consolidate_memory()`，working→episodic，episodic→semantic |
-| Qdrant 语义召回 | 已实现 | `QdrantMemoryStore.search_memory()` |
-| 任务感知筛选 | 已实现 | `MEMORY_CONTEXT_POLICY`、route-aware context weights、`search_memory(query=...)` |
-| 低质量过滤 | 已实现 | `_save_extracted()` 中 confidence/importance 阈值 |
-
-面试说法：
-
-> Memory 写入不是无脑保存。抽取阶段优先用 LLM 输出结构化 memory，失败后回退 regex；保存阶段根据 importance 和 confidence 过滤；写入时做相似度去重，重复内容更新 evidence_count 和 last_seen；固化阶段把高重要度 working/episodic 晋升到更长期的层级；读取阶段根据 query、answer_mode 和 route 选择该注入哪些 memory，避免 tech_stack 这类长期上下文污染普通闲聊。
-
----
-
-### 3.13 Skill 复用是否真的存在
-
-**结论：代码中部分实现。**
-
-Skill 不是空概念，存在 DB 模型、repository、service、匹配、草稿生成、审批状态、上下文注入、使用统计。但它还不是完整的“自动执行历史 workflow 编排引擎”。
-
-关键证据：
-
-| 能力 | 状态 | 证据 |
-|---|---|---|
-| Skill 持久化 | 已实现 | `src/web_app/models/orm.py` 的 `Skill` 模型 |
-| Skill CRUD/列表 | 已实现 | `src/web_app/db/repositories/skill_repository.py`、`SkillService` |
-| 匹配已有 Skill | 已实现 | `SkillService.match_skill()` |
-| 命中后注入上下文 | 已实现 | `read_nodes.py` 的 `skill_matcher` 和 `_skill_context_block()` |
-| 自动生成 Skill 草稿 | 已实现 | `agent_nodes.py` 的 `skill_agent()` |
-| 复用价值评估 | 已实现 | `SkillService.evaluate_reusability()` |
-| 使用统计/演进 | 已实现 | `record_skill_usage()`、`get_skill_evolution()` |
-| 自动编译成可执行工作流并重放 | 没有发现完整实现 | 当前主要是匹配、注入、草稿和统计 |
-
-推荐简历说法：
-
-> 实现 Skill 复用雏形：从成功 Agent run 中评估 workflow 可复用性并生成 Skill 草稿；后续请求中根据 trigger/context 做 Skill 匹配，命中 approved skill 后把 workflow steps、tool plan、output contract 注入 GSSC 上下文，并记录使用统计。
-
-面试官如果问“Skill 会自动执行吗”：
-
-> 当前版本不是把 Skill 编译成独立可执行 DAG 自动重放，而是作为 workflow memory 和 context contract 使用。它能指导 planner/tool/rag 等节点复用历史流程。真正的下一步是把 approved skill 的 tool_plan 转成受 MCP 权限约束的可执行子图。
-
----
-
-## 4. 缺口清单与面试降风险说法
-
-| 缺口 | 风险 | 面试怎么说 |
-|---|---|---|
-| 没有独立 router node | 面试官按简历找不到文件 | “路由被拆成 planner、supervisor_observer、llm_supervisor_route 和 conditional dispatcher，没有单独命名 router node。” |
-| checkpoint 曾默认关闭 | 已解决，现在默认开启 PostgresSaver | “已升级为生产级 PostgresSaver + interrupt/Command(resume)；启动有 health check + require_durable fail-fast。” |
-| RedisSaver 生产不可用 | langgraph-checkpoint-redis 0.4.1 有内部 bug | “已切到 PostgresSaver 作为生产 backend，RedisSaver 标记 experimental。” |
-| Approval 悬挂风险 | 用户不操作，run 永久卡在 waiting_approval | “已实现 approval expiry：24h 超时自动 expire，run/message/tool_call 四表同步，expired checkpoint 进入 7 天清理 TTL。” |
-| Checkpoint 无限增长 | PG 表持续膨胀 | “已实现 TTL cleanup：completed=7d, failed=30d, expired=7d。waiting_approval 永不清理。” |
-| MemorySaver fallback 非生产持久 | 服务重启丢失 | “require_durable=True 时启动 fail-fast，不允许静默降级到内存模式。” |
-| JSON Schema 校验不完整 | 外部 MCP server 接入会有风险 | “当前针对内置工具做 required 和格式校验；外部 MCP 应升级到标准 JSON Schema validator。” |
-| RRF 只在 Qdrant native hybrid | Python fallback 不是 RRF | “native Qdrant hybrid 使用 Fusion.RRF；fallback 是 weighted merge/rerank。” |
-| hit@5 记录是 synthetic eval | 不能说线上数据 | “是可复现 synthetic benchmark，不是生产 A/B。” |
-| Skill 不是自动执行引擎 | 过度包装风险 | “当前是可复用 workflow 的识别、草稿、匹配和上下文注入层。” |
-| 三层 memory 的 store 类很薄 | 容易被问到 architecture | “主逻辑在 MemoryService/Repository/QdrantMemoryStore，`memory/*.py` 是轻量抽象。” |
-
----
-
-## 5. 推荐简历改写版本
-
-### 更稳的项目亮点写法
-
-> 基于 LangGraph StateGraph 设计并实现多节点 Agent Runtime，将权限检查、意图识别、规划、并行上下文读取、RAG、工具调用、Memory、Skill、评估和最终回复拆为可观测节点；通过 RoutePlan、supervisor observer 与 conditional dispatcher 实现动态路由。
-
-> 设计 MCP 工具治理层：内置工具统一注册到 registry/DB，工具 spec 包含 input_schema、output_schema、safety_level、approval_required；执行前进行参数校验、L0-L4 风险分级、L3 人工审批、L4 默认阻断，并通过 ToolCall、Approval、AgentEvent 形成审计链路。
-
-> 构建文档 RAG 检索链路：实现 Parent-Child Chunking，仅 child chunk 写入 Qdrant，检索后回查 parent context；将 Qdrant dense + sparse hybrid search 接入检索器，并在 native hybrid 路径使用 Fusion.RRF 融合召回。
-
-> 搭建 RAG synthetic eval runner，比较 Python BM25 fallback 与 Qdrant native hybrid backend，输出 hit@1/hit@3/hit@5、keyword_hit_rate、fallback_count、latency 和 JSONL 详情；在项目 benchmark 中将 hit@5 从 0.54 提升到 0.92。
-
-> 实现三层 Memory 服务：working/episodic/semantic 的抽取、过滤、去重、固化和语义召回；结合 GSSC 上下文构建器，根据 route、answer_mode、token budget 和 memory policy 动态选择注入 Memory、RAG evidence、FeedCard、Conversation History 等上下文。
-
-> 实现 Skill 复用雏形：从 Agent run 评估 workflow 可复用性并生成 Skill 草稿；后续请求中匹配 approved Skill，将 tool plan、context recipe 和 output contract 注入上下文，并记录使用统计。
-
-### 不建议写的版本
-
-> ~~实现生产级 checkpoint 崩溃恢复~~ (已实现，可写)。  
-> 实现完整 MCP JSON Schema 校验引擎。  
-> 实现独立 router 节点。  
-> 实现全自动 Skill 工作流执行引擎。  
-> 基于线上数据将 RAG hit@5 从 0.54 提升到 0.92。
-
----
-
-## 6. 面试模块讲解稿
-
-### 6.1 Agent Runtime 怎么讲
-
-> 这个项目原本更像一个应用型 deep research 项目。我在上层做了一个 Agent OS runtime，把用户请求进入系统后的过程拆成 LangGraph StateGraph 节点。  
-> 
-> 入口先过 `permission_guard`，然后用 `home_intent_react` 和 `planner` 得到 RoutePlan。接着 `parallel_prefetch` 和 `parallel_read_stage` 并行准备上下文、RAG evidence、Memory、Skill。之后 `supervisor_observer` 做状态观测，`llm_supervisor_route` 可选让 LLM 接管并改写 route plan（full 模式），然后 dispatcher 根据 route plan 和已完成节点决定下一个 agent，比如 research、rag、tool、memory、skill。最后经过 evaluator 和 final_response。  
-> 
-> 我这里没有把 router 做成一个单独节点，而是把路由拆成 planner、supervisor observer、LLM supervisor 和 conditional dispatcher，这样每一层职责更清楚，LLM supervisor 可以在需要时动态调整执行计划。
-
-### 6.2 MCP 安全治理怎么讲
-
-> 我把工具调用统一收敛到 MCP Service/ToolExecutor。每个工具都有 spec，包括 name、category、input_schema、output_schema、safety_level 和 requires_approval。  
-> 
-> 执行前先通过 registry 找到工具，再做参数必填校验和风险判断。L3 工具，比如本地文件写入、发邮件，会创建 Approval 并让 Agent run 进入 waiting_approval；L4 高危工具，比如删除，默认直接 blocked。  
-> 
-> 审计方面，ToolCall、Approval 和 AgentEvent 都会落库，所以能追踪一次工具调用从发起、等待审批、批准、执行到完成的过程。
-
-### 6.3 RAG 怎么讲
-
-> RAG 我重点解决两个问题：切分粒度和中文/精确关键词召回。  
-> 
-> 切分上用 Parent-Child Chunking。child chunk 小，适合检索；parent chunk 大，适合给模型补上下文。入库时只有 child 写向量库，parent/overview 留在 PostgreSQL，检索命中 child 后再根据 parent_id 回查 parent context。  
-> 
-> 召回上接了 Qdrant hybrid，child chunk 同时写 dense 和 sparse；查询时 dense 和 sparse 两路 prefetch，在 Qdrant native hybrid 里用 Fusion.RRF 做融合。这样合同号、金额、中文关键词这类信息比纯 dense 更稳。
-
-### 6.4 RAG 评估怎么讲
-
-> 我没有只靠肉眼判断检索效果，而是做了 synthetic benchmark。runner 会 ingest 固定测试文档，然后跑一组 query，对比 python_bm25 和 qdrant_hybrid 两个 backend，输出 hit@1、hit@3、hit@5、keyword_hit_rate、fallback_count、latency。  
-> 
-> 项目里保留了历史报告，能看到 baseline hit@5 0.54，qdrant_hybrid hit@5 0.92。但我会明确这是 synthetic benchmark，不是线上真实 A/B。
-
-### 6.5 Memory / GSSC 怎么讲
-
-> Memory 分三层：working、episodic、semantic。working 记录当前页面/当前任务，episodic 记录历史任务事件，semantic 记录长期偏好、技术栈、边界约束。  
-> 
-> 写入时先抽取，LLM 失败会 fallback regex；再根据 confidence 和 importance 过滤；再做相似度去重；重复内容不新建，而是更新 evidence_count 和 last_seen。固化逻辑会把高价值 working/episodic 晋升到更长期的 memory。  
-> 
-> 读取时不是全部塞进 prompt，而是通过 GSSC 做上下文选择。GSSC 就是 Gather、Select、Structure、Compress：先收集 Memory、RAG evidence、Feed、History、Graph context，再根据 route 权重、answer_mode policy 和 token budget 选择，最后组织成结构化上下文给 final_response。
-
-### 6.6 Skill 怎么讲
-
-> Skill 当前是一个可复用 workflow 层，不是完整自动执行引擎。  
-> 
-> 当一次 Agent run 成功后，skill_agent 会评估这个任务是否有复用价值，如果分数够高，就生成 Skill 草稿，包括 trigger、input_schema、workflow_steps、tool_plan、output_schema。后续请求会通过 skill_matcher 匹配已有 Skill，命中 approved skill 后把它的 tool plan 和 output contract 注入 GSSC，影响 planner 和最终回复。  
-> 
-> 这版已经有复用识别、匹配、草稿生成和使用统计；下一步才是把 approved skill 编译成可执行子图。
-
----
-
-## 7. 最值得展示的证据路径
-
-| 模块 | 文件 |
-|---|---|
-| LangGraph 构图 | `src/web_app/agent/runtime/graph_builder.py` |
-| 节点注册 | `src/web_app/agent/runtime/graph_registry.py` |
-| 状态定义 | `src/web_app/agent/runtime/state.py` |
-| Planner | `src/web_app/agent/runtime/planner.py` |
-| LLM Supervisor Route | `src/web_app/agent/runtime/llm_supervisor.py` |
-| Dispatcher | `src/web_app/agent/runtime/dispatch.py` |
-| Checkpointer | `src/web_app/agent/runtime/checkpointers.py` |
-| Checkpoint Cleanup | `src/web_app/agent/runtime/checkpoint_cleanup.py` |
-| Approval Expiry | `src/web_app/services/approval_expiry.py` |
-| Checkpoint Health Check | `src/web_app/agent/runtime/checkpointers.py` — `check_checkpointer_health()` |
-| MCP Registry | `src/web_app/mcp/registry.py` |
-| MCP Schema | `src/web_app/mcp/schemas.py` |
-| MCP Executor | `src/web_app/mcp/tool_executor.py` |
-| Permission Guard | `src/web_app/services/permission_service.py` |
-| Approval Service | `src/web_app/services/approval_service.py` |
-| Parent-Child Chunking | `src/web_app/rag/structured_chunker.py` |
-| Document Ingestion | `src/web_app/services/document_service.py` |
-| Qdrant Vector Store | `src/web_app/rag/vector_store.py` |
-| RAG Retriever | `src/web_app/rag/retriever.py` |
-| RAG Eval | `scripts/run_rag_hybrid_eval.py` |
-| Memory Service | `src/web_app/services/memory_service.py` |
-| Memory Extractor | `src/web_app/memory/extractor.py` |
-| Qdrant Memory | `src/web_app/memory/qdrant_memory_store.py` |
-| GSSC Builder | `src/web_app/context/builder.py` |
-| Runtime Context Node | `src/web_app/agent/runtime/node_groups/read_nodes.py` |
-| Final GSSC Prompt | `src/web_app/agent/runtime/node_groups/eval_final_nodes.py` |
-| Skill Service | `src/web_app/services/skill_service.py` |
-| Skill Model | `src/web_app/models/orm.py` |
-
----
-
-## 8. 最终审计结论
-
-这份项目经历能放进简历，而且有不少亮点是真实现、可追问的。最强的三块是：
-
-1. **LangGraph 多节点 Agent Runtime**
-2. **MCP L0-L4 工具治理与审批中断**
-3. **Parent-Child + Qdrant Hybrid + RRF + hit@5 eval 的 RAG 工程链路**
-
-需要降调的两块是：
-
-1. **Schema 校验**：讲”参数必填与格式校验”，不要讲”完整 JSON Schema validator”。
-2. **Skill 复用**：讲”复用识别、匹配、上下文注入和草稿生成”，不要讲”完整自动执行 Skill 引擎”。
-
-已升级可讲的一块是：
-
-1. **checkpoint**：已从”部分实现、默认关闭”升级到”PostgresSaver 生产闭环 + interrupt/Command(resume) + 健康检查 + require_durable fail-fast + 审批超时自动过期 + TTL 清理”。现在是真可讲的生产级能力。
-
-最稳的面试总括：
-
-> 这个项目的核心价值不是单个算法，而是把 Agent 平台常见的工程问题串成了闭环：LangGraph 节点化运行、MCP 工具安全治理、RAG 检索评估、Memory 上下文管理和 Skill 复用雏形。每个模块都有代码落点和测试/评估证据，同时我也清楚哪些部分还只是第一版工程实现，比如 checkpoint 的生产恢复和 Skill 的自动执行。
-
----
-
-# 9. 四大模块深度讲解书
-
-下面这部分不是审计表，而是给你面试前真正“讲明白”的版本。你可以把它当成自己的项目讲解稿来读：先理解整体链路，再理解每个模块怎么做、为什么这么做、代码里在哪里、面试官追问时怎么回答。
-
-我把项目拆成四个核心模块：
-
-1. **LangGraph Agent Runtime：多节点 Agent 编排层**
-2. **MCP Tool Governance：工具治理、安全分级与审批层**
-3. **RAG Retrieval System：Parent-Child + Qdrant Hybrid + RRF + Eval 检索层**
-4. **Memory / GSSC / Skill：长期记忆、动态上下文与工作流复用层**
-
-这四个模块不是孤立的。真实工作流是这样的：
-
-```mermaid
-flowchart TD
-    A["用户输入"] --> B["Agent Service 创建 AgentRun"]
-    B --> C["LangGraph Runtime"]
-    C --> D["Planner 生成 RoutePlan"]
-    D --> E["Parallel Read 准备上下文"]
-    E --> F["GSSC 结构化上下文"]
-    F --> F2["LLM Supervisor 可选接管路由"]
-    F2 --> G{"Dispatcher 选择节点"}
-
-    G --> H["RAG Agent"]
-    G --> I["Tool Agent"]
-    G --> J["Memory Agent"]
-    G --> K["Skill Agent"]
-    G --> L["Research/Artifact Agent"]
-
-    H --> H1["Parent-Child / Qdrant Hybrid / RRF"]
-    I --> I1["MCP Registry / Risk / Approval / Audit"]
-    J --> J1["Memory Extract / Dedup / Consolidate"]
-    K --> K1["Skill Match / Draft / Context Inject"]
-
-    H1 --> M["Evaluator"]
-    I1 --> M
-    J1 --> M
-    K1 --> M
-    L --> M
-    M --> N["Final Response"]
-```
-
-面试时你要先建立这个“系统级视角”：  
-**我不是只写了一个聊天接口，而是把 Agent 执行过程拆成规划、上下文、工具、安全、检索、记忆、复用和最终回复几个可观测环节。**
-
----
-
-## 9.1 模块一：LangGraph Agent Runtime 多节点编排层
-
-### 9.1.1 这个模块解决什么问题
-
-普通 LLM 应用常见的问题是：用户输入进来以后，代码里一堆 if/else 判断，要不要查资料、要不要调用工具、要不要写记忆、要不要生成文件，最后全混在一个函数里。这样会有几个问题：
-
-1. **不可观测**：失败时不知道是 planner 错了、RAG 没查到、工具被拦截，还是 final response 胡说。
-2. **不可恢复**：工具审批、长任务、异常中断时，很难恢复到正确阶段。
-3. **不可扩展**：以后新增 memory、skill、artifact、approval，每加一个能力都要改主流程。
-4. **安全边界模糊**：工具调用、审批、输出生成混在一起，容易绕过安全策略。
-
-所以你做的是：  
-**用 LangGraph StateGraph 把 Agent 执行流程拆成节点，让每个节点只负责一个阶段，并通过共享 state 传递结果。**
-
-一句话讲给面试官：
-
-> 我把 Agent Runtime 从传统的单函数链路改成了 LangGraph StateGraph 节点图。每个阶段，比如权限检查、意图识别、规划、上下文读取、RAG、工具调用、Memory、Skill、评估、最终回复，都是独立节点。节点之间通过 AgentRuntimeState 传递状态，并通过 dispatcher 做条件跳转。这样整个 Agent 执行过程可观测、可插拔，也方便处理审批中断和恢复。
-
-### 9.1.2 你具体怎么做的
-
-你主要做了三件事：
-
-第一，定义统一状态 `AgentRuntimeState`。  
-这个 state 是所有节点共享的数据结构。它里面不只是 `user_input`，还包括：
-
-| 状态字段 | 作用 |
-|---|---|
-| `user_id` / `run_id` / `thread_id` | 标识用户、运行实例、LangGraph thread |
-| `route_plan` | planner 生成的路由计划 |
-| `context` | GSSC 上下文、Memory、RAG evidence、FeedCard 等 |
-| `rag_result` / `tool_result` / `memory_result` / `skill_result` | 各 agent 节点产物 |
-| `pending_approval_id` / `pending_tool_call_id` | 工具审批中断时保存恢复信息 |
-| `completed_nodes` | 已完成节点列表 |
-| `node_results` | 节点执行结果，用于观测和最终汇总 |
-| `errors` | 节点错误 |
-| `final_answer` / `final_payload` | 最终回复 |
-
-这个设计的意义是：每个节点都不需要知道全局业务细节，只需要读自己关心的字段，写自己的结果字段。
-
-第二，定义节点注册表。  
-在 `graph_registry.py` 里，节点不是散落注册的，而是有结构化分类：
-
-| 分组 | 节点 |
-|---|---|
-| SETUP | `permission_guard`、`home_intent_react`、`planner` |
-| READ | `parallel_prefetch`、`parallel_read_stage`、`supervisor_observer`、`llm_supervisor_route` |
-| AGENT | `research_agent`、`rag_agent`、`artifact_agent`、`tool_agent`、`memory_agent`、`skill_agent` |
-| EVAL | `evaluator`、`final_response` |
-
-这说明你的 Agent 不是“函数随机跳”，而是有阶段边界的 runtime。
-
-第三，用 StateGraph 连接节点。  
-在 `graph_builder.py` 里创建 `StateGraph(AgentRuntimeState)`，然后把节点都 add 进去。固定前置链路大概是：
-
-```text
-permission_guard
-  -> home_intent_react
-  -> planner
-  -> parallel_prefetch
-  -> parallel_read_stage
-  -> supervisor_observer
-  -> llm_supervisor_route (LLM可改写route_plan)
-```
-
-到 `llm_supervisor_route` 之后，就不是固定单一路径，而是根据（可能已被 LLM 改写后的）route plan 和当前完成情况动态选择下一个 agent 节点。
-
-### 9.1.3 一次请求的真实工作流
-
-你可以这样给面试官讲完整请求链路：
+| Runtime | 把请求拆成可控节点并驱动执行 | Agent 不可控、流程不可观测、失败不可恢复 |
+| MCP | 工具调用前做治理和审批 | Agent 误写文件、误发邮件、误删数据 |
+| RAG | 从用户文档中找可靠证据 | LLM 幻觉、文档问答不准、编号类问题漏召回 |
+| Memory/GSSC | 选择该给模型看的上下文 | 多轮遗忘、上下文污染、token 爆炸、偏好丢失 |
+
+### 3.2 四模块之间的交互
 
 ```mermaid
 sequenceDiagram
-    participant U as User
-    participant S as AgentService
-    participant G as LangGraph
-    participant P as Planner
-    participant R as ParallelRead
-    participant D as Dispatcher
-    participant A as AgentNode
-    participant E as Evaluator
-    participant F as FinalResponse
+    participant AS as AgentService
+    participant RT as Runtime
+    participant G as GSSC
+    participant R as RAG
+    participant M as Memory
+    participant T as MCP Tool
+    participant DB as PostgreSQL/Qdrant
 
-    U->>S: 输入问题/任务
-    S->>S: 创建 AgentRun, conversation, thread_id
-    S->>G: AgentRuntime.run(initial_state)
-    G->>G: permission_guard
-    G->>G: home_intent_react
-    G->>P: planner
-    P-->>G: RoutePlan(route, intent, risk, answer_mode)
-    G->>R: parallel_prefetch / parallel_read_stage
-    R-->>G: context, memory, rag_evidence, skill candidates
-    G->>D: supervisor_observer → llm_supervisor_route → dispatch_next_route_node
-    D-->>G: 选择下一个节点
-    G->>A: rag/tool/memory/skill/research/artifact
-    A-->>G: agent result
-    G->>E: evaluator
-    E-->>G: warnings/constraints
-    G->>F: final_response
-    F-->>S: final_answer/final_payload
-    S-->>U: 流式/最终回复
+    AS->>RT: run(state)
+    RT->>G: build context(route, user_input)
+    G->>M: search_memory + load conversation history
+    G->>R: search_evidence if needed
+    M-->>G: memory items / summary / segments
+    R-->>G: evidence
+    G-->>RT: gssc_context
+    RT->>R: rag_agent if route needs RAG
+    R->>DB: Qdrant hybrid search + parent enrichment
+    R-->>RT: rag_result
+    RT->>T: tool_agent if route needs tool
+    T->>DB: ToolCall / Approval
+    T-->>RT: tool_result or waiting_approval
+    RT->>M: memory_agent if route needs memory
+    M->>DB: PG + Qdrant memory
+    RT-->>AS: final state
+    AS-->>DB: persist answer / summary / events
 ```
-
-更具体地说：
-
-1. **AgentService 创建运行记录**  
-   用户请求先进入 service 层。service 会创建 `AgentRun`，保存 `conversation_id`、`thread_id`、`user_input`、`graph_state` 等。这里的作用是让一次 Agent 执行有数据库身份，后续事件、审批、工具调用都能关联到这个 run。
-
-2. **permission_guard 做早期安全检查**  
-   它不是具体工具审批，而是 runtime 入口的安全门。比如用户意图明显是 blocked/approval 时，可以提前调整 route。
-
-3. **home_intent_react 识别首页意图**  
-   这个节点用规则/LLM 辅助判断用户是在普通聊天、文档问答、工具动作、研究任务还是记忆相关任务。
-
-4. **planner 生成 RoutePlan**  
-   planner 是核心。它根据用户输入、意图、风险等级、answer_mode，决定后面要走哪些 agent 节点。比如：
-
-   ```text
-   用户问当前文档内容 -> route: rag_agent -> evaluator -> final_response
-   用户要求发邮件 -> route: tool_agent -> evaluator -> final_response, risk=L3
-   用户说“记住我喜欢中文回答” -> route: memory_agent -> final_response
-   用户要求深度研究并产出报告 -> route: research_agent -> artifact_agent -> memory_agent -> skill_agent
-   ```
-
-5. **parallel_prefetch / parallel_read_stage 提前准备上下文**  
-   这里会提前准备 Memory、RAG evidence、Skill candidates、conversation history、FeedCard context 等。这样后面的 RAG、final_response、skill_matcher 不用各自重复查。
-
-6. **supervisor_observer → llm_supervisor_route → dispatcher 做动态节点选择**  
-   你的项目里没有一个单独名叫 router 的 StateGraph 节点。实际路由分成：
-
-   | 层 | 责任 |
-   |---|---|
-   | planner | 生成初始 route plan |
-   | supervisor_observer | 观察当前执行状态和候选节点 |
-   | llm_supervisor_route | LLM 分析 state，可选改写 route plan（full 模式） |
-   | dispatch_next_route_node | 给 LangGraph conditional edge 返回下一个节点名 |
-
-   这也是面试要讲清楚的地方。不要说”我有 router 节点”，要说”我实现的是 planner + LLM supervisor + dispatcher 的条件路由机制，LLM supervisor 可以在 full 模式下动态优化执行计划”。
-
-7. **agent 节点执行具体能力**  
-   例如 `rag_agent` 做文档检索，`tool_agent` 做 MCP 工具调用，`memory_agent` 做记忆写入，`skill_agent` 做可复用 workflow 检测。
-
-8. **evaluator 做最终前检查**  
-   evaluator 会检查一些约束，比如 RAG 没 evidence 不要声称“根据文档”，工具等待审批时不要声称已执行。
-
-9. **final_response 构造最终回答**  
-   final_response 会优先使用 GSSC context，把各 agent 的结果整合成用户能读的自然语言。
-
-### 9.1.4 这个模块最重要的工程亮点
-
-**亮点一：节点有职责边界。**
-
-你不是写一个大函数处理所有事情，而是把职责拆开：
-
-| 节点 | 职责 |
-|---|---|
-| `planner` | 决定做什么 |
-| `parallel_read_stage` | 准备上下文 |
-| `rag_agent` | 查用户文档 |
-| `tool_agent` | 调工具并处理审批 |
-| `memory_agent` | 抽取并写入记忆 |
-| `skill_agent` | 检测 workflow 是否可复用 |
-| `evaluator` | 防止最终回答过度声称 |
-| `final_response` | 组织用户可读答案 |
-
-**亮点二：状态可观测。**
-
-通过 `AgentRun`、`AgentEvent`、`AgentStep`、`node_results`、`completed_nodes`，可以看一次 run 到底卡在哪个节点。这对 Agent 平台非常重要，因为 Agent 的问题通常不是“代码直接报错”，而是“模型做了奇怪决策”。可观测性就是定位这类问题的基础。
-
-**亮点三：审批中断是 runtime 级别处理。**
-
-当工具需要审批时，`tool_agent` 不会继续往下假装执行成功，而是设置：
-
-```text
-status = waiting_approval
-approval_required = True
-pending_approval_id = ...
-pending_tool_call_id = ...
-pending_tool_name = ...
-pending_tool_args = ...
-```
-
-然后 dispatcher 看到 `waiting_approval`，直接路由到 END。这个设计保证危险工具不会在用户审批前执行。
-
-**亮点四：route plan 与 agent 节点解耦。**
-
-planner 只决定路线，不直接执行工具、不直接检索、不直接写记忆。这样以后要新增一个 agent 节点，只要把它注册到 graph 和 planner route 即可。
-
-### 9.1.5 面试官可能怎么追问
-
-**问题：为什么不用 LangChain AgentExecutor，为什么要用 LangGraph？**
-
-你可以答：
-
-> AgentExecutor 更适合简单 ReAct 工具调用，但这个项目有审批中断、Memory 写入、RAG 检索、Skill 复用、最终评估等多个阶段。我需要明确的状态图、条件边、节点级观测和恢复点，所以选了 LangGraph StateGraph。StateGraph 能让我把复杂 Agent 拆成稳定节点，而不是让 LLM 在一个循环里自由决定所有事情。
-
-**问题：你这个 router 在哪里？**
-
-你可以答：
-
-> 严格说没有独立 router node。我把路由能力拆成 planner、supervisor_observer、llm_supervisor_route 和 dispatch_next_route_node。planner 生成 route plan，supervisor 观察运行状态，llm_supervisor_route 可选让 LLM 接管并重写 route plan（full 模式下），dispatcher 根据 completed_nodes 和 waiting_approval 返回下一个节点名。这样比单独一个 router 节点更容易测试和维护，且 LLM supervisor 可以在需要时动态调整执行计划。
-
-**问题：checkpoint 真的能恢复吗？**
-
-你可以答：
-
-> 能。当前默认开启 PostgresSaver（AsyncPostgresSaver，agent_checkpointer_backend=postgres），agent_checkpointer_require_durable=True。审批暂停时 LangGraph interrupt() 把 checkpoint 写入 PG 的 checkpoints、checkpoint_blobs、checkpoint_writes 三张表。恢复时 agent_service 先在图外执行工具，再 Command(resume=...) 从 checkpoint 精确恢复——不重跑 graph，不产生 stale state。跨进程 recovery E2E 已验证通过。同时有 approval expiry（24h TTL）防止悬挂，checkpoint cleanup（7d/30d TTL）防止 PG 膨胀。
 
 ---
 
-## 9.2 模块二：MCP Tool Governance 工具治理、安全分级与审批层
+# 模块一：Agent Runtime 编排
 
-### 9.2.1 这个模块解决什么问题
+## 3.5 Runtime 模块要怎么“讲透”
 
-Agent 平台最危险的地方不是回答错一句话，而是它能调用工具。工具一旦能写文件、发邮件、删数据、访问外部系统，就必须有治理层。
+Runtime 是整个项目的骨架。你可以把它理解成“Agent 的执行操作系统”。如果没有 Runtime，项目里其他能力都会变成松散函数：RAG 是一个检索函数，MCP 是一个工具执行函数，Memory 是一个保存偏好的函数，Skill 是一个匹配函数。Runtime 的价值在于，它把这些函数组织成一次完整、可观测、可恢复的 Agent 执行过程。
 
-如果没有治理层，会出现这些风险：
+面试官听 Runtime 时，真正想知道的不是“你用了 LangGraph”，而是下面几个问题：
 
-1. 模型误判用户意图，直接执行危险操作。
-2. 工具参数不完整或格式错误，执行出错。
-3. 外部写入动作没有用户确认。
-4. 高危操作没有阻断。
-5. 事后不知道调用了哪个工具、传了什么参数、是否审批。
+1. 你为什么要把 Agent 拆成节点？
+2. 节点之间怎么传状态？
+3. 谁决定下一步走哪个 agent？
+4. 工具审批这种中途暂停怎么恢复？
+5. 出错以后怎么知道错在哪？
 
-所以你做的 MCP 工具治理层，本质上是：
+你的项目对这几个问题都有工程回答：
 
-> 把所有工具调用收敛到统一入口，在执行前做注册、参数校验、风险分级、审批拦截和审计记录。
+- 节点拆分：用 `StateGraph(AgentRuntimeState)` 注册 permission、planner、read、agent、eval、final 节点。
+- 状态传递：用 `AgentRuntimeState` 作为共享状态总线。
+- 路由决策：由 `planner` 生成 route_plan，`llm_supervisor_route` 可选改写，`dispatch_next_route_node` 做条件跳转。
+- 审批恢复：用 `interrupt()` 暂停，用 PostgresSaver checkpoint 保存，用 `Command(resume=...)` 恢复。
+- 可观测性：用 AgentRun、AgentStep、AgentEvent、ToolCall、LLMCall、runtime_latency_trace 记录每一步。
 
-一句话讲给面试官：
+所以 Runtime 模块的面试核心不是“LangGraph 会用”，而是：
 
-> 我没有让 LLM 直接调用 Python 函数，而是做了 MCP ToolExecutor。工具先注册成 MCPToolSpec，带 input_schema、output_schema、safety_level 和 requires_approval。执行时统一经过 PermissionGuard：L3 生成人工审批，L4 默认阻断。所有 ToolCall、Approval、AgentEvent 都落库，形成审计链路。
+> 我把 Agent 执行抽象成一个可恢复的状态机，每个节点只做一类状态变更，所有副作用都能被记录和审计，高风险操作可以在图中暂停并恢复。
 
-### 9.2.2 你具体怎么做的
+## 3.6 Runtime 为什么不能写成一个大函数
 
-这个模块可以拆成五层：
-
-```mermaid
-flowchart TD
-    A["Tool Request"] --> B["MCP Registry"]
-    B --> C["Schema / Required Fields Validation"]
-    C --> D["PermissionGuard Risk Decision"]
-    D --> E{"Risk Level"}
-    E -->|L0/L1/L2| F["Execute Tool"]
-    E -->|L3| G["Create Approval"]
-    E -->|L4| H["Block"]
-    F --> I["ToolCall completed/failed"]
-    G --> J["waiting_approval"]
-    H --> K["blocked/high_risk_denied"]
-    I --> L["Audit Records"]
-    J --> L
-    K --> L
-```
-
-第一层：工具注册。  
-在 `registry.py` 中，内置工具被声明成 `BUILTIN_TOOLS`。每个工具包含：
-
-| 字段 | 作用 |
-|---|---|
-| `name` | 工具名，例如 `local_file.write`、`email.send` |
-| `description` | 工具说明 |
-| `category` | 工具分类 |
-| `input_schema` | 输入字段描述 |
-| `output_schema` | 输出字段描述 |
-| `safety_level` | 风险等级 |
-| `requires_approval` | 是否需要审批 |
-| `enabled` | 是否启用 |
-| `aliases` | 工具别名 |
-
-`ensure_builtin_tools()` 会把这些工具同步到数据库。这样工具不是写死在执行逻辑里，而是有统一 registry 和持久化记录。
-
-第二层：工具参数校验。  
-`tool_router.py` 里的 `validate_tool_input()` 会根据工具 schema 检查 required 字段，并做一些格式校验，比如 email。  
-真实边界是：它不是完整 JSON Schema validator，而是针对项目内置工具的工程校验。
-
-第三层：风险分级。  
-工具风险分成 L0-L4：
-
-| 等级 | 含义 | 示例 |
-|---|---|---|
-| L0 | 只读/无副作用 | 读取状态、搜索记忆 |
-| L1 | 草稿/低风险 | 创建 artifact 草稿 |
-| L2 | 本地低风险写入或只读系统操作 | 某些本地生成动作 |
-| L3 | 外部写入/需要确认 | 写本地文件、发邮件 |
-| L4 | 高危破坏性操作 | 删除文件、危险 shell、破坏性动作 |
-
-第四层：审批和阻断。  
-`PermissionGuard.check_tool_call()` 是关键：
-
-```text
-L3 -> allowed=False, requires_approval=True
-L4 -> allowed=False, requires_approval=False, reason=high_risk_denied
-```
-
-这代表：
-
-| 等级 | 行为 |
-|---|---|
-| L3 | 不执行，创建 Approval，等待用户批准 |
-| L4 | 直接阻断，不进入审批 |
-
-第五层：审计。  
-每次工具调用都会创建 `ToolCall` 记录，包括 tool_name、input、output、permission_level、status、error_message 等。审批会创建 `Approval`。运行过程还会写 `AgentEvent`。
-
-### 9.2.3 L3 审批的完整工作流
-
-以用户说”帮我写一个文件”为例：
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant TA as tool_agent
-    participant MS as MCPService
-    participant EX as ToolExecutor
-    participant PG as PermissionGuard
-    participant DB as DB
-    participant CP as PostgresSaver
-    participant UI as Frontend
-
-    U->>TA: 请写入本地文件
-    TA->>TA: infer/select tool = local_file.write
-    TA->>TA: validate_tool_input
-    TA->>MS: call_tool(tool_name,args)
-    MS->>EX: ToolExecutor.call_tool
-    EX->>DB: create ToolCall(status=pending)
-    EX->>PG: check_tool_call
-    PG-->>EX: requires_approval=True
-    EX->>DB: create Approval(status=pending)
-    EX-->>TA: status=waiting_approval, approval_id
-    TA->>TA: 保存 pending 字段
-    TA->>CP: interrupt(payload) → checkpoint 写入 PG
-    TA-->>UI: GraphInterrupt → SSE: approval_required
-    UI-->>U: 展示审批卡片
-```
-
-这里最关键的是：  
-**ToolExecutor 在审批前不会调用真实 provider，tool_agent 通过 LangGraph interrupt() 暂停，checkpoint 持久化到 PostgresSaver。**
-
-也就是说，L3 工具在用户确认前只创建审批记录，不执行写文件/发邮件。即使服务重启，checkpoint 还在 PG 里。
-
-### 9.2.4 用户批准后的恢复工作流
-
-用户点击批准后，不是重新让模型决定一次工具调用，而是走 interrupt resume：
-
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant AS as ApprovalService
-    participant AG as AgentService
-    participant EX as ToolExecutor
-    participant G as AgentRuntime
-    participant CP as PostgresSaver
-    participant F as FinalResponse
-
-    U->>AS: approve approval_id
-    AS->>AS: 校验 approval 属于当前 user/run
-    AS->>AS: 如果超时→expired, 拒绝执行
-    AS->>AS: 更新 approval.status=approved
-    AS->>AG: resume_run_after_approval
-    AG->>EX: execute_approved_tool(tool_call_id) ← 图外执行
-    EX->>EX: 真正执行工具
-    EX-->>AG: result
-    AG->>G: resume_from_interrupt(Command(resume={"action":"approved",...}))
-    G->>CP: PostgresSaver 加载 checkpoint (thread_id=run:{run_id})
-    G->>G: graph 从 interrupt() 点继续，不重跑
-    G->>F: 生成最终回复
-```
-
-**对比旧架构（已废弃）：**
-
-| 方面 | 旧（END-based） | 新（interrupt + Command(resume)） |
-|---|---|---|
-| 暂停方式 | dispatch 返回 END | LangGraph interrupt() |
-| 状态存储 | agent_runs.graph_state (JSONB) | PostgresSaver 4 张表 |
-| 恢复方式 | 从 entry_point 重跑整个 graph | Command(resume=...) 精确继续 |
-| 跨进程 | 依赖 DB 读 graph_state | 真正的 checkpoint recovery |
-| stale state | 需要 aggressive sanitize | 不需要（不重跑） |
-
-这套设计的意义：
-
-1. 审批前不执行。
-2. 批准后执行的是之前保存的 tool_call，而不是让 LLM 重新生成参数。
-3. 工具在图外执行（agent_service），结果通过 Command(resume=...) 传回 graph。
-4. graph 从 interrupt() 精确继续，不重跑，无 stale state。
-5. 审计链路能看见：谁发起、谁批准、执行结果是什么。
-6. 审批超时 24h 自动过期，防止永久悬挂。
-
-### 9.2.5 L4 阻断工作流
-
-L4 不走审批，而是直接拒绝：
-
-```text
-tool_agent
-  -> MCPService.call_tool
-  -> ToolExecutor.call_tool
-  -> PermissionGuard.check_tool_call
-  -> reason = high_risk_denied
-  -> ToolCall.status = blocked
-  -> final_response 告知不能执行
-```
-
-为什么 L4 不审批？  
-因为审批不是万能安全机制。有些动作即使用户点了批准，也不应该让 Agent 自动做，比如破坏性删除、危险命令。这是保守安全策略。
-
-面试时你可以讲：
-
-> 我把 L3 和 L4 区分开。L3 是“可以做，但需要人确认”的动作；L4 是“当前系统策略下不允许 Agent 做”的动作。这样能避免把所有风险都甩给用户审批。
-
-### 9.2.6 这个模块最重要的工程亮点
-
-**亮点一：工具调用统一入口。**  
-LLM 不能绕过 MCPService 直接调用 provider。
-
-**亮点二：工具 spec 和执行解耦。**  
-工具信息在 registry/spec 层，执行逻辑在 executor/provider 层。以后接外部 MCP server，也可以复用治理逻辑。
-
-**亮点三：审批是中断，不是弹窗装饰。**  
-L3 工具会让 `tool_agent` 设置 `waiting_approval`，dispatcher 直接 END。Graph 不会继续假装任务完成。
-
-**亮点四：L4 默认拒绝。**  
-高危动作不是“请用户确认一下”，而是系统层 blocked。
-
-**亮点五：审计链路完整。**  
-ToolCall、Approval、AgentEvent 可以还原一次工具调用生命周期。
-
-### 9.2.7 面试官可能怎么追问
-
-**问题：MCP 工具注册怎么做？**
-
-> 我在 registry 里定义 MCPToolSpec，每个工具有 name、input_schema、output_schema、safety_level、requires_approval、enabled 等字段。启动或调用前会 ensure_builtin_tools，把内置工具同步到 DB。执行时通过 registry 找 spec，而不是直接调用函数。
-
-**问题：Schema 校验是不是完整 JSON Schema？**
-
-> 当前不是完整 JSON Schema validator，而是根据 spec 做 required 字段和部分格式校验，比如 email。原因是目前主要治理内置工具，这样足够覆盖关键失败场景。如果后续接入任意第三方 MCP server，我会引入标准 jsonschema 校验。
-
-**问题：审批怎么保证工具没提前执行？**
-
-> ToolExecutor 在 permission guard 判断 requires_approval 后，只创建 Approval 并返回 waiting_approval，不调用 provider。真正 provider.call 只发生在 execute_approved_tool，也就是审批通过之后。
-
----
-
-## 9.3 模块三：RAG Retrieval System 检索层
-
-### 9.3.1 这个模块解决什么问题
-
-RAG 看起来简单：上传文档、切 chunk、embedding、检索、回答。  
-但真实项目里会遇到很多问题：
-
-1. chunk 太小，命中了但上下文不完整。
-2. chunk 太大，召回不准、embedding 噪声高。
-3. 纯 dense embedding 对合同编号、金额、中文关键词、表格字段不稳定。
-4. 检索优化没有评估指标，只靠主观感受。
-5. 向量库里到底存了哪些 chunk 不清楚，parent/child 容易混。
-
-所以你做的是：
-
-> 用 Parent-Child Chunking 解决上下文粒度问题，用 Qdrant dense + sparse hybrid 解决语义和关键词召回问题，用 RRF 做融合，用 hit@k eval runner 量化效果。
-
-一句话讲给面试官：
-
-> RAG 这块我不是简单切片入库，而是做了 Parent-Child Chunking：child chunk 负责向量检索，parent chunk 负责补上下文。向量库使用 Qdrant hybrid collection，同时写 dense 和 sparse；查询时 dense/sparse 两路召回，在 Qdrant native hybrid 路径用 Fusion.RRF 融合。最后用 synthetic eval runner 评估 hit@5，从 baseline 0.54 到 qdrant_hybrid 0.92。
-
-### 9.3.2 文档摄入工作流
-
-先讲 ingestion，因为检索效果一半来自入库设计。
-
-```mermaid
-flowchart TD
-    A["上传文档"] --> B["parse_document"]
-    B --> C["build_structured_chunks"]
-    C --> D["overview chunk"]
-    C --> E["parent chunks"]
-    C --> F["child chunks"]
-    F --> G["embedding child only"]
-    G --> H["Qdrant upsert child vectors"]
-    D --> I["PostgreSQL save all chunks"]
-    E --> I
-    F --> I
-    H --> I
-```
-
-具体流程：
-
-1. **parse document**  
-   文档先经过解析器，抽取文本、标题、页码、表格等 metadata。
-
-2. **structured chunker 生成三类 chunk**  
-   `build_structured_chunks()` 会生成：
-
-   | chunk 类型 | 作用 | 是否写 Qdrant |
-   |---|---|---|
-   | overview | 文档整体概览 | 否 |
-   | parent | 较大语义段落/章节 | 否 |
-   | child | 检索粒度的小片段 | 是 |
-
-3. **只 embedding child chunks**  
-   这点非常重要。不是所有 chunk 都写向量库。只有 `metadata.chunk_role == "child"` 的 chunk 会写 Qdrant。
-
-4. **保存所有 chunk 到 PostgreSQL**  
-   parent/overview 虽然不写向量库，但保存在 DB。检索命中 child 后，根据 child 的 `parent_id` 回查 parent。
-
-这个设计为什么好？
-
-| 问题 | 解决方式 |
-|---|---|
-| child 太短导致回答不完整 | 命中 child 后补 parent_context |
-| parent 太长导致召回不准 | parent 不直接参与向量召回 |
-| overview 影响检索噪声 | overview 不写 Qdrant，只用于文档结构 |
-| 无法解释命中位置 | child 带 parent_id、heading_path、page/sheet metadata |
-
-### 9.3.3 Parent-Child Chunking 怎么讲清楚
-
-你可以用这个例子：
-
-```text
-文档：合同说明
-
-Parent p-0001:
-  第 1 节 合同基本信息
-  合同编号：HT-2026-001
-  甲方：...
-  金额：128000
-  支付方式：...
-
-Child p-0001-c-001:
-  合同编号：HT-2026-001
-
-Child p-0001-c-002:
-  金额：128000，支付方式：...
-```
-
-用户问“合同编号是多少？”  
-检索时 child `p-0001-c-001` 更容易命中，因为它短、关键词集中。  
-回答时系统再拿 parent `p-0001` 补上下文，避免只给一个孤立编号。
-
-面试说法：
-
-> child 是检索单元，parent 是回答上下文单元。这样兼顾 recall precision 和 answer completeness。
-
-### 9.3.4 Qdrant Hybrid Search 工作流
-
-纯 dense embedding 对语义问题很好，但对精确信息不稳定，比如：
-
-| Query 类型 | 纯 dense 风险 |
-|---|---|
-| 合同编号是多少 | 编号不是语义概念，embedding 可能弱 |
-| 邮箱是什么 | token 精确匹配更重要 |
-| 中文关键词“稀疏向量缺失” | 中文分词和 embedding 可能漂移 |
-| 表格字段 | 字段名、数值、单位都需要 lexical signal |
-
-所以你做了 hybrid：
-
-```mermaid
-flowchart LR
-    Q["Query"] --> DE["Dense Embedding"]
-    Q --> SE["Sparse Encoding"]
-    DE --> DP["Qdrant Dense Prefetch"]
-    SE --> SP["Qdrant Sparse Prefetch"]
-    DP --> RRF["Fusion.RRF"]
-    SP --> RRF
-    RRF --> TOP["Top K child hits"]
-    TOP --> PARENT["Parent Context Enrichment"]
-    PARENT --> RERANK["Rerank / Final Score"]
-```
-
-入库时：
-
-```text
-child content
-  -> dense embedding vector
-  -> sparse vector
-  -> Qdrant point vector = {dense_name: dense, sparse_name: sparse}
-```
-
-查询时：
-
-```text
-query
-  -> dense query vector
-  -> sparse query vector
-  -> Qdrant query_points(prefetch=[dense, sparse], query=FusionQuery(Fusion.RRF))
-```
-
-这里的 RRF 是 Qdrant 原生 Fusion.RRF。它把 dense 和 sparse 两路召回按排名融合，而不是简单加权分数。好处是不同召回器的分数尺度不需要完全一致。
-
-### 9.3.5 RRF 怎么讲
-
-RRF 全称 Reciprocal Rank Fusion。  
-直觉上，它不太关心每个检索器给的原始分数，而是关心“这个文档在各个检索器里排第几”。
-
-一个简单例子：
-
-| chunk | dense rank | sparse rank | RRF 后 |
----|---:|---:|---:|
-| A | 1 | 20 | 仍然较高 |
-| B | 8 | 1 | 也会较高 |
-| C | 5 | 5 | 稳定靠前 |
-
-如果一个 chunk 在 dense 和 sparse 里都排名不错，它会被强化。  
-如果只在其中一路特别高，也不会被完全忽略。
-
-面试时你不需要讲公式，讲工程意义就够：
-
-> RRF 适合 hybrid，因为 dense 和 sparse 的分数尺度不一样。直接加分会有校准问题，RRF 按 rank 融合，更稳。
-
-### 9.3.6 检索后的 parent enrichment
-
-Qdrant 返回的是 child hits，但最终回答不能只看 child。  
-所以 retriever 会做：
-
-```text
-for each child_hit:
-    parent_id = child_hit.metadata.parent_id
-    parent = DocumentChunkRepository.get_parent(document_id, parent_id)
-    child_hit.parent_context = parent.content
-```
-
-这样 final response 能拿到：
-
-| 字段 | 作用 |
-|---|---|
-| `content` | child 命中内容 |
-| `parent_context` | 更完整上下文 |
-| `citation` | 文档名、chunk_id、parent_id |
-| `heading_path` | 章节路径 |
-| `page_number/sheet_name` | 页码/表格来源 |
-
-### 9.3.7 fallback 设计
-
-Qdrant hybrid 不一定永远可用，比如：
-
-1. collection schema 不是 hybrid。
-2. sparse encoder 不可用。
-3. Qdrant 服务异常。
-4. 老数据没有 sparse vector。
-
-所以 retriever 里保留了 Python BM25 hybrid fallback。  
-它的工作方式大致是：
-
-```text
-vector search
-local BM25 search from PostgreSQL child candidates
-merge hits
-weighted rerank
-parent enrichment
-```
-
-注意：fallback 不是 RRF，而是本地 weighted merge/rerank。  
-面试一定要讲清楚：
-
-> RRF 是 Qdrant native hybrid 路径；fallback 是 Python BM25 + vector merge。
-
-### 9.3.8 hit@5 评估怎么做
-
-你做了 `scripts/run_rag_hybrid_eval.py`，这点非常关键，因为它让 RAG 优化有指标。
-
-评估流程：
-
-```mermaid
-flowchart TD
-    A["准备 synthetic fixture docs"] --> B["DocumentService ingest"]
-    B --> C["validate ingestion"]
-    C --> D["Run queries on python_bm25"]
-    C --> E["Run queries on qdrant_hybrid"]
-    D --> F["compute hit@1/hit@3/hit@5"]
-    E --> F
-    F --> G["write Markdown report"]
-    F --> H["write JSONL details"]
-```
-
-它不是只看“有没有返回结果”，而是看 top-k 结果里是否命中 expected keyword。
-
-指标包括：
-
-| 指标 | 含义 |
-|---|---|
-| hit@1 | 第一个结果是否命中 |
-| hit@3 | 前 3 个结果是否命中 |
-| hit@5 | 前 5 个结果是否命中 |
-| keyword_hit_rate | 关键词命中率 |
-| fallback_count | fallback 次数 |
-| warning_count | 警告次数 |
-| avg_latency_ms | 平均延迟 |
-
-历史报告中存在：
-
-```text
-python_bm25 hit@5 = 0.54
-qdrant_hybrid hit@5 = 0.92
-```
-
-面试讲法要非常稳：
-
-> 这个 0.54 到 0.92 是 synthetic benchmark 上 backend 对比，不是线上 A/B。我保留了 Markdown 和 JSONL 报告，用来做可复现评估和防回归。
-
-### 9.3.9 这个模块最重要的工程亮点
-
-**亮点一：child-only vector upsert。**  
-这避免 parent/overview 污染向量检索。
-
-**亮点二：parent context enrichment。**  
-这解决了小 chunk 命中但回答上下文不够的问题。
-
-**亮点三：dense + sparse hybrid。**  
-语义召回和关键词召回互补。
-
-**亮点四：Qdrant native RRF。**  
-用 rank fusion 避免不同检索器分数不可比。
-
-**亮点五：有 eval runner。**  
-RAG 优化有 hit@k 指标和历史报告，不是凭感觉。
-
-### 9.3.10 面试官可能怎么追问
-
-**问题：为什么 Parent-Child 比普通 chunk 好？**
-
-> 普通 chunk 要在“检索精度”和“上下文完整性”之间二选一。chunk 小，召回准但信息不完整；chunk 大，上下文完整但召回噪声高。Parent-Child 把这两个目标拆开：child 负责召回，parent 负责补上下文。
-
-**问题：Qdrant hybrid 比你原来的 BM25 fallback 好在哪里？**
-
-> 原来的 fallback 是本地 BM25 和 vector merge，能工作，但融合和索引都在应用层。Qdrant hybrid 把 dense/sparse 都放进向量库，由 Qdrant 做 native prefetch 和 RRF，结构更统一，也更适合后续扩展过滤、索引和线上化。
-
-**问题：0.54 到 0.92 是怎么来的？**
-
-> 是项目 synthetic eval 的结果。baseline 是 python_bm25 backend，hit@5 0.54；qdrant_hybrid backend hit@5 0.92。这个数据集不是线上真实用户，而是固定测试文档和 query，用来验证中文关键词、合同编号、摘要类问题等场景。
-
----
-
-## 9.4 模块四：Memory / GSSC / Skill 记忆、上下文与复用层
-
-### 9.4.1 这个模块解决什么问题
-
-Agent 如果没有记忆，每次对话都像第一次见用户。  
-但如果把所有历史都塞进 prompt，又会产生上下文污染、token 爆炸和错误个性化。
-
-你这个模块解决的是三个问题：
-
-1. **什么值得记住**：从对话里抽取偏好、项目目标、技术栈、历史任务事件。
-2. **什么时候拿出来用**：不同任务只注入相关 memory，不是全部塞进去。
-3. **重复 workflow 能否复用**：把成功任务沉淀成 Skill 草稿，下次匹配后注入上下文。
-
-所以这个模块其实由三部分组成：
-
-| 子模块 | 解决问题 |
-|---|---|
-| Memory | 长期/短期信息怎么存、怎么检索、怎么固化 |
-| GSSC | 多源上下文怎么选择、组织、压缩 |
-| Skill | 成功 workflow 怎么沉淀、匹配和复用 |
-
-一句话讲给面试官：
-
-> 我做了一个 Memory + GSSC + Skill 的上下文层。Memory 负责抽取、去重、固化和召回；GSSC 负责根据 route、answer_mode 和 token budget 选择上下文；Skill 负责把可复用 workflow 变成草稿，并在后续请求中匹配后注入上下文。
-
----
-
-## 9.4.A Memory 三层记忆系统
-
-### 9.4.A.1 三层记忆分别是什么
-
-你的 memory 分成 working、episodic、semantic：
-
-| 类型 | 生命周期 | 存什么 | 示例 |
-|---|---|---|---|
-| working | 当前任务/短期 | 当前页面、选中卡片、临时上下文 | 用户当前在看某个 FeedCard |
-| episodic | 中期事件 | 用户做过什么任务、发生过什么交互 | 用户启动过一次深度研究 |
-| semantic | 长期稳定事实 | 偏好、目标、技术栈、边界约束 | 用户偏好中文、正在做 Agent OS |
-
-这三个类型不是为了好听，而是为了控制“什么时候注入什么”。
-
-比如用户问“我叫什么？”可以注入 name_preference。  
-用户随便问“Python list 怎么排序？”不应该注入他的项目目标、技术栈、历史 research 记录。  
-用户问“继续上次那个 Agent OS 项目”时，才应该注入 project_goal、tech_stack、workflow_pattern。
-
-### 9.4.A.2 Memory 写入工作流
-
-```mermaid
-flowchart TD
-    A["Agent 输出 + 用户输入"] --> B["Memory Agent"]
-    B --> C{"是否 casual chat"}
-    C -->|是| D["Regex Extractor"]
-    C -->|否| E["LLM Extractor"]
-    E -->|失败| D
-    D --> F["working / episodic / semantic candidates"]
-    E --> F
-    F --> G["importance / confidence filter"]
-    G --> H["add_with_dedup"]
-    H --> I{"similar memory exists?"}
-    I -->|是| J["update evidence_count / last_seen / importance"]
-    I -->|否| K["create memory in PostgreSQL"]
-    J --> L["Qdrant update if semantic/episodic"]
-    K --> L
-    L --> M["consolidation"]
-```
-
-步骤解释：
-
-1. **Memory Agent 拿到上下文**  
-   它会拿用户输入、Agent 输出、page_context、feed_card_context、matched_skill、created_skill_draft。
-
-2. **优先 LLM 抽取，失败 fallback regex**  
-   对非 casual chat，`LlmMemoryExtractor` 会调用 memory 模型，要求输出结构化 JSON。  
-   如果 LLM 失败，回退到 deterministic regex extractor。
-
-3. **抽取三类 memory candidates**  
-   extractor 会输出：
-
-   ```text
-   working_memories
-   episodic_memories
-   semantic_memories
-   should_consolidate
-   ```
-
-4. **confidence / importance 过滤**  
-   不是抽出来就保存。低置信度、低重要度会被过滤。
-
-5. **去重写入**  
-   `add_with_dedup()` 会找相似 memory。如果找到，就更新旧 memory，而不是新增重复记录。
-
-6. **semantic/episodic 写 Qdrant**  
-   PostgreSQL 是权威存储，Qdrant 用于语义检索。working 通常不进 Qdrant。
-
-7. **固化/晋升**  
-   高重要度 working 可以晋升 episodic；高稳定性 episodic 可以晋升 semantic。
-
-### 9.4.A.3 去重怎么做
-
-你不是简单按字符串完全相等去重，而是 `_find_similar()` 做相似度判断。它会搜索同类型 memory，然后用归一化文本、Jaccard、字符 n-gram 等方式估计相似度。
-
-如果相似度超过阈值，会 `_update_existing()`：
-
-| 字段 | 更新方式 |
-|---|---|
-| `evidence_count` | +1，说明多次被观察到 |
-| `last_seen_at` | 更新时间 |
-| `importance` | 取更高值并小幅增强 |
-| `metadata` | 合并新证据 |
-| Qdrant point | 如果存在则更新向量 payload |
-
-这就是你可以讲的“记忆去重与证据累积”。
-
-面试说法：
-
-> 我没有每次都新增 memory。保存前会查找相似记忆，如果用户重复表达同一偏好，就更新已有 memory 的 evidence_count、last_seen_at 和 importance。这样长期记忆会越来越稳定，而不是越来越乱。
-
-### 9.4.A.4 固化怎么做
-
-固化就是 memory 从短期变长期：
-
-```text
-working -> episodic
-episodic -> semantic
-```
-
-规则大概是：
-
-| 晋升路径 | 条件 |
-|---|---|
-| working → episodic | importance 足够高 |
-| episodic → semantic | importance 高、不是 temporary、evidence_count 足够、category 属于长期类别 |
-
-为什么要固化？  
-因为用户一次临时行为不一定代表长期偏好。比如用户某次让你“这次用英文”，不应该立刻变成“用户长期偏好英文”。但如果他多次表达“以后都用中文”，就可以固化为 semantic memory。
-
-### 9.4.A.5 Memory 读取和任务感知筛选
-
-Memory 读取不是全量加载，而是三步：
-
-1. `search_memory(user_id, query)` 做 query-aware 搜索。
-2. `get_baseline_memories()` 取稳定 profile/project 类 memory。
-3. `MEMORY_CONTEXT_POLICY` 根据 answer_mode 过滤类别。
-
-例如：
-
-| answer_mode | 允许注入的 memory |
-|---|---|
-| casual | name、language、tone |
-| general_qa | name、language、answer_preference、tone |
-| rag_qa | name、language、document_preference |
-| tool_action | name、language、tool_preference、boundary |
-| project_advice | project_goal、tech_stack、boundary、workflow_pattern 等 |
-
-这个设计很重要，因为它避免“上下文污染”。  
-用户问普通技术问题时，不应该每次都塞进“我在做 Agent OS”。
-
----
-
-## 9.4.B GSSC 动态上下文工程
-
-### 9.4.B.1 GSSC 是什么
-
-GSSC 可以讲成：
-
-```text
-Gather -> Select -> Structure -> Compress
-```
-
-| 阶段 | 做什么 |
-|---|---|
-| Gather | 收集多源上下文 |
-| Select | 根据 route 权重、相关性、token budget 选择 |
-| Structure | 按固定 section 组织 |
-| Compress | 超预算时压缩 |
-
-它解决的问题是：Agent 的上下文来源太多，不可能无脑塞。
-
-上下文来源包括：
-
-| 来源 | 示例 |
-|---|---|
-| task | 当前用户问题 |
-| profile | 用户画像 |
-| memory | 长期/短期记忆 |
-| evidence | RAG 检索证据 |
-| feed_card | 当前卡片 |
-| page_context | 当前页面 |
-| conversation_history | 最近对话 |
-| conversation_summary | 会话摘要 |
-| checkpoint_summary | 前序执行摘要 |
-| dynamic_preferences | 动态偏好 |
-| graph_context | 图谱上下文 |
-| output_contract | 输出要求 |
-
-### 9.4.B.2 GSSC 工作流
-
-```mermaid
-flowchart TD
-    A["parallel_read_stage"] --> B["load conversation history"]
-    A --> C["load memory"]
-    A --> D["load rag evidence"]
-    A --> E["load feed/page context"]
-    A --> F["load graph context"]
-    B --> G["ContextBuilder.gather"]
-    C --> G
-    D --> G
-    E --> G
-    F --> G
-    G --> H["select by route weights + token budget"]
-    H --> I["structure into sections"]
-    I --> J["compress if needed"]
-    J --> K["state.context.gssc_context"]
-    K --> L["final_response prompt"]
-```
-
-### 9.4.B.3 route-aware 权重怎么理解
-
-不同任务需要不同上下文。
-
-比如：
-
-| route | 更重要的上下文 |
-|---|---|
-| chat | conversation_history、memory、profile |
-| rag | evidence、task、conversation_history |
-| research | feed_card、evidence、checkpoint_summary |
-| tool | task、conversation_history、evidence |
-| skill | memory、conversation_history、dynamic_preferences |
-
-这就是 `_ROUTE_WEIGHTS` 的作用。  
-它让 GSSC 在 token budget 不够时知道优先保留什么。
-
-面试说法：
-
-> GSSC 不是简单拼 prompt。它会根据 route 给不同 source 分配权重，比如 rag 任务优先保留 evidence，chat 任务优先保留 conversation history 和 memory，tool 任务优先保留 task 和 tool state。然后在 token budget 内选择最相关的上下文。
-
-### 9.4.B.4 Structure 阶段怎么组织 prompt
-
-GSSC 会把上下文组织成固定 section，例如：
-
-```text
-[Role & Policies]
-[User Profile]
-[Task]
-[Conversation History]
-[Relevant Memory]
-[Evidence]
-[Tool State]
-[Output Contract]
-[Checkpoint Summary]
-[Dynamic Preferences]
-[Graph Context]
-```
-
-这样 final_response 看到的不是一坨混乱文本，而是结构化上下文。
-
-这对 LLM 很重要，因为模型更容易遵守：
-
-1. 哪些是用户问题。
-2. 哪些是历史对话。
-3. 哪些是记忆。
-4. 哪些是文档证据。
-5. 哪些是输出约束。
-
-### 9.4.B.5 GSSC 的真实边界
-
-GSSC 是工程启发式，不是深度学习模型。  
-你可以讲它是“route-aware context builder”，不要讲成“自研动态上下文学习算法”。
-
-真实实现有：
-
-| 能力 | 是否有 |
-|---|---|
-| 多源 gather | 有 |
-| route-aware weights | 有 |
-| token budget select | 有 |
-| section structure | 有 |
-| simple compression | 有 |
-| selected/dropped debug | 有 |
-| 学习型上下文优化 | 没有 |
-
-面试时这样讲非常稳：
-
-> 我这里的 GSSC 是工程化上下文管理，不是论文级 optimizer。它的价值是把上下文选择显式化、可调试化，能看到 selected_sources、dropped_sources 和 token_budget_used。
-
----
-
-## 9.4.C Skill 复用层
-
-### 9.4.C.1 Skill 复用想解决什么
-
-很多 Agent 任务是重复的：
-
-1. 用户经常让 Agent 做某类研究。
-2. 经常需要同样的输出格式。
-3. 经常使用同一组工具。
-4. 经常对同一类 FeedCard 做分析。
-
-如果每次都从零规划，成本高、行为不稳定。  
-所以 Skill 的目标是：
-
-> 把成功任务的 workflow 沉淀下来，后续相似任务命中后复用其 trigger、tool_plan、context_recipe 和 output_contract。
-
-### 9.4.C.2 当前 Skill 的真实能力
-
-当前项目中 Skill 是“复用雏形”，不是完整自动执行引擎。
-
-已经实现：
-
-| 能力 | 说明 |
-|---|---|
-| Skill 模型 | DB 中有 name、trigger_text、input_schema、context_recipe、tool_plan、output_schema、safety_level、status |
-| 创建草稿 | `create_skill_draft_from_run()` |
-| 评估可复用性 | `evaluate_reusability()` |
-| 匹配已有 Skill | `match_skill()` |
-| 命中后上下文注入 | `skill_matcher` 把 Skill block 拼入 GSSC |
-| 使用统计 | `record_skill_usage()` |
-| 重复 workflow 检测 | `detect_repeated_workflow()` |
-
-还没有完整实现：
-
-| 能力 | 状态 |
-|---|---|
-| 把 Skill 编译成可执行 LangGraph 子图 | 未发现 |
-| 自动按 tool_plan 逐步执行 | 未完整实现 |
-| Skill 版本演进和自动优化 | 只有统计雏形 |
-
-### 9.4.C.3 Skill 草稿生成工作流
-
-```mermaid
-flowchart TD
-    A["Agent run finished"] --> B["skill_agent"]
-    B --> C["evaluate_reusability"]
-    C --> D{"score >= 0.70?"}
-    D -->|否| E["不生成，只记录"]
-    D -->|是| F["create_skill_draft_from_run"]
-    F --> G["保存 Skill 草稿"]
-    G --> H["created_skill_draft 写入 state"]
-    H --> I["memory_agent 可记录 skill_creation episodic memory"]
-```
-
-`evaluate_reusability()` 会看几个信号：
-
-| 信号 | 说明 |
-|---|---|
-| repeatability | 用户是否表达“以后/下次/复用/流程”等 |
-| workflow_structure | route 是否属于 research/rag/tool/artifact/skill |
-| artifact_output | 是否产出了 artifact |
-| tool_chain | 是否涉及工具链 |
-| user_intent | 用户是否明确要保存成 skill |
-| successful | run 是否成功 |
-
-如果分数够高，就生成 Skill 草稿。
-
-### 9.4.C.4 Skill 匹配工作流
-
-```mermaid
-flowchart TD
-    A["新用户请求"] --> B["skill_matcher"]
-    B --> C["load user's skills"]
-    C --> D["skip disabled"]
-    D --> E["terms overlap + trigger phrase scoring"]
-    E --> F{"approved && score >= 0.75?"}
-    F -->|是| G["matched_skill"]
-    F -->|否| H["candidate_skills only"]
-    G --> I["inject skill block into gssc_context"]
-    I --> J["后续 planner/final_response 可参考"]
-```
-
-命中 approved skill 后，会把这类信息注入上下文：
-
-```text
-Reusable Skill Applied:
-- Skill Name
-- Why matched
-- Expected Inputs
-- Execution Steps
-- Output Contract
-- Constraints
-```
-
-这意味着 Skill 当前更多是“上下文 contract”和“workflow memory”，而不是直接执行器。
-
-### 9.4.C.5 面试怎么讲 Skill 才不翻车
-
-不要说：
-
-> 我实现了自动执行 Skill 的完整工作流引擎。
-
-要说：
-
-> 我实现了 Skill 复用的第一阶段：识别可复用 workflow、生成 Skill 草稿、匹配 approved Skill，并把它的 workflow steps、tool plan 和 output contract 注入上下文，指导后续 Agent 执行。下一步会把 approved Skill 编译成受 MCP 权限约束的可执行子图。
-
-这个说法非常稳，因为它准确对应当前代码。
-
----
-
-## 9.5 四大模块如何串成一个完整故事
-
-面试时不要把四个模块散着讲。你要讲成一个完整 Agent 平台故事：
-
-> 我做的是一个工程化 Agent Runtime。用户请求进来后，LangGraph Runtime 先做权限、意图和规划，生成 RoutePlan。然后 parallel_read_stage 通过 GSSC 准备上下文，包括 Memory、Conversation History、RAG evidence、FeedCard 和 Skill。  
-> 
-> 如果任务需要查文档，就走 RAG：文档摄入阶段用了 Parent-Child Chunking，检索阶段用了 Qdrant dense+sparse hybrid 和 RRF，命中 child 后再回查 parent context。  
-> 
-> 如果任务需要工具，就走 MCP Tool Governance：工具统一 registry，执行前做参数校验、L0-L4 风险分级，L3 进入审批中断，L4 直接阻断，所有 ToolCall 和 Approval 落库审计。  
-> 
-> 如果任务产生了有价值的用户偏好或项目事实，就走 Memory：抽取、过滤、去重、固化，并在后续任务通过 GSSC 按需注入。  
-> 
-> 如果一次任务体现出可重复 workflow，就走 Skill：生成草稿，后续匹配 approved Skill 后注入上下文。最后 evaluator 做约束检查，final_response 基于结构化上下文生成最终答案。
-
-这段就是你的总讲法。
-
----
-
-## 9.6 你可以背下来的 4 段模块讲法
-
-### LangGraph Runtime 30 秒版
-
-> 我用 LangGraph StateGraph 做 Agent Runtime，把一次请求拆成权限检查、意图识别、规划、并行上下文读取、LLM supervisor dispatch、RAG/tool/memory/skill agent、evaluator 和 final_response。节点共享 AgentRuntimeState，每个节点只写自己的结果。路由不是黑盒 router，而是 planner 生成 RoutePlan，LLM supervisor 可选接管改写，dispatcher 返回下一个节点。审批机制是真正的 LangGraph interrupt()：暂停时 checkpoint 写入 PostgresSaver（AsyncPostgresSaver），恢复时 Command(resume=...) 从精确位置继续，不重跑 graph。启动有健康检查，require_durable fail-fast，审批超时自动过期 24h，checkpoint 按 TTL 清理。
-
-### MCP Governance 30 秒版
-
-> 工具调用统一走 MCP ToolExecutor。每个工具先注册成 MCPToolSpec，带 schema、风险等级和 approval_required。执行前校验参数，再交给 PermissionGuard 判断 L0-L4。L3 工具不执行，创建 Approval 并通过 LangGraph interrupt() 暂停 graph（checkpoint 持久化到 PostgresSaver）；L4 高危工具直接 blocked。审批通过后图外执行工具，再 Command(resume=...) 从 checkpoint 恢复，不重跑 graph。审批超过 24h 自动过期。ToolCall、Approval、AgentEvent 都落库，能完整审计。
-
-### RAG 30 秒版
-
-> RAG 摄入阶段我做了 Parent-Child Chunking，只把 child chunk 写 Qdrant，parent/overview 存 PostgreSQL。检索时 child 负责召回，命中后回查 parent_context。向量库升级成 Qdrant hybrid，同时写 dense 和 sparse；查询时两路 prefetch，用 Qdrant Fusion.RRF 融合。最后用 synthetic eval runner 比较 python_bm25 和 qdrant_hybrid，记录 hit@5 从 0.54 到 0.92。
-
-### Memory/GSSC/Skill 30 秒版
-
-> Memory 分 working、episodic、semantic 三层。写入时 LLM 抽取，失败 fallback regex，然后按 confidence/importance 过滤、相似度去重、证据累积和固化。读取时不是全量塞 prompt，而是 GSSC 根据 route、answer_mode、token budget 选择 Memory、RAG evidence、Conversation History 等上下文。Skill 是复用层，会从成功 run 生成草稿，后续匹配 approved Skill 后把 workflow steps、tool_plan、output_contract 注入上下文。
-
----
-
-## 9.7 如果面试官深挖，你要主动承认的边界
-
-能讲清楚边界，反而更像真实做过。
-
-| 模块 | 主动承认边界 | 你再补一句 |
-|---|---|---|
-| Runtime | 没有独立 router node | 路由拆成 planner/supervisor/dispatcher |
-| Checkpoint | 已生产闭环，PostgresSaver + interrupt/Command(resume) | 启动有 health check + require_durable fail-fast；approval 超时自动过期 + TTL 清理 |
-| MCP | 不是完整 JSON Schema validator | 当前覆盖内置工具 required/format，外部 MCP 会升级 jsonschema |
-| RAG | 0.54→0.92 是 synthetic eval | 价值是可复现和防回归，不是线上 A/B |
-| RRF | 只在 Qdrant native hybrid | Python fallback 是 weighted merge/rerank |
-| Memory | store 类薄，主逻辑在 service | MemoryService/Repository/QdrantMemoryStore 是核心 |
-| Skill | 不是自动执行引擎 | 当前是 workflow 识别、草稿、匹配和上下文注入 |
-
-面试里最有杀伤力的不是“我全做完了”，而是：
-
-> 我知道这个系统哪些已经工程闭环，哪些只是第一版能力，下一步怎么补生产级验证。
-
-这句话会让你的项目听起来非常真实。
-
----
-
-## 9.8 最终给你的理解地图
-
-你可以按下面这张图在脑子里记：
-
-```mermaid
-mindmap
-  root((Agent OS))
-    LangGraph Runtime
-      StateGraph
-      AgentRuntimeState
-      Planner RoutePlan
-      Supervisor Dispatcher
-      Evaluator FinalResponse
-      Interrupt + Command(resume)
-      PostgresSaver Checkpoint
-    MCP Governance
-      Registry
-      Tool Spec
-      Required Validation
-      L0-L4 Risk
-      L3 Approval + Interrupt
-      L4 Block
-      ToolCall Audit
-      Approval Expiry 24h
-      Checkpoint Cleanup TTL
-    RAG
-      Document Parse
-      Parent Child Chunking
-      Child Only Vector
-      Qdrant Dense Sparse
-      Fusion RRF
-      Parent Enrichment
-      hit@5 Eval
-    Memory GSSC Skill
-      Working Episodic Semantic
-      LLM Extract Regex Fallback
-      Dedup Evidence Count
-      Consolidation
-      Route-aware GSSC
-      Skill Draft
-      Skill Match Context Inject
-```
-
-你真正要理解的是这条主线：
-
-> LangGraph 管执行流程，MCP 管工具安全，RAG 管知识检索，Memory/GSSC/Skill 管上下文和复用。
-
-这就是你这个项目最完整、最可信、也最能讲清楚的架构故事。
-
----
-
-# 10. 四大模块超详细扩展版：从“我做了什么”讲到“我为什么这么做”
-
-这一章继续往深里讲。前面已经把四个模块的主干讲清楚了，但面试时真正难的不是背名词，而是当面试官连续追问时，你能不能把“一个请求进来以后，每一层发生了什么”讲到足够具体。
-
-你要把自己训练成这样一种表达方式：
-
-> 我先说业务问题，再说我拆的工程模块，再说请求流，再说关键数据结构，再说安全/失败/观测怎么处理，最后说当前边界和下一步优化。
-
-这个表达顺序非常重要。因为面试官不是只想听“我用了 LangGraph、用了 Qdrant、用了 MCP”，他想判断你是不是知道为什么用、怎么串起来、哪里有坑。
-
-下面四个模块我都会按这个顺序讲：
-
-1. **业务问题**
-2. **我的设计目标**
-3. **核心数据结构**
-4. **完整工作流**
-5. **关键代码落点**
-6. **失败路径**
-7. **观测与调试**
-8. **面试讲法**
-9. **容易被追问的点**
-
----
-
-## 10.1 LangGraph Runtime 超详细讲解
-
-### 10.1.1 你到底做了什么
-
-你做的不是“把 LangGraph 接进项目”这么简单。更准确的说法是：
-
-> 我为 Web App 上层实现了一个 Agent Runtime，把一次用户请求拆成多个可观测、可中断、可恢复的执行节点，并且让 planner、context builder、RAG、tool、memory、skill、evaluator、final response 这些能力通过统一的 state 串起来。
-
-这里有几个关键词：
-
-| 关键词 | 真实含义 |
-|---|---|
-| 可观测 | 每个节点执行后有 node_results、events、steps、status trace |
-| 可中断 | L3 工具审批时 graph 通过 LangGraph interrupt() 暂停，checkpoint 写入 PostgresSaver |
-| 可恢复 | 审批后图外执行工具，再 Command(resume=...) 从 checkpoint 精确继续，不重跑 graph |
-| 可扩展 | 新增节点时注册到 graph registry，再让 planner route 到它 |
-| 可治理 | 工具、记忆、RAG、最终回复都有边界，不混在一个大函数里 |
-
-### 10.1.2 为什么不能只用一个普通 async 函数
-
-如果用普通函数写，可能会变成这样：
+如果把整个 Agent 写成一个大函数，大概会是这样：
 
 ```python
-async def handle_user_message(user_input):
-    intent = detect_intent(user_input)
+def run_agent(user_input):
+    intent = classify(user_input)
+    context = build_context(user_input)
     if intent == "rag":
-        docs = search_docs(user_input)
-        answer = call_llm(docs)
+        result = rag(user_input, context)
     elif intent == "tool":
-        tool = select_tool(user_input)
-        result = call_tool(tool)
-        answer = call_llm(result)
+        result = call_tool(user_input)
     elif intent == "memory":
-        save_memory(user_input)
-        answer = "已记住"
-    return answer
+        result = save_memory(user_input)
+    return final_answer(result)
 ```
 
-这个写法看起来简单，但问题很多：
+这种写法短期能跑，但工程上有四个问题：
 
-1. 工具审批怎么暂停？
-2. 暂停以后怎么恢复？
-3. RAG 失败了 final_response 怎么知道不要声称有证据？
-4. Memory 写入失败了怎么提醒 evaluator？
-5. 每个阶段耗时怎么记录？
-6. 如果后面新增 skill_agent、artifact_agent，主函数会越来越长。
+第一，状态不可见。你只知道函数最后失败了，但不知道是 planner 失败、RAG 检索失败、工具参数失败，还是 final_response 失败。  
+第二，恢复困难。工具审批卡住时，大函数已经执行到一半，你很难把 Python 调用栈持久化到数据库，服务重启后更没法从中间继续。  
+第三，副作用难控。比如工具节点已经写文件，后面 final_response 失败，如果从头重跑，可能重复写。  
+第四，扩展困难。新增 skill_agent、artifact_agent、replanner、supervisor 时，大函数会越来越像一坨不可测试的流程脚本。
 
-所以你用 StateGraph。StateGraph 的价值不是炫技，而是把执行过程拆成稳定节点。
+LangGraph StateGraph 的价值就是把“大函数调用栈”变成“显式状态图”：
 
-### 10.1.3 AgentRuntimeState 是整套系统的“总线”
-
-你可以把 `AgentRuntimeState` 理解成一辆车上的总线。每个节点都往总线上读写自己关心的信号。
-
-#### 请求刚进入时的 state
-
-一开始大概只有这些：
-
-```python
-{
-    "user_id": 1,
-    "run_id": 123,
-    "thread_id": "user:1:conversation:abc",
-    "conversation_id": "abc",
-    "user_input": "帮我总结当前上传文档",
-    "mode": "react",
-    "page_context": {...}
-}
+```text
+节点 = 明确职责
+边 = 明确执行顺序
+state = 明确数据载体
+checkpoint = 明确恢复点
+event = 明确观测记录
 ```
 
-#### planner 执行后的 state
+你可以这样讲：
 
-planner 会补上：
+> 我一开始如果用普通函数编排，确实能更快跑通 demo，但后面加审批、恢复、并行预取、LLM supervisor、Skill 和 Memory 时会非常难维护。所以我把 Runtime 设计成 StateGraph。每个节点可以独立测试，节点输出会写入 state 和 AgentStep，条件边只负责下一步跳转。这样系统复杂度上升时，结构仍然可控。
 
-```python
-{
-    "route": "rag",
-    "answer_mode": "rag_qa",
-    "route_plan": {
-        "intent": "document_qa",
-        "route": ["rag_agent", "evaluator", "final_response"],
-        "risk_level": "L1",
-        "needs_approval": False,
-        "answer_mode": "rag_qa"
-    }
-}
+## 3.7 Runtime 的分层设计
+
+Runtime 不是一堆节点平铺，而是有阶段分层：
+
+### 第一层：Setup 阶段
+
+Setup 阶段负责回答“这个请求要不要继续、属于什么大类、初步路线是什么”。
+
+- `permission_guard`：最早做安全/权限粗筛。如果输入明显不允许继续，可以直接走 final_response。
+- `home_intent_react`：结合首页、FeedCard、页面上下文判断用户意图。
+- `planner`：生成结构化 route_plan。
+
+这一层的输出是 RoutePlan。它不是最终答案，而是执行计划。
+
+### 第二层：Read 阶段
+
+Read 阶段负责回答“执行前需要准备哪些上下文”。
+
+- `parallel_prefetch`：提前并行拿 memory、RAG、skill、graph context 等候选数据。
+- `parallel_read_stage`：把预取结果整合，执行 context_builder 和 skill_matcher。
+- `supervisor_observer`：记录当前 state，用于可观测和后续调度判断。
+- `llm_supervisor_route`：可选让 LLM supervisor 检查或改写 route_plan。
+
+这一层的输出是 `context.gssc_context`、`matched_skill`、`rag_evidence` 等。
+
+### 第三层：Agent 阶段
+
+Agent 阶段负责真正执行能力节点：
+
+- `rag_agent`：回答文档问题。
+- `tool_agent`：执行工具或进入审批。
+- `memory_agent`：写入记忆。
+- `skill_agent`：生成 Skill 草稿。
+- `research_agent`：执行研究任务。
+- `artifact_agent`：生成文件或成果。
+
+Agent 节点不一定只执行一个。RoutePlan 可以让多个 agent 串起来。例如一个研究任务可能先 research，再 artifact，再 skill。
+
+### 第四层：Eval / Final 阶段
+
+最后进入：
+
+- `evaluator`：检查 agent 结果和约束。
+- `final_response`：把结构化结果转成用户能读的自然语言回答。
+
+你可以这样讲：
+
+> Runtime 的执行不是“用户问什么就直接回答”，而是分成 setup、read、agent、final 四层。setup 负责规划，read 负责准备上下文，agent 负责执行能力，final 负责聚合和输出。这样职责很清晰，任何一层出问题都能定位。
+
+## 3.8 Runtime 的状态流怎么走
+
+一次普通请求进入后，状态大概这样演化：
+
+```text
+初始 state:
+  user_id / run_id / conversation_id / user_input
+
+permission_guard 后:
+  permission / risk hints
+
+planner 后:
+  route_plan / execution_plan / route / answer_mode
+
+parallel_read_stage 后:
+  context.gssc_context / memory_context / rag_evidence / matched_skill
+
+agent 节点后:
+  rag_result / tool_result / memory_result / skill_result / agent_results
+
+evaluator 后:
+  evaluation_result / final_response_constraints / final_warnings
+
+final_response 后:
+  final_answer / final_payload / status
 ```
 
-#### parallel_read_stage 执行后的 state
+这条状态流特别适合面试讲，因为它能体现你不是只会“调包”，而是理解 Agent 系统里的信息如何流动。
 
-上下文节点会补上：
+面试官如果问“不同模块怎么交互”，你可以回答：
 
-```python
-{
-    "context": {
-        "gssc_context": "... structured context ...",
-        "gssc_debug": {
-            "selected_sources": ["task", "evidence", "conversation_history"],
-            "dropped_sources": ["feed_card"],
-            "token_budget_used": 1280
-        },
-        "memory_items": [...],
-        "rag_evidence": [...],
-        "conversation_history": "..."
-    },
-    "memory_context": {
-        "loader": "memory_context_loader",
-        "read_only": True,
-        "items": [...]
-    }
-}
+> 它们主要不是互相直接耦合，而是通过 state 交互。planner 写 route_plan，context_builder 写 context，RAG 写 rag_result，tool_agent 写 tool_call/tool_result，memory_agent 写 memory_updates，final_response 统一读取这些字段。这种 state bus 的设计让模块边界更清楚，也方便记录每个节点的输入输出。
+
+## 3.9 Runtime 的失败处理思路
+
+Runtime 不是保证每个节点永远成功，而是要保证失败可观测、可降级、可恢复。
+
+常见失败场景：
+
+| 失败点 | 可能原因 | 当前处理思路 |
+|---|---|---|
+| planner 失败 | LLM 输出格式异常、意图不明确 | fallback route / 默认 chat |
+| RAG 失败 | Qdrant 不可用、文档未入库 | fallback BM25 或返回文档状态 |
+| tool 失败 | 参数缺失、审批拒绝、provider 异常 | ToolCall 记录失败，final_response 明确说明 |
+| memory 失败 | LLM 抽取失败、Qdrant 写入失败 | regex fallback 或 PG 成功、Qdrant best-effort |
+| final_response 失败 | LLM 异常 | 服务层 fallback 用户可读回答 |
+| checkpoint 失败 | PostgresSaver 不可用 | 生产 fail-fast，不静默降级 |
+
+面试可以这样讲：
+
+> 我没有假设 Agent 每步都会成功。Runtime 的设计是：失败要写入 state 和事件，能降级的降级，不能降级的明确失败；对于高风险审批恢复这种能力，生产环境要求 durable checkpointer，不允许静默降级到内存。
+
+## 4. Runtime 要解决什么问题
+
+如果只把用户输入直接扔给 LLM，有几个问题：
+
+1. 模型不知道什么时候该 RAG、什么时候该工具、什么时候该写记忆。
+2. 高风险工具可能被误调用。
+3. 执行到一半需要人工审批时，状态容易丢。
+4. 多个能力混在一个 prompt 里，难以观测、测试、恢复。
+5. 失败后不知道卡在哪个节点。
+
+Runtime 的目标是把 Agent 运行变成一个可控的状态机。
+
+## 5. Runtime 内部图
+
+```mermaid
+flowchart TD
+    START(["START"]) --> PG["permission_guard"]
+    PG -->|continue| HIR["home_intent_react"]
+    PG -->|done| FR["final_response"]
+    HIR --> PL["planner"]
+    PL --> PF["parallel_prefetch"]
+    PF --> PRS["parallel_read_stage"]
+    PRS --> SO["supervisor_observer"]
+    SO --> LSR["llm_supervisor_route"]
+    LSR --> D{"dispatch_next_route_node"}
+
+    D --> RA["research_agent"]
+    D --> RG["rag_agent"]
+    D --> AA["artifact_agent"]
+    D --> TA["tool_agent"]
+    D --> MA["memory_agent"]
+    D --> SA["skill_agent"]
+    D --> EV["evaluator"]
+    D --> FR
+    D --> END(["END"])
+
+    RA --> D
+    RG --> D
+    AA --> D
+    TA --> D
+    MA --> D
+    SA --> D
+    EV --> FR
+    FR --> END
 ```
 
-#### rag_agent 执行后的 state
+对应代码：
 
-```python
-{
-    "rag_result": {
-        "answer": "...",
-        "evidence": [...],
-        "retrieval_source": "qdrant_hybrid"
-    },
-    "agent_outputs": [...],
-    "node_results": [
-        {"node": "rag_agent", "status": "ok", "updates": {...}}
-    ],
-    "completed_nodes": ["permission_guard", "planner", "parallel_read_stage", "rag_agent"]
-}
-```
+- `src/web_app/agent/runtime/graph_builder.py`
+- `src/web_app/agent/runtime/graph_registry.py`
+- `src/web_app/agent/runtime/dispatch.py`
+- `src/web_app/agent/runtime/graph.py`
 
-#### tool_agent 等待审批时的 state
+## 6. Runtime 的节点分层
 
-如果用户请求 L3 工具，比如写文件，会变成：
+| 节点组 | 节点 | 作用 |
+|---|---|---|
+| Setup | `permission_guard` | 权限和安全入口 |
+| Setup | `home_intent_react` | 识别首页/页面上下文意图 |
+| Setup | `planner` | 生成 RoutePlan |
+| Read | `parallel_prefetch` | 并行预取 RAG、Memory、Skill、Graph context |
+| Read | `parallel_read_stage` | 构建上下文和匹配 skill |
+| Read | `supervisor_observer` | 观察运行状态 |
+| Read | `llm_supervisor_route` | 可选 LLM 接管 route_plan |
+| Agent | `rag_agent` | 文档问答和证据回答 |
+| Agent | `tool_agent` | 工具调用或审批暂停 |
+| Agent | `memory_agent` | 写入和固化记忆 |
+| Agent | `skill_agent` | 生成 Skill 草稿 |
+| Agent | `research_agent` | 研究任务 |
+| Agent | `artifact_agent` | 生成 artifact |
+| Final | `evaluator` | 结果约束和一致性检查 |
+| Final | `final_response` | 聚合最终回答 |
 
-```python
-{
-    "status": "waiting_approval",
-    "approval_required": True,
-    "approval_pause_mode": "interrupt",  # 新架构：interrupt-based
-    "pending_approval_id": 88,
-    "pending_tool_name": "local_file.write",
-    "pending_tool_args": {"path": "...", "content": "..."},
-    "pending_tool_call_id": 456,
-    "resume_token": "approval:88"
-}
-```
+## 7. RoutePlan 是 Runtime 的核心控制对象
 
-此时 tool_agent 调用了 `langgraph.types.interrupt(payload)`，graph 暂停。checkpoint 已写入 PostgresSaver 的 4 张表（thread_id=run:{run_id}）。agent_service 捕获 GraphInterrupt，emit SSE 事件给前端。用户批准后，agent_service 在图外执行工具，再 `Command(resume={"action":"approved","tool_result":...})` 从 checkpoint 精确恢复。
+`planner` 的核心产物是 `route_plan`。它告诉 Runtime：
 
-这个例子很重要，因为它说明你的 runtime 不是一次性跑到底，而是能被工具审批打断，且 checkpoint 跨进程可恢复。
+- 用户意图是什么。
+- 要走哪些 agent。
+- 风险等级是什么。
+- 是否需要审批。
+- 回答模式是什么。
 
-### 10.1.4 节点分组的设计思路
-
-你可以把节点分成四类：
-
-#### 第一类：Setup 节点
-
-| 节点 | 做什么 |
-|---|---|
-| `permission_guard` | runtime 入口安全检查 |
-| `home_intent_react` | 判断用户请求的大方向 |
-| `planner` | 生成 RoutePlan |
-
-这类节点负责“决定做什么”。
-
-#### 第二类：Read 节点
-
-| 节点 | 做什么 |
-|---|---|
-| `parallel_prefetch` | 并行预取 memory、skill、graph、rag 相关材料 |
-| `parallel_read_stage` | 构建 GSSC context |
-| `supervisor_observer` | 观察上下文和 route plan，准备调度 |
-| `llm_supervisor_route` | LLM 接管路由（full 模式下可改写 planner 的 route_plan） |
-
-这类节点负责“准备材料”。
-
-#### 第三类：Agent 节点
-
-| 节点 | 做什么 |
-|---|---|
-| `research_agent` | 深度研究 |
-| `rag_agent` | 文档问答 |
-| `artifact_agent` | 生成 artifact |
-| `tool_agent` | MCP 工具调用 |
-| `memory_agent` | 记忆抽取和写入 |
-| `skill_agent` | 可复用 workflow 检测和 Skill 草稿 |
-
-这类节点负责“执行具体任务”。
-
-#### 第四类：Eval/Final 节点
-
-| 节点 | 做什么 |
-|---|---|
-| `evaluator` | 检查结果一致性和风险 |
-| `final_response` | 生成最终用户回复 |
-
-这类节点负责“收口”。
-
-### 10.1.5 RoutePlan 是什么
-
-RoutePlan 是 planner 给后续节点的执行计划。它不是自然语言，而是结构化决策。
-
-你可以把它讲成：
-
-> RoutePlan 是 planner 输出的执行合同。它告诉 runtime：这次是什么 intent、要走哪些节点、风险等级是什么、是否需要审批、最终回答模式是什么。
-
-示例一：普通 RAG 问答
+示例：
 
 ```python
 {
@@ -2667,11 +461,11 @@ RoutePlan 是 planner 给后续节点的执行计划。它不是自然语言，�
 }
 ```
 
-示例二：工具写文件
+工具动作可能是：
 
 ```python
 {
-    "intent": "tool.local_file_write",
+    "intent": "tool.email",
     "route": ["tool_agent", "evaluator", "final_response"],
     "risk_level": "L3",
     "needs_approval": True,
@@ -2679,2042 +473,1909 @@ RoutePlan 是 planner 给后续节点的执行计划。它不是自然语言，�
 }
 ```
 
-示例三：用户要求记忆
+## 8. LLM Supervisor 为什么存在
 
-```python
-{
-    "intent": "memory.write",
-    "route": ["memory_agent", "evaluator", "final_response"],
-    "risk_level": "L1",
-    "needs_approval": False,
-    "answer_mode": "memory_confirm"
-}
-```
-
-### 10.1.6 dispatcher 怎么工作
-
-dispatcher 不是 LLM，它是确定性的。它看：
-
-1. route_plan 里有哪些节点。
-2. completed_nodes 里哪些已经完成。
-3. 是否有 supervisor/replanner 给出的 next node。
-
-注意：审批暂停不再走 dispatcher 的 END 返回（旧架构）。新架构中 tool_agent 直接调用 LangGraph interrupt() 暂停 graph，checkpoint 写入 PostgresSaver。dispatcher 仅负责正常路由。
-
-```text
-for node in route_plan.route:
-    if node not in completed_nodes:
-        return node
-return final_response
-```
-
-这就是为什么它稳定。LLM 做规划，但真正跳边是代码控制的。审批中断由 LangGraph interrupt() 原生处理。
-
-### 10.1.7 evaluator 的价值
-
-很多人做 Agent 会忽略 evaluator，直接把 agent 输出喂给 final response。你这个项目里 evaluator 的价值是“最终回答前的合同检查”。
-
-典型检查：
-
-| 场景 | evaluator/最终约束 |
-|---|---|
-| RAG 没 evidence | 不要声称“根据文档” |
-| 工具 waiting_approval | 不要声称工具已执行 |
-| Memory 写失败 | 不要说“已记住” |
-| research 是 fallback | 告知检索/研究限制 |
-| final answer 里出现内部 JSON | 清理成自然语言 |
-
-面试可以讲：
-
-> evaluator 是我给 Agent 加的一层结果约束。因为 Agent 很容易把中间状态说成最终事实，比如工具还没审批却说已执行。evaluator 会根据 node result 和 state 生成 warnings/constraints，final_response 必须遵守。
-
-### 10.1.8 Runtime 模块长版面试讲法
-
-> 这个项目里我做的第一块是 Agent Runtime。我没有把所有能力写在一个大的 chat handler 里，而是用 LangGraph StateGraph 把执行过程拆成多个节点。  
-> 
-> 用户请求进来后，service 层先创建 AgentRun，保存 run_id、thread_id、conversation_id。然后 runtime 从 permission_guard 开始，做意图识别和 planner。planner 输出 RoutePlan，里面有 intent、route、risk_level、needs_approval 和 answer_mode。  
-> 
-> 接下来 parallel_prefetch 和 parallel_read_stage 会准备上下文，比如 conversation history、memory、rag evidence、feed card 和 skill candidates，并通过 GSSC 组装成结构化上下文。然后 supervisor_observer 观测状态，llm_supervisor_route（full 模式下）可选让 LLM 接管并改写 route_plan，dispatcher 根据 route_plan 和 completed_nodes 选择下一个 agent 节点。  
-> 
-> 如果是文档问答，就走 rag_agent；如果是工具动作，就走 tool_agent；如果是记忆相关，就走 memory_agent；如果任务有复用价值，就走 skill_agent。每个节点都会把自己的结果写回 AgentRuntimeState，包括 node_results、agent_outputs、completed_nodes 和 errors。最后 evaluator 做一致性检查，final_response 基于 GSSC context 和各 agent result 输出用户可读答案。  
-> 
-> 这套设计的核心价值是把 Agent 执行过程显式化。每个阶段可观测、可测试，也能处理工具审批这样的中断场景。
-
----
-
-## 10.2 MCP Tool Governance 超详细讲解
-
-### 10.2.1 你到底做了什么
-
-你做的是一个“工具安全网关”。  
-不要把它讲成“我写了几个工具”。你真正做的是：
-
-> 所有工具调用必须经过统一治理层，先查工具注册信息，再校验输入，再判断风险等级，再决定自动执行、等待审批或直接阻断，最后落库审计。
-
-这就像后端系统里的 API Gateway，只不过它面对的调用方是 Agent/LLM。
-
-### 10.2.2 MCP ToolSpec 是工具治理的基础
-
-每个工具都不只是一个函数，而是一份 spec。
-
-你可以这样理解：
-
-```python
-{
-    "name": "local_file.write",
-    "description": "Write a local file",
-    "category": "local_file",
-    "input_schema": {
-        "type": "object",
-        "required": ["path", "content"],
-        "properties": {
-            "path": {"type": "string"},
-            "content": {"type": "string"}
-        }
-    },
-    "output_schema": {...},
-    "safety_level": "L3_EXTERNAL_WRITE",
-    "requires_approval": True,
-    "enabled": True
-}
-```
-
-这个 spec 带来的好处：
-
-1. 工具列表可枚举。
-2. 工具风险可配置。
-3. 工具参数可校验。
-4. 工具是否启用可控制。
-5. 工具调用可审计。
-
-### 10.2.3 工具调用前为什么要 normalize
-
-LLM 可能会输出不同名字：
-
-```text
-write_file
-local_file.write
-file.write
-```
-
-registry 里有 alias/normalize 逻辑，把不同叫法映射到统一工具名。  
-这样可以降低模型输出名字不稳定带来的失败率。
-
-面试可以讲：
-
-> 我没有完全相信模型输出的 tool name，而是通过 registry 做 normalize 和 alias mapping。这样模型输出接近的工具名时，系统仍然能映射到标准 MCP tool。
-
-### 10.2.4 参数校验的真实边界
-
-当前参数校验做了：
-
-1. required 字段检查。
-2. 空值检查。
-3. 一些格式校验，比如 email。
-4. 输出 cleaned args。
-5. 如果缺字段，tool_agent 会要求用户补充，而不是直接执行。
-
-如果用户说：
-
-```text
-帮我发封邮件
-```
-
-但没有收件人、主题、正文，系统应该返回：
-
-```text
-需要补充 recipient、subject、body
-```
-
-而不是让模型瞎编一个邮箱。
-
-这也是 Agent 工具调用很重要的工程点：  
-**缺参数时要问用户，不要编参数。**
-
-### 10.2.5 风险等级如何影响执行路径
-
-你可以把 L0-L4 讲成“执行策略矩阵”：
-
-| 风险 | 是否自动执行 | 是否审批 | 是否阻断 | 解释 |
-|---|---:|---:|---:|---|
-| L0 | 是 | 否 | 否 | 纯只读 |
-| L1 | 通常是 | 否 | 否 | 草稿/低风险 |
-| L2 | 视工具而定 | 可能 | 否 | 本地低风险副作用 |
-| L3 | 否 | 是 | 否 | 外部写入/用户确认 |
-| L4 | 否 | 否 | 是 | 高危动作 |
-
-重点是 L3 和 L4：
-
-```text
-L3 = 可以做，但必须用户确认
-L4 = 当前系统策略下不允许 Agent 做
-```
-
-这句话非常好用。
-
-### 10.2.6 ToolCall 状态机
-
-工具调用可以有这些状态：
+Planner 是初始规划，LLM Supervisor 是运行时复核/接管。
 
 ```mermaid
-stateDiagram-v2
-    [*] --> pending
-    pending --> running: low risk execute
-    pending --> waiting_approval: L3
-    pending --> blocked: L4 / disabled
-    waiting_approval --> running: approved
-    waiting_approval --> rejected: user rejects
-    running --> completed
-    running --> failed
-    blocked --> [*]
-    rejected --> [*]
-    completed --> [*]
-    failed --> [*]
+flowchart LR
+    A["planner 生成 route_plan"] --> B["parallel_read_stage 准备上下文"]
+    B --> C["supervisor_observer 观察 state"]
+    C --> D{"llm_supervisor_route"}
+    D -->|off| E["直接使用原 route_plan"]
+    D -->|shadow| F["记录 LLM 判断但不改路由"]
+    D -->|full| G["LLM 改写 route_plan"]
+    E --> H["dispatcher"]
+    F --> H
+    G --> H
 ```
 
-这张状态机你可以在脑子里记住。面试官问“审批怎么保证状态一致”，你就按这个讲。
+面试讲法：
 
-### 10.2.7 审批 payload 里应该有什么
+> 我把路由拆成 planner、supervisor、dispatcher 三层。planner 做初始决策，supervisor 可以在上下文准备后根据 state 复核甚至改写 route_plan，dispatcher 保持简单，只按 route_plan 和 completed_nodes 跳转。这样既有可解释性，又保留了运行时动态调整能力。
 
-一个好的审批不是只弹“是否同意”。它应该告诉用户：
+## 9. Runtime 的 checkpoint 与恢复
 
-1. 要执行哪个工具。
-2. 工具风险等级是什么。
-3. 将要使用什么参数。
-4. 可能产生什么副作用。
-5. 审批后怎么恢复。
+普通运行时，graph 可以无 checkpoint 编译；但高风险审批恢复必须有 checkpointer。当前生产路径使用 PostgresSaver / AsyncPostgresSaver。
 
-你项目里的审批记录 payload 会包含 tool_name、input、permission_level、preview/safety notes 等信息。这样前端可以展示审批卡片。
+```mermaid
+sequenceDiagram
+    participant User as 用户
+    participant AS as AgentService
+    participant G as LangGraph
+    participant TA as tool_agent
+    participant CP as AsyncPostgresSaver
+    participant DB as PostgreSQL
 
-### 10.2.8 为什么审批后不能重新问 LLM
-
-这是非常重要的安全点。
-
-错误做法：
-
-```text
-用户批准后 -> 再让 LLM 重新生成工具参数 -> 执行
+    User->>AS: 请求发送邮件
+    AS->>G: graph.ainvoke(state, thread_id=run:id)
+    G->>TA: tool_agent
+    TA->>TA: 判断 L3，需要审批
+    TA->>G: interrupt(approval_payload)
+    G->>CP: 保存 checkpoint
+    CP->>DB: 写 checkpoints / blobs / writes
+    AS-->>User: SSE approval_required + run_paused
+    User->>AS: approve
+    AS->>AS: 图外执行 approved tool
+    AS->>G: Command(resume={tool_result})
+    G->>CP: 读取 checkpoint
+    G->>TA: 从 interrupt 点继续
+    G-->>AS: final state
+    AS-->>User: final answer
 ```
 
-问题是：用户批准的是旧参数，但执行的是新参数，安全上不一致。
+关键讲点：
 
-正确做法：
+1. 不是从头 replay graph。
+2. 工具审批前不会执行真实外部写入。
+3. 审批后服务层先执行工具，再把结果 resume 回 graph。
+4. `thread_id=run:{run_id}` 是 checkpoint 的稳定 key。
+5. PostgresSaver 支持跨进程恢复。
 
-```text
-审批前保存 ToolCall(input)
-用户批准的是这个 ToolCall
-审批后 execute_approved_tool(tool_call_id)
-执行保存过的 input
-```
+## 10. Runtime 模块面试话术
 
-你项目就是这个思路。
-
-面试可以讲：
-
-> 审批批准的是一个具体 ToolCall，而不是一个抽象意图。批准后执行保存过的 tool_call_id，避免模型二次生成参数导致审批内容和执行内容不一致。
-
-### 10.2.9 MCP 模块长版面试讲法
-
-> 第二块是 MCP 工具治理。因为 Agent 一旦能调用工具，就必须有安全边界。我把工具调用统一收敛到 MCPService 和 ToolExecutor。  
-> 
-> 每个工具先在 registry 里声明成 MCPToolSpec，包括 input_schema、output_schema、safety_level、requires_approval、enabled 等。调用前先 normalize tool name，再根据 spec 做 required 字段校验。如果缺参数，tool_agent 会让用户补充，不会让模型编参数。  
-> 
-> 参数通过后进入 PermissionGuard。L0/L1/L2 可以自动执行或低风险执行；L3，比如写本地文件、发邮件，会创建 Approval，把 ToolCall 状态置为 waiting_approval，并让 LangGraph runtime 中断；L4，比如删除或高危命令，直接 blocked，不进入审批。  
-> 
-> 审批通过后，不是重新让模型生成参数，而是执行之前保存的 tool_call_id，这样用户批准的内容和实际执行的内容一致。所有 ToolCall、Approval、AgentEvent 都会落库，所以事后能审计整个工具调用生命周期。
-
-### 10.2.10 MCP 常见追问
-
-**问：如果用户明确要求删除文件，为什么还要阻断？**
-
-答：
-
-> 因为我把 L4 定义成当前系统不允许 Agent 自动执行的高危能力。用户确认可以降低误操作风险，但不能解决所有破坏性风险。当前阶段我宁愿保守阻断，后续可以针对特定目录、回收站机制、二次确认再开放有限删除。
-
-**问：审批会不会影响用户体验？**
-
-答：
-
-> 只对 L3/L4 级别动作影响。普通只读检索、草稿生成不需要审批。这个分级的目的就是避免所有工具都弹审批，同时保证外部写入和高危动作受控。
-
-**问：工具调用失败怎么办？**
-
-答：
-
-> ToolExecutor 会把 ToolCall 标成 failed，并把 error_message 写入记录。state 里也会 append error，evaluator/final_response 会基于这个状态告诉用户失败，而不是假装成功。
+> Runtime 是这个项目的执行内核。我没有让模型自由决定所有行为，而是用 LangGraph StateGraph 把请求拆成权限、意图、规划、上下文、能力节点、评估、最终回复。每个节点只负责一类状态变更，所有节点通过 AgentRuntimeState 共享数据。高风险工具通过 interrupt 暂停，PostgresSaver 保存 checkpoint，用户审批后 Command(resume) 从暂停点继续。这样 Runtime 具备可观测、可恢复和可治理的特点。
 
 ---
 
-## 10.3 RAG 检索系统超详细讲解
+# 模块二：MCP 工具治理
 
-### 10.3.1 你到底做了什么
+## 10.5 MCP 模块要怎么“讲透”
 
-你做的是一套“可评估的文档检索链路”，不是简单向量搜索。
+MCP 这一块不要只讲“我接了 MCP 工具”。这样说太浅，听起来像只是把一个 tool list 塞进 LLM。你真正要讲的是：**当 Agent 具备调用外部工具的能力后，系统如何防止模型越权、误操作、乱填参数、绕过审批，以及如何在审批后恢复执行。**
 
-它包括：
-
-1. 文档解析。
-2. 结构化 chunking。
-3. child-only vector upsert。
-4. Qdrant dense + sparse hybrid。
-5. native RRF fusion。
-6. parent context enrichment。
-7. rerank。
-8. hit@k eval runner。
-
-把这几个词串起来，就是你的 RAG 故事。
-
-### 10.3.2 为什么 RAG 的关键不是“用了向量数据库”
-
-很多项目会说“我用了向量数据库做 RAG”，但这不够。  
-真正决定效果的是：
-
-| 环节 | 决定什么 |
-|---|---|
-| 文档解析 | 原始文本质量 |
-| chunking | 检索粒度 |
-| metadata | 过滤和引用能力 |
-| embedding | 语义召回 |
-| sparse | 关键词召回 |
-| fusion | 多路召回怎么合并 |
-| rerank | top-k 顺序 |
-| eval | 优化有没有证据 |
-
-你的项目覆盖了这些关键点，所以可以讲得比“我用了 Qdrant”更高级。
-
-### 10.3.3 Ingestion 的每一步再展开
-
-#### 第一步：parse_document
-
-解析文档时，系统要尽量保留结构信息：
-
-1. 文件名。
-2. 文件类型。
-3. 标题层级。
-4. 页码。
-5. sheet 名。
-6. 表格 header。
-7. 原始文本。
-
-这些 metadata 后面会进入 chunk metadata。
-
-#### 第二步：build_structured_chunks
-
-它会生成：
-
-```python
-{
-    "overview_chunk": {...},
-    "parent_chunks": [...],
-    "vector_chunks": [...],  # child chunks
-    "all_chunks": [...]
-}
-```
-
-其中 child metadata 大概包含：
-
-```python
-{
-    "chunk_role": "child",
-    "chunk_id": "p-0001-c-001",
-    "parent_id": "p-0001",
-    "chunk_type": "section",
-    "heading_path": ["Chapter", "Section"],
-    "page_number": 3,
-    "content_hash": "..."
-}
-```
-
-parent metadata 大概包含：
-
-```python
-{
-    "chunk_role": "parent",
-    "chunk_id": "p-0001",
-    "heading_path": ["Chapter"],
-}
-```
-
-#### 第三步：embedding child chunks
-
-只有 `vector_chunks` 会 embedding。  
-这就是 child-only vector upsert。
-
-#### 第四步：Qdrant upsert
-
-Qdrant point payload 会包含：
-
-| payload | 用途 |
-|---|---|
-| `user_id` | 用户隔离 |
-| `document_id` | 文档过滤 |
-| `chunk_id` | chunk 标识 |
-| `chunk_role` | 确认是 child |
-| `parent_id` | 回查 parent |
-| `filename` | 引用展示 |
-| `heading_path` | 章节引用 |
-| `content` | 检索结果 preview |
-
-#### 第五步：PostgreSQL 保存 all chunks
-
-所有 overview/parent/child 都保存到 PostgreSQL。  
-Qdrant 负责召回，PostgreSQL 负责权威 chunk 记录和 parent 回查。
-
-### 10.3.4 Query 的每一步再展开
-
-用户问问题后，RAG 检索流程大概是：
+普通 Agent demo 里，工具调用往往是这样的：
 
 ```text
-query
-  -> 判断 backend
-  -> 如果 qdrant_hybrid:
-       dense embedding(query)
-       sparse encode(query)
-       Qdrant dense prefetch
-       Qdrant sparse prefetch
-       Fusion.RRF
-       top-k child hits
-  -> enrich parent_context
-  -> rerank_results
-  -> return evidence
+LLM 生成 tool_name + tool_args -> 后端直接执行 -> 把结果返回给模型
 ```
 
-如果 qdrant_hybrid 失败：
+这在演示环境里可以跑，但工程上风险很大。因为模型可能会：
+
+1. 把用户一句“帮我看看能不能发”理解成“立刻发送邮件”。
+2. 漏掉必填参数，比如收件人、文件路径、确认字段。
+3. 对高风险工具生成看似合理但实际上危险的参数。
+4. 在上下文污染时调用完全不相关的工具。
+5. 执行失败后没有审计记录，出了问题无法复盘。
+
+所以你项目里的 MCP 治理层，本质上是给 Agent 工具调用加了一层“操作系统权限模型”。模型可以提出工具调用意图，但不能绕过工具注册表、参数校验、风险等级、人类审批和审计表。面试时可以这样概括：
+
+> MCP 模块不是简单 tool calling，而是把工具从“LLM 的自由动作”改造成“有注册、有 schema/参数约束、有风险等级、有审批状态、有审计记录、有恢复链路”的受控执行系统。
+
+这里最能体现工程能力的点有四个：
+
+1. **工具抽象统一**：所有工具先进入 registry，用统一 spec 描述名称、参数、权限等级、provider 和执行入口。
+2. **执行边界统一**：tool_agent 不直接碰具体工具实现，而是通过 ToolRouter/ToolExecutor 走统一执行路径。
+3. **风险控制统一**：L0-L4 风险等级控制工具是否直接执行、是否需要审批、是否直接阻断。
+4. **状态恢复统一**：L3 审批不是简单返回一句“等用户确认”，而是结合 LangGraph interrupt、Approval 表、ToolCall 表和 checkpoint resume 继续原来的 run。
+
+## 10.6 MCP 在整体项目里的位置
+
+MCP 模块位于 Runtime 和外部世界之间。Runtime 负责决定“下一步可能要调用工具”，但 MCP 负责决定“这个工具是否能被调用、怎么调用、是否要审批、调用结果如何记录”。
+
+```mermaid
+flowchart LR
+    U["用户意图"] --> RT["Runtime / planner"]
+    RT --> TA["tool_agent"]
+    TA --> TR["ToolRouter"]
+    TR --> TE["ToolExecutor"]
+    TE --> REG["Tool Registry"]
+    TE --> PERM["Permission / Risk Policy"]
+    TE --> AUDIT["ToolCall / Approval 审计"]
+    TE --> EXT["外部工具 Provider"]
+    TE --> RT2["Runtime resume / final_response"]
+```
+
+这张图可以这么讲：
+
+> tool_agent 只负责把当前任务转成候选工具调用，真正的执行权在 ToolExecutor。ToolExecutor 会回查 registry，确认工具存在、参数满足基本约束、风险等级允许，然后根据 L0-L4 决定直接执行、审批等待或阻断。这样 Runtime 和工具实现解耦，安全策略也不会散落在每个工具函数里。
+
+这也是为什么 MCP 是你项目里很适合面试展开的模块。它不是“为了用 MCP 而 MCP”，而是在解决 Agent 产品化最现实的问题：**模型可以很聪明，但模型不能被默认信任。**
+
+## 10.7 工具注册表的价值
+
+工具注册表的核心作用，是把“工具函数”升级成“可治理资源”。如果没有 registry，每个工具可能只是一个 Python function，名字、参数、风险、权限、描述都散落在代码里。这样会带来几个问题：
+
+1. Runtime 不知道有哪些工具能用。
+2. LLM 不知道每个工具的真实边界。
+3. 参数校验逻辑容易重复或遗漏。
+4. 新增工具时很难统一接入审批和审计。
+5. 删除、发邮件、外部写入这类动作没有统一入口。
+
+你的项目里，工具被抽象成类似下面的治理对象：
 
 ```text
-fallback to python_bm25_hybrid
-  -> vector search
-  -> local BM25 over child candidates
-  -> merge hits
-  -> rerank
-  -> parent enrichment
+ToolSpec
+  - name: 工具名
+  - description: 给模型/系统看的能力说明
+  - parameters: 参数定义、required 字段、基础格式
+  - permission_level: L0/L1/L2/L3/L4
+  - provider: 具体执行方
+  - metadata: 工具分类、审计信息、展示信息
 ```
 
-### 10.3.5 为什么要 sparse encoder
+面试时你可以强调：
 
-dense embedding 擅长语义，例如：
+> 我没有让 agent 节点直接 import 某个工具函数执行，而是通过 registry 统一拿 tool spec。这样工具能力、权限边界和执行入口是数据化的，后面做 UI 展示、人工审批、工具审计、权限收敛和灰度开关都会更容易。
+
+注意措辞：当前代码里的参数校验更接近 required 字段和基础格式校验，不要说成“完整 JSON Schema 全量校验引擎”。更稳的说法是：
+
+> 当前实现做了工具参数 required/format 层面的结构校验，并把工具输入校验放在统一执行路径里；如果后续增强，可以继续补完整 JSON Schema validator、参数级策略和更细粒度的数据权限。
+
+这样讲既真实，又体现你知道下一步怎么演进。
+
+## 10.8 风险等级为什么要分 L0-L4
+
+Agent 工具风险不是二元的，不是“能调”和“不能调”。不同工具的风险差异很大：
+
+| 等级 | 典型能力 | 风险特点 | 处理方式 |
+|---|---|---|---|
+| L0 | 纯计算、格式化、无外部副作用 | 不读敏感数据、不写外部系统 | 可直接执行 |
+| L1 | 读本地或读公开数据 | 有信息读取，但副作用低 | 可执行并记录 |
+| L2 | 本地写入、生成草稿、内部状态修改 | 有副作用，但影响范围可控 | 受限执行并审计 |
+| L3 | 发邮件、外部系统写入、提交审批类动作 | 影响用户或外部系统 | 必须人工审批 |
+| L4 | 删除关键数据、危险命令、不可逆外部操作 | 高危或不可接受 | 阻断 |
+
+这一层最关键的面试表达是：
+
+> 我不是把所有工具都放到人工审批后面，因为那会让 Agent 很难用；也不是全部放开，因为那不安全。所以我按副作用和外部影响做风险分级。低风险工具直接跑，高风险工具走审批，不可接受风险直接阻断。
+
+这背后是一个非常典型的工程取舍：
 
 ```text
-query: 这份合同的付款条款是什么？
-content: Payment Terms: ...
+全部放开：体验好，但安全差
+全部审批：安全高，但体验差
+风险分级：在体验和安全之间做可解释折中
 ```
 
-但对这些内容不一定稳：
+你可以举例：
 
-```text
-HT-2026-001
-contract-eval@example.com
-XR-9000-Pro
-¥128,000
-qdrant_hybrid
-```
+- 查询天气、格式化文本：L0/L1。
+- 生成邮件草稿但不发送：L2。
+- 真正发送邮件、提交外部系统：L3。
+- 删除用户数据、执行任意 shell、覆盖重要文件：L4。
 
-这些是精确 token。Sparse vector/BM25 更擅长。
+## 10.9 L3 审批为什么是闭环能力
 
-所以 hybrid 的本质是：
+很多项目会说“高风险工具需要用户确认”，但真实工程里最难的不是弹一个确认框，而是确认之后怎么继续原来的执行链路。
 
-```text
-dense = 语义理解
-sparse = 关键词/编号/术语精确匹配
-```
+你的项目应该这样讲：
 
-### 10.3.6 reranker 在这里做什么
+> L3 工具调用到达 ToolExecutor 后，不会直接执行。系统会创建 ToolCall 和 Approval 记录，把当前 Runtime 通过 LangGraph interrupt 暂停，并依赖 PostgresSaver 保存 checkpoint。前端收到 approval_required 事件后展示工具名、参数和风险说明。用户 approve 后，服务层执行被批准的工具，然后用 Command(resume) 把结果塞回原来的 graph，让 run 从暂停点继续。
 
-RRF 已经融合了 dense/sparse，但项目里还有 rerank。  
-rerank 的作用是结合业务启发式，比如：
+这个链路很重要，因为它把三个系统串起来了：
 
-1. query 是 exact/table/summary/general 哪种类型。
-2. 是否命中关键词。
-3. 是否来自 hybrid。
-4. 是否是用户指定文档。
-5. 是否 parent_context 可用。
-6. 是否 filename 匹配。
+1. **MCP**：识别工具风险并创建审批。
+2. **Runtime**：在安全边界处暂停执行。
+3. **Checkpoint**：保证审批跨请求、跨时间后还能恢复。
 
-你可以讲：
+可以用这段话解释“为什么不是简单同步等待”：
 
-> Qdrant RRF 解决多路召回融合，reranker 解决业务侧排序，比如精确问合同号时提高关键词命中权重，摘要问题时提高 overview/summary 相关内容权重。
+> 审批是人参与的异步流程，用户可能几秒后点确认，也可能几分钟后才回来。如果只是内存里 await，一个进程重启就丢了。所以我把等待状态持久化成 Approval/ToolCall，再用 LangGraph checkpoint 保存图状态，审批后 resume。
 
-### 10.3.7 Eval runner 为什么重要
+这会让面试官明显感觉你是在按生产系统思考。
 
-RAG 优化如果没有 eval，很容易变成“我感觉效果变好了”。  
-你的 eval runner 做了几件正确的事：
+## 10.10 ToolCall 与 Approval 审计为什么重要
 
-1. 使用固定 fixture 文档。
-2. 每次重新 ingest。
-3. 校验 ingestion 是否符合 Parent-Child 约束。
-4. 同一批 query 对比不同 backend。
-5. 输出 Markdown 适合人看。
-6. 输出 JSONL 适合复盘每个 query。
-7. 有 hit@1/hit@3/hit@5 指标。
+工具调用不是只要成功就行。Agent 一旦能操作外部系统，就一定要回答四个问题：
 
-这说明你有工程闭环：
+1. 谁触发了这个工具？
+2. 当时模型给了什么参数？
+3. 系统为什么允许或拒绝？
+4. 最终工具有没有执行，执行结果是什么？
 
-```text
-改检索逻辑 -> 跑 eval -> 看 hit@k/latency/fallback -> 决定是否作为默认 backend
-```
+所以 ToolCall/Approval 记录不是“多余日志”，而是安全系统的一部分。你可以这样讲：
 
-### 10.3.8 RAG 模块长版面试讲法
+> ToolCall 记录的是工具调用事实，Approval 记录的是人工决策事实。两者结合后，系统可以复盘一次高风险动作：用户说了什么、Agent 规划了什么、工具参数是什么、风险等级是什么、谁批准了、批准后实际执行结果是什么。
 
-> RAG 模块我主要做了两件事：一是改 chunking，二是改检索融合，并且补了评估。  
-> 
-> chunking 上，我没有把文档直接等长切片，而是做 Parent-Child。解析文档后生成 overview、parent、child 三类 chunk。只有 child chunk 会 embedding 并写入 Qdrant，因为 child 粒度小，召回更准；parent 和 overview 保存在 PostgreSQL。检索命中 child 后，再根据 parent_id 回查 parent_context，给最终回答补充完整上下文。  
-> 
-> 检索上，我把 Qdrant 从 dense-only 升级成 dense+sparse hybrid collection。写入时 child 同时有 dense embedding 和 sparse vector；查询时 query 也同时生成 dense 和 sparse，两路在 Qdrant prefetch，然后用 Fusion.RRF 做融合。这样能同时覆盖语义问题和合同编号、邮箱、中文关键词这类 lexical query。  
-> 
-> 同时我保留了 Python BM25 fallback。如果 Qdrant hybrid 不可用，就降级到 vector + local BM25 + weighted rerank。最后我写了 synthetic eval runner，固定文档和 query，比较 python_bm25 与 qdrant_hybrid，输出 hit@1、hit@3、hit@5 和 JSONL 明细。历史报告里 qdrant_hybrid 的 hit@5 达到 0.92，baseline 是 0.54。
+如果面试官追问“这和普通 log 有什么区别”，你可以回答：
 
-### 10.3.9 RAG 常见追问
+> 普通 log 是运行时副产物，不一定结构化，也不一定能被业务查询。ToolCall/Approval 是业务审计实体，有明确状态机，可以被 UI 展示、被审批流程引用、被恢复逻辑引用，也可以后续用于合规和风控统计。
 
-**问：为什么只 child 入向量库？**
+## 10.11 MCP 与 Runtime 的边界
 
-答：
+这一点也很容易被问。你要说清楚：Runtime 不应该知道每个工具的细节，MCP 也不应该决定整个 Agent 的任务规划。
 
-> 因为向量召回需要小粒度、信息密度高的文本。parent 太长，embedding 会稀释关键信息；overview 太概括，容易污染召回。child-only vector upsert 能保持召回精度，parent 通过 parent_id 在命中后补上下文。
-
-**问：怎么保证 parent 和 child 不错位？**
-
-答：
-
-> child metadata 里有 parent_id，parent chunk 在 PostgreSQL 中有对应 chunk_id。检索返回 child 后，用 document_id + parent_id 回查 parent。eval runner 里也检查 child 必须有 parent_id，非 child 不应该有 qdrant_point_id。
-
-**问：如果 hybrid collection schema 不对怎么办？**
-
-答：
-
-> vector_store 里有 hybrid capability 检查，qdrant_hybrid 失败后 retriever 可以 fallback 到 python_bm25_hybrid，并记录 retrieval_warning/fallback_count。这样不会因为 hybrid 不可用导致整个 RAG 崩掉。
-
----
-
-## 10.4 Memory / GSSC / Skill 超详细讲解
-
-### 10.4.1 这个模块的本质
-
-这个模块表面上有三个名字：Memory、GSSC、Skill。  
-但本质只有一个问题：
-
-> Agent 如何带着“合适的历史”和“合适的工作流经验”回答当前问题？
-
-Memory 负责“历史事实”。  
-GSSC 负责“当前该用哪些上下文”。  
-Skill 负责“历史成功流程怎么复用”。
-
-### 10.4.2 Memory 写入不是简单保存聊天记录
-
-简单保存聊天记录的问题：
-
-1. 太多。
-2. 噪声大。
-3. 无法区分短期和长期。
-4. 无法判断哪些该注入。
-5. 用户一句玩笑也可能被当真。
-
-你的 MemoryService 做的是“结构化记忆”，不是聊天日志。
-
-### 10.4.3 Memory extraction 的输入
-
-抽取器会看：
-
-| 输入 | 作用 |
-|---|---|
-| `user_input` | 用户明确表达的偏好/事实 |
-| `agent_output` | Agent 完成了什么 |
-| `page_context` | 当前页面 |
-| `feed_card_context` | 当前卡片 |
-| `matched_skill` | 是否命中 Skill |
-| `created_skill_draft` | 是否生成 Skill 草稿 |
-
-这说明 memory 不只来自用户说的话，也来自 Agent 执行事件。
-
-例如：
-
-```text
-用户：以后都用中文回答我
--> semantic memory: 用户偏好中文回答
-
-用户：对这个 FeedCard 做深度研究
--> episodic memory: 用户对某卡片启动深度研究
-
-系统：生成了一个 Skill 草稿
--> episodic memory: Agent 创建了新的 Skill 草稿
-```
-
-### 10.4.4 LLM extractor 和 regex fallback 的分工
-
-| 抽取方式 | 优点 | 缺点 |
+| 模块 | 负责什么 | 不负责什么 |
 |---|---|---|
-| LLM extractor | 能理解复杂表达 | 可能失败、成本更高 |
-| regex extractor | 稳定、便宜、可控 | 覆盖面有限 |
+| Runtime | 任务流程、节点路由、checkpoint、resume、最终回答 | 每个工具的具体安全策略 |
+| tool_agent | 把任务转成工具调用意图 | 绕过审批直接执行外部工具 |
+| MCP Registry | 管理工具元信息和能力边界 | 生成最终自然语言答案 |
+| ToolExecutor | 参数校验、风险分级、执行、审批状态 | 决定整个任务要不要做 RAG 或 Memory |
+| PermissionService | 记录审批、权限状态 | 替代 LangGraph 状态机 |
 
-所以你的策略是：
+面试话术：
 
-```text
-非 casual chat -> 先 LLM
-LLM 失败 -> regex fallback
-casual chat -> regex/低成本路径
+> Runtime 管流程，MCP 管工具边界。Runtime 只知道现在进入 tool_agent，需要一个工具结果；MCP 负责判断这个工具是否存在、参数是否合法、风险等级是什么、是否需要审批。这样工具安全策略集中在 MCP 层，而不是散落在 Runtime 各个节点里。
+
+## 10.12 MCP 的失败路径怎么处理
+
+工具系统一定会失败。面试官很可能问“如果工具不存在、参数错、审批拒绝、执行异常怎么办”。你要能按路径回答：
+
+1. **工具不存在**：ToolRouter/Registry 查不到 spec，返回结构化错误，Runtime 不应继续假装执行成功。
+2. **参数不完整**：validate 阶段拦截，提示缺少哪些字段，必要时让 final_response 询问用户补充。
+3. **风险 L4**：直接阻断，写审计，不进入执行。
+4. **风险 L3**：进入 waiting_approval，不直接执行。
+5. **用户拒绝审批**：ToolCall/Approval 标记 rejected，Runtime resume 后告诉用户未执行，并可给替代方案。
+6. **provider 执行失败**：记录 error，final_response 做降级说明。
+7. **checkpoint 恢复失败**：服务层返回恢复失败，保留审批记录和错误信息方便排查。
+
+你可以总结成一句：
+
+> MCP 的失败不是异常散落，而是尽量结构化进入状态和审计记录，让 Runtime 可以降级回答，而不是让用户看到一串后端 traceback。
+
+## 10.13 MCP 模块的面试亮点和诚实边界
+
+**可以重点讲：**
+
+- 工具 registry/spec 抽象。
+- ToolRouter + ToolExecutor 统一执行路径。
+- L0-L4 风险分级。
+- L3 人工审批。
+- L4 高危阻断。
+- ToolCall/Approval 审计。
+- interrupt + checkpoint + resume 的审批恢复闭环。
+
+**不要夸大：**
+
+- 不要说“完整 MCP 生态平台”，更稳是“围绕 MCP 工具调用做了一层治理能力”。
+- 不要说“完整 JSON Schema validator”，更稳是“required/format 等基础参数校验，预留完整 schema 扩展”。
+- 不要说“所有危险操作都绝对安全”，更稳是“按风险等级降低误操作概率，并保留审计和人工审批”。
+- 不要说“工具调用可以完全自动修复”，更稳是“失败会结构化返回，由 Runtime/final_response 降级处理或追问用户”。
+
+## 11. MCP 模块要解决什么问题
+
+Agent 工具调用最怕三件事：
+
+1. 模型误调用危险工具。
+2. 参数不完整或格式错误。
+3. 外部写入、删除、发邮件这类操作无法追踪和回滚。
+
+MCP 治理层的任务是：**让工具调用从“模型想调就调”变成“注册、校验、分级、审批、审计”的工程流程。**
+
+## 12. MCP 工具治理流程图
+
+```mermaid
+flowchart TD
+    A["tool_agent 收到 route_plan"] --> B["选择 tool_name + tool_args"]
+    B --> C["ToolRouter 规范化工具名"]
+    C --> D["validate_tool_input<br/>参数校验"]
+    D --> E["ToolExecutor"]
+    E --> F["读取 Tool spec / permission_level"]
+    F --> G{"风险等级"}
+    G -->|L0/L1 读操作| H["直接执行 provider"]
+    G -->|L2 本地写| I["受限写入 / 记录审计"]
+    G -->|L3 外部写| J["创建 Approval + ToolCall<br/>返回 waiting_approval"]
+    G -->|L4 高危| K["直接 blocked"]
+    J --> L["LangGraph interrupt 暂停"]
+    H --> M["写 ToolCall completed"]
+    I --> M
+    K --> N["写 ToolCall blocked"]
 ```
 
-这是一种工程上比较稳的设计。
+## 13. 风险等级怎么讲
 
-### 10.4.5 Memory 保存阈值
+| 等级 | 类型 | 示例 | 策略 |
+|---|---|---|---|
+| L0 | 纯对话 / 内部推理 | 闲聊、解释概念 | 直接执行 |
+| L1 | 读取信息 | 搜索、RAG、读取文件 | 直接执行但记录 |
+| L2 | 本地低风险写 | 生成 artifact、写草稿 | 限制目录或上下文 |
+| L3 | 外部写入 | 发邮件、提交表单、发布内容 | 人工审批 |
+| L4 | 高危不可逆 | 删除、支付、权限修改 | 默认阻断 |
 
-抽取出来的 memory 不会全部保存。  
-保存逻辑会看：
+## 14. ToolCall 和 Approval 的关系
 
-| 指标 | 含义 |
+```mermaid
+erDiagram
+    AgentRun ||--o{ ToolCall : has
+    AgentRun ||--o{ Approval : has
+    ToolCall ||--o| Approval : may_require
+
+    AgentRun {
+        int id
+        string status
+        json graph_state
+    }
+    ToolCall {
+        int id
+        string tool_name
+        json input_json
+        string status
+        json output_json
+    }
+    Approval {
+        int id
+        string status
+        string risk_level
+        json payload
+    }
+```
+
+解释：
+
+> ToolCall 是工具调用事实记录，Approval 是人工审批记录。L3 工具会先创建 ToolCall 和 Approval，但不执行真实 provider。用户批准后，AgentService 根据 ToolCall 执行工具，并把结果通过 Command(resume) 交回 LangGraph。
+
+## 15. MCP 与 Runtime 的交互
+
+MCP 不是孤立模块，它和 Runtime 的 checkpoint 深度结合。
+
+```mermaid
+sequenceDiagram
+    participant RT as Runtime
+    participant TA as tool_agent
+    participant EX as ToolExecutor
+    participant DB as DB
+    participant CP as Checkpoint
+
+    RT->>TA: 执行 tool_agent
+    TA->>EX: execute(tool_name, args)
+    EX->>DB: 创建 ToolCall
+    EX->>DB: 创建 Approval
+    EX-->>TA: waiting_approval
+    TA->>CP: interrupt payload
+    CP-->>RT: graph paused
+```
+
+## 16. MCP 模块面试话术
+
+> 我把 MCP 工具调用做成了一个治理链路。工具不是让 LLM 直接执行，而是先注册成 spec，包括 input_schema、output_schema、permission_level 和 approval_required。tool_agent 选择工具后先经过 ToolRouter 做工具名规范化和参数校验，再进入 ToolExecutor 做风险判断。L3 外部写入会创建 ToolCall 和 Approval，并通过 LangGraph interrupt 暂停；L4 高危操作直接 blocked。这样工具调用有前置约束、人工审批和审计记录。
+
+边界要讲清：
+
+> 当前参数校验主要覆盖 required 字段和部分格式，不能夸成完整 JSON Schema validator。后续可以接入 jsonschema 或 Pydantic 做更严格校验。
+
+---
+
+# 模块三：结构化 RAG 检索
+
+## 16.5 RAG 模块要怎么“讲透”
+
+RAG 这一块面试时最容易讲浅。很多人只会说“我把文档切 chunk，然后 embedding，最后相似度搜索”。你要讲得更工程化：**文档检索不是只做向量相似度，而是要解决切分粒度、召回信号、上下文完整性、证据可用性和效果评估这五个问题。**
+
+普通 RAG 的链路是：
+
+```text
+文档 -> 切 chunk -> embedding -> top-k 相似度 -> 塞给 LLM
+```
+
+这个链路的问题在真实文档里很明显：
+
+1. chunk 太大：一个 chunk 包含太多主题，向量会被平均化，召回不准。
+2. chunk 太小：命中了某句话，但缺少前后条件，回答容易断章取义。
+3. dense embedding 不擅长合同编号、表格字段、专有名词、代码、数字。
+4. 只用 BM25 又不擅长语义改写和同义表达。
+5. 没有 eval 时，优化只能靠主观感觉。
+
+所以你项目的 RAG 要讲成一套组合方案：
+
+```text
+结构化解析
+-> Parent-Child Chunking
+-> child dense/sparse indexing
+-> Qdrant Hybrid Search
+-> Fusion.RRF
+-> parent context enrichment
+-> evidence 进入 GSSC / final_response
+-> synthetic eval 量化对比
+```
+
+面试时可以先用这句话压住全局：
+
+> RAG 模块的核心不是“向量库接入”，而是把“精准召回”和“完整回答上下文”拆开处理。child chunk 用来提高命中精度，parent chunk 用来补足回答上下文；dense 处理语义，sparse 处理关键词、编号和字段；最后用 RRF 融合，并用 eval 检查 hit@k。
+
+## 16.6 RAG 在整体链路里的位置
+
+RAG 不是孤立服务，它和 Runtime、GSSC、Memory 都有关系：
+
+```mermaid
+flowchart TD
+    U["用户问题"] --> RT["Runtime planner"]
+    RT -->|route=rag_agent| GSSC["GSSC 构建任务上下文"]
+    GSSC --> RAG["rag_agent / RagService"]
+    RAG --> AN["Query Analyzer"]
+    AN --> VS["QdrantVectorStore"]
+    VS --> QD["Qdrant Hybrid Search"]
+    QD --> HIT["child hits"]
+    HIT --> PG["PostgreSQL 查 parent/metadata"]
+    PG --> EV["Evidence List"]
+    EV --> GSSC2["GSSC / final_response"]
+    GSSC2 --> OUT["基于证据回答"]
+```
+
+这里可以这样解释：
+
+> Runtime 判断这是文档问题后，把任务路由到 rag_agent。rag_agent 不直接把全部文档塞给模型，而是调用检索服务。检索服务先分析 query，再走 Qdrant hybrid 召回 child chunk，命中后回查 parent chunk 和文档 metadata，最后把 evidence list 交给 final_response。GSSC 在中间负责把 RAG evidence 和最近对话、用户偏好等其他上下文一起组织进 prompt。
+
+这句话里体现了两个重点：
+
+1. RAG 只负责证据检索，不负责整个 Agent 编排。
+2. RAG evidence 不是直接裸塞，而是进入上下文治理层。
+
+## 16.7 为什么要做结构化解析与层级 chunk
+
+真实文档不是一整块自然语言。它可能包含标题、章节、列表、表格、编号、脚注、代码块、附件说明。直接按固定字符数切分，会破坏文档结构。
+
+举个例子：
+
+```text
+2.4 违约责任
+甲方未按时付款，应按每日 0.05% 支付违约金。
+但因不可抗力导致延期的，不适用本条。
+```
+
+如果 chunk 切得太小，只命中“每日 0.05%”，模型可能回答“违约金是每日 0.05%”，但漏掉“不可抗力不适用”的限制条件。如果 chunk 切得太大，这一节和前后很多无关条款混在一起，向量相似度又会变差。
+
+Parent-Child 的解决思路是：
+
+```text
+Parent: 保留完整语义单元，例如一个章节、一个段落组、一个表格上下文
+Child: 从 Parent 内部切出更小片段，用来做精准召回
+```
+
+你可以这样讲：
+
+> child 是检索粒度，parent 是回答粒度。检索时要小，回答时要完整。这是 RAG 里非常关键的粒度解耦。
+
+## 16.8 Overview / Parent / Child 三类 chunk 怎么分工
+
+你的文档里可以把三类 chunk 讲得更细：
+
+| chunk 类型 | 主要作用 | 是否适合作为检索点 | 是否适合作为回答上下文 |
+|---|---|---|---|
+| Overview | 表示文档整体摘要、主题、来源 | 适合粗召回或文档级判断 | 可作为背景 |
+| Parent | 保留完整段落、章节、表格上下文 | 不一定直接向量检索 | 非常适合回答 |
+| Child | 小片段、语义焦点清晰 | 非常适合检索 | 单独回答可能不完整 |
+
+更直白的面试表达：
+
+> Overview 解决“这个文档大概是什么”，Parent 解决“回答时上下文够不够”，Child 解决“向量空间里能不能准命中”。
+
+这三者形成的链路是：
+
+```mermaid
+flowchart TD
+    D["原始文档"] --> O["Overview Chunk<br/>文档级摘要"]
+    D --> P1["Parent Chunk A<br/>完整章节/段落组"]
+    D --> P2["Parent Chunk B<br/>完整章节/段落组"]
+    P1 --> C11["Child A1"]
+    P1 --> C12["Child A2"]
+    P1 --> C13["Child A3"]
+    P2 --> C21["Child B1"]
+    P2 --> C22["Child B2"]
+    C11 --> IDX["Qdrant index"]
+    C12 --> IDX
+    C13 --> IDX
+    C21 --> IDX
+    C22 --> IDX
+    IDX --> HIT["命中 child"]
+    HIT --> BACK["回查 parent"]
+```
+
+## 16.9 为什么 dense + sparse 都要有
+
+只用 dense embedding 的问题是，它擅长语义相似，但对精确 token 不稳定。比如：
+
+```text
+“HT-2026-001 的付款期限是什么？”
+“第 3.2.1 条的责任上限是多少？”
+“CSV 里的 inventory_count 字段是什么意思？”
+```
+
+这些问题里，编号、字段名、合同号非常关键。dense 可能知道“付款期限”和“责任上限”的语义，但可能漏掉具体编号。sparse/BM25 对这些 token 更敏感。
+
+只用 sparse 的问题是，它对语义改写不友好。比如：
+
+```text
+用户问：这家公司什么时候可以不赔偿？
+文档写：因不可抗力导致延期的，不承担违约责任。
+```
+
+这时候 dense 更容易把“可以不赔偿”和“不承担违约责任”连起来。
+
+所以 hybrid 的价值是互补：
+
+| 查询类型 | dense 价值 | sparse 价值 |
+|---|---|---|
+| 语义改写问题 | 高 | 中 |
+| 合同号/编号/字段名 | 中或低 | 高 |
+| 表格列名/代码符号 | 中 | 高 |
+| 长自然语言问题 | 高 | 中 |
+| 用户关键词很明确 | 中 | 高 |
+
+面试时可以说：
+
+> dense 负责“意思像不像”，sparse 负责“字面上有没有”。真实企业文档里编号、字段、金额、条款号很多，所以只用 dense 不够稳。
+
+## 16.10 RRF 融合为什么比简单加权好讲
+
+Qdrant native hybrid 里使用 Fusion.RRF。RRF 的直觉是：不直接比较 dense score 和 sparse score 的绝对值，而是根据两个列表里的排名做融合。
+
+为什么这有价值？
+
+1. dense score 和 sparse score 的分布不同，直接相加不一定合理。
+2. RRF 更关注“在多个检索器里排名都靠前”的结果。
+3. 对分数尺度不敏感，更适合多路召回融合。
+
+可以这样讲：
+
+> RRF 不是问“两个分数怎么相加”，而是问“这个候选在多个召回列表里是不是都排得靠前”。这样避免 dense/sparse 分数尺度不同导致融合不稳定。
+
+你不需要在面试里推公式，但可以知道它的直觉：
+
+```text
+如果一个 chunk 在 dense 排第 2，在 sparse 排第 3，
+通常比一个只在 dense 排第 1、sparse 完全没命中的 chunk 更值得保留。
+```
+
+## 16.11 Parent context enrichment 为什么是回答质量关键
+
+命中 child 后，如果直接把 child 发给 LLM，会有两个风险：
+
+1. **证据碎片化**：只有一句话，没有前后限制条件。
+2. **引用不可解释**：最终回答无法说明来自哪个文档、哪个章节。
+
+所以需要 parent context enrichment：
+
+```text
+child hit
+-> child.parent_id
+-> PostgreSQL 查询 parent chunk
+-> 合并 parent text / metadata / document source
+-> evidence item
+```
+
+这一步要讲成“RAG 证据可用性”的增强，而不只是“多查一次数据库”。
+
+面试话术：
+
+> 检索命中的是 child，但最终给模型的是带 parent context 的 evidence。这样能同时保证召回时的精度和回答时的完整性，尤其适合合同、报告、长章节和表格上下文。
+
+## 16.12 RAG 与 GSSC 的关系
+
+RAG 检索出的 evidence 不是最终 prompt 的唯一来源。用户可能刚刚说过“只看第二份文档”，Memory 里可能记录了“用户喜欢中文回答”，conversation summary 里可能有前文约束。因此 evidence 要进入 GSSC，由上下文选择器统一组织。
+
+```mermaid
+flowchart LR
+    RAG["RAG Evidence"] --> G["GSSC"]
+    H["Recent History"] --> G
+    S["Running Summary"] --> G
+    M["Relevant Memory"] --> G
+    F["FeedCard / Page Context"] --> G
+    G --> P["Prompt Sections"]
+    P --> LLM["final_response LLM"]
+```
+
+这点可以这样讲：
+
+> RAG 解决“外部文档证据”，GSSC 解决“这些证据和当前对话、用户偏好、任务约束如何一起进入 prompt”。如果没有 GSSC，RAG evidence 可能和用户最新要求冲突，或者把不相关证据塞进去造成污染。
+
+## 16.13 RAG eval 该怎么解释
+
+RAG 优化最怕“感觉变好了”。你的项目里有 synthetic eval runner，所以面试时要把它讲成工程闭环：
+
+```text
+固定文档集
+固定 query 集
+固定 expected evidence / keyword
+跑不同 backend
+比较 hit@1 / hit@3 / hit@5 / keyword_hit_rate / fallback_count / latency
+```
+
+你可以说：
+
+> 我用 synthetic eval 来比较不同检索 backend，不是只看最终生成回答，而是先看 evidence 能不能命中。因为 RAG 如果证据没召回，后面模型再强也只能胡编或答偏。
+
+关于 `hit@5 0.54 -> 0.92`，一定要加边界：
+
+> 这是自建 synthetic eval 集上的 backend 对比指标，不是线上真实用户 A/B 指标。
+
+这样讲非常稳。面试官通常不怕你指标小，怕你乱讲指标来源。
+
+## 16.14 RAG 的失败与降级
+
+面试官可能问“如果没检索到怎么办”。你要把失败路径说清楚：
+
+1. **Qdrant 不可用**：走 fallback backend 或返回检索失败信息。
+2. **dense/sparse 某一路失败**：优先使用另一条路径或 fallback。
+3. **top-k 分数太低**：final_response 明确说明“未找到足够证据”，不要编。
+4. **命中 child 但 parent 缺失**：返回 child text，同时标记上下文不完整。
+5. **用户问题超出文档范围**：回答边界，提示需要更多资料。
+6. **多文档证据冲突**：把冲突交给 final_response/evaluator，让回答说明不同来源。
+
+工程话术：
+
+> RAG 的底线是宁可说证据不足，也不要把低置信证据包装成确定答案。检索失败应该进入可解释降级，而不是让模型自由发挥。
+
+## 16.15 RAG 模块的面试亮点和诚实边界
+
+**可以重点讲：**
+
+- 结构化文档解析。
+- Overview/Parent/Child 层级 chunk。
+- child 用于精准召回，parent 用于回答上下文。
+- Qdrant dense/sparse hybrid。
+- Fusion.RRF 融合排序。
+- parent context enrichment。
+- synthetic eval 和 hit@k 指标。
+- 与 GSSC 结合，避免证据裸塞 prompt。
+
+**不要夸大：**
+
+- 不要说“所有文档格式都完美解析”，说“支持常见格式并保留结构化扩展”更稳。
+- 不要说“线上 hit@5 提升”，说“自建 synthetic eval 集”。
+- 不要说“RAG 可以完全避免幻觉”，说“通过 evidence 和低置信降级降低幻觉风险”。
+- 不要说“RRF 是我发明的算法”，说“使用 Qdrant native Fusion.RRF 做多路召回融合”。
+
+## 17. RAG 模块要解决什么问题
+
+普通 RAG 的问题：
+
+1. chunk 太大，召回不准。
+2. chunk 太小，回答缺上下文。
+3. dense embedding 对合同号、编号、表字段不敏感。
+4. 单纯 BM25 又不理解语义。
+5. 没有 eval，就不知道优化有没有效果。
+
+你的方案是：
+
+```text
+Parent-Child Chunking + Qdrant Hybrid Search + RRF + Parent Context Enrichment + Eval
+```
+
+## 18. RAG 写入链路
+
+```mermaid
+flowchart TD
+    A["上传文档"] --> B["DocumentService"]
+    B --> C["DocumentParser<br/>PDF / Markdown / CSV / TXT"]
+    C --> D["StructuredChunker"]
+    D --> E["Overview Chunk"]
+    D --> F["Parent Chunk"]
+    D --> G["Child Chunk"]
+    G --> H["Embedding dense vector"]
+    G --> I["Sparse encoder / BM25 signal"]
+    H --> J["Qdrant upsert"]
+    I --> J
+    E --> PG["PostgreSQL DocumentChunk"]
+    F --> PG
+    G --> PG
+```
+
+核心设计：
+
+- Overview：适合文档整体摘要。
+- Parent：适合给回答补上下文。
+- Child：适合做向量检索命中。
+- 只有 child 需要进 Qdrant 检索。
+- parent/overview 保存在 PG，检索命中 child 后回查。
+
+## 19. RAG 查询链路
+
+```mermaid
+sequenceDiagram
+    participant User as 用户问题
+    participant RAG as RagService/Retriever
+    participant VS as QdrantVectorStore
+    participant Q as Qdrant
+    participant PG as PostgreSQL
+    participant RR as Reranker/Enrich
+
+    User->>RAG: query
+    RAG->>RAG: query analyzer
+    RAG->>VS: search_hybrid(query_vector, query_text)
+    VS->>Q: dense prefetch
+    VS->>Q: sparse prefetch
+    Q-->>VS: Fusion.RRF hits
+    VS-->>RAG: child hits
+    RAG->>PG: 根据 parent_id 回查 parent
+    PG-->>RAG: parent context
+    RAG->>RR: rerank / enrich
+    RR-->>RAG: evidence list
+```
+
+## 20. Parent-Child 为什么重要
+
+可以用这个图讲：
+
+```mermaid
+flowchart LR
+    A["大段 Parent<br/>包含完整上下文"] --> B["切成多个 Child"]
+    B --> C1["Child 1<br/>适合精确命中"]
+    B --> C2["Child 2<br/>适合关键词命中"]
+    B --> C3["Child 3<br/>适合语义命中"]
+    C2 --> D["检索命中"]
+    D --> E["回查 Parent"]
+    E --> F["回答时有完整上下文"]
+```
+
+面试讲法：
+
+> child chunk 小，向量空间里更容易准确命中；parent chunk 大，包含完整段落、表格上下文或前后约束。检索只命中 child 的话回答容易断章取义，所以我在返回 evidence 前根据 parent_id 回查 parent，把命中精度和回答完整性分开处理。
+
+## 21. Qdrant Hybrid 和 RRF
+
+当前 native hybrid 路径使用 Qdrant 的 Fusion.RRF。
+
+```mermaid
+flowchart TD
+    Q["用户 query"] --> D["Dense embedding"]
+    Q --> S["Sparse/BM25 representation"]
+    D --> DH["Dense hits"]
+    S --> SH["Sparse hits"]
+    DH --> RRF["Fusion.RRF"]
+    SH --> RRF
+    RRF --> TOP["Top-k fused child chunks"]
+```
+
+为什么要 hybrid：
+
+| 查询类型 | dense 强项 | sparse 强项 |
+|---|---|---|
+| “这份合同的风险是什么” | 好 | 一般 |
+| “合同编号 HT-2026-001 是多少” | 可能漏 | 强 |
+| “表里库存字段是多少” | 一般 | 强 |
+| “这段话表达的核心问题” | 强 | 一般 |
+
+## 22. RAG eval 怎么讲
+
+项目里有 synthetic RAG eval runner。你可以说：
+
+> 我没有只靠主观感觉调 RAG，而是写了 eval runner，对固定测试文档和 query 跑不同 backend，输出 hit@1、hit@3、hit@5、keyword_hit_rate、fallback_count 和 latency。当前可以说在自建 synthetic eval 中，Qdrant hybrid 相比 baseline hit@5 有明显提升。
+
+注意措辞：
+
+- 可以说“自建 synthetic RAG eval”。
+- 不要说“线上真实用户指标”。
+- 如果说 hit@5 0.54 到 0.92，要补一句“在自建评估集上”。
+
+## 23. RAG 模块面试话术
+
+> RAG 这块我重点解决两个矛盾：精确召回和完整上下文。切分时我用了 Parent-Child Chunking：child 小，负责检索；parent 大，负责回答时补上下文。检索时优先 Qdrant native hybrid，dense 负责语义，sparse 负责编号、关键词、表字段等精确信号，最后用 RRF 融合。命中 child 后再回查 parent context，保证 evidence 不是碎片。为了避免凭感觉优化，我还做了 synthetic eval runner，比较不同 backend 的 hit@5、keyword_hit_rate 和 fallback_count。
+
+---
+
+# 模块四：Memory / GSSC 上下文工程
+
+## 23.5 Memory/GSSC 模块要怎么“讲透”
+
+Memory/GSSC 是四个模块里最容易讲出差异化的一块，因为很多 Agent 项目只做两件事：
+
+```text
+取最近 N 条对话 + 检索一点历史记忆
+```
+
+这只能解决很轻的多轮对话。一旦对话超过几十轮，就会出现三类问题：
+
+1. **早期事实丢失**：用户第 3 轮说的约束，到第 100 轮已经不在最近窗口里。
+2. **上下文污染**：把所有历史、所有记忆、所有 RAG 证据都塞进 prompt，模型反而分不清重点。
+3. **token 浪费**：大量无关历史占据上下文，真正证据和当前任务被挤掉。
+
+你这个模块要讲成“上下文治理系统”，而不是“记忆表”。核心思想是：
+
+```text
+不要把所有东西都塞给模型；
+先分层存储，再按任务动态选择，再结构化组织，再在预算内压缩。
+```
+
+这就是 GSSC：
+
+```text
+Gather: 收集候选上下文
+Select: 按 route / answer_mode / budget 选择
+Structure: 组织成 prompt section
+Compress: 超预算时压缩或裁剪
+```
+
+面试时可以用这句话开场：
+
+> Memory/GSSC 解决的不是“如何存一条记忆”，而是“每次模型调用前，哪些历史事实、用户偏好、对话摘要、RAG 证据和任务约束应该进入上下文”。我把上下文当成一种有限预算资源来治理，而不是无限堆 prompt。
+
+## 23.6 为什么不能只靠最近消息窗口
+
+项目里现在配置 `conversation_recent_message_limit=24`，这代表每次只保留最近 24 条原文消息。这个窗口很必要，因为最近消息保留了最完整的指代关系和交互细节，比如：
+
+```text
+用户：这个方案按刚才第二版来
+助手：第二版指的是……
+用户：对，继续扩展
+```
+
+这种“刚才”“第二版”“继续”如果没有最近原文，很难理解。
+
+但只靠最近窗口不够。原因是：
+
+```text
+100 轮对话 = 大约 200 条 message
+最近 24 条只能覆盖最后一小段
+早期需求、约束、用户偏好、阶段性结论会自然消失
+```
+
+所以正确设计不是把窗口无限放大，而是做分层：
+
+| 层 | 解决什么 | 为什么需要 |
+|---|---|---|
+| Recent messages | 最近指代、短期上下文 | 保留原文细节 |
+| Running summary | 全局连续摘要 | 覆盖被窗口挤出去的主线 |
+| Historical segments | 可检索历史片段 | 找回某个早期具体事实 |
+| Long-term memory | 稳定偏好和事实 | 跨会话复用 |
+| GSSC selection | 控制注入哪些内容 | 避免污染和 token 爆炸 |
+
+可以这样讲：
+
+> 最近消息解决“刚才说了什么”，summary 解决“这段对话整体进行到哪”，segment 解决“很久以前某个具体事实怎么找回”，long-term memory 解决“跨任务稳定偏好和事实怎么沉淀”。这几层职责不同，不能互相替代。
+
+## 23.7 三层 Memory 的工程含义
+
+三层 Memory 不是为了概念好听，而是为了区分不同生命周期的信息。
+
+### Working Memory
+
+Working memory 是当前任务里的临时状态，比如：
+
+- 当前正在分析哪份文档。
+- 本次 run 里已经完成哪些步骤。
+- 用户刚刚指定“先不要写最终报告”。
+- 当前工具审批正在等待。
+
+它的特点是短期、任务内有效，不一定要长期沉淀。面试可以说：
+
+> working memory 更像 run 内状态，不是所有临时信息都应该变成长期记忆，否则会污染用户画像。
+
+### Episodic Memory
+
+Episodic memory 记录历史事件和任务经历，比如：
+
+- 用户上次让系统分析了某个竞品报告。
+- 某次任务生成过一份研究结论。
+- 用户在某个项目阶段采用了 A 方案而放弃 B 方案。
+
+它的价值是“以后提到上次那个任务时能接得上”。但它不一定是永久事实，因为任务会过期。
+
+面试表达：
+
+> episodic memory 解决的是“历史发生过什么”。它比 summary 更结构化，比 semantic memory 更事件化。
+
+### Semantic Memory
+
+Semantic memory 记录稳定事实和偏好，比如：
+
+- 用户偏好中文回答。
+- 用户项目技术栈是 LangGraph + FastAPI + PostgreSQL + Qdrant。
+- 用户面试方向偏 Agent 工程化。
+- 用户希望简历表述不要夸大。
+
+它最适合跨会话、跨任务复用。
+
+面试表达：
+
+> semantic memory 解决的是“长期稳定的用户事实和偏好”。这类信息应该有 importance、confidence、evidence_count、last_seen 等字段辅助治理，不能一抽取就永久相信。
+
+## 23.8 Memory 写入为什么要抽取、过滤、去重、固化
+
+记忆写入不能等于“用户说了什么就全部存”。如果全部存，会出现：
+
+1. 临时闲聊变成长期偏好。
+2. 错误事实被长期引用。
+3. 重复记忆越来越多。
+4. 旧偏好和新偏好冲突。
+5. 检索出来的 memory 噪声很大。
+
+所以写入流程应当是：
+
+```mermaid
+flowchart TD
+    A["候选对话 / agent result"] --> B["MemoryExtractor 抽取候选记忆"]
+    B --> C["分类 working / episodic / semantic"]
+    C --> D["importance / confidence / stability 过滤"]
+    D --> E["相似度去重"]
+    E --> F{"已有相似 memory?"}
+    F -->|是| G["更新 evidence_count / last_seen / metadata"]
+    F -->|否| H["创建新 memory"]
+    G --> I["PostgreSQL"]
+    H --> I
+    I --> J["部分 memory 写入向量索引"]
+```
+
+这里可以讲一个核心工程原则：
+
+> Memory 写入的关键不是多存，而是控制什么值得长期影响后续回答。
+
+如果面试官问“怎么判断值得存”，你可以回答：
+
+- 明确用户偏好的，优先存 semantic。
+- 明确历史任务产物的，存 episodic。
+- 临时过程状态，不长期固化。
+- 低置信、低重要性、语义重复的候选过滤或合并。
+- 同一偏好多次出现时提高 evidence_count，而不是生成很多重复行。
+
+## 23.9 Conversation Running Summary 的作用
+
+Running summary 是对当前 conversation 的连续压缩。它不是某一轮摘要，而是随对话推进不断更新的“主线状态”。
+
+它适合保存：
+
+- 用户最初的问题背景。
+- 已经达成的阶段性结论。
+- 当前方案的关键约束。
+- 中途被修改过的方向。
+- 后续回答必须遵守的要求。
+
+它不适合保存：
+
+- 每一句原文。
+- 所有工具调用细节。
+- 需要精确引用的证据原文。
+- 可以从 RAG 重新检索的文档内容。
+
+面试话术：
+
+> running summary 是为了解决最近消息窗口之外的“对话主线丢失”。它保留的是压缩后的连续状态，不替代最近原文，也不替代可检索 segment。
+
+需要诚实说明当前状态：
+
+> 当前普通 completed/failed 路径已经接入 summary 更新；segment 服务、表、召回和 GSSC 注入也具备，但普通 completed path 的 segment creation hook 还需要补齐，不能夸成每轮普通对话都自动切 segment。
+
+这句话虽然暴露边界，但反而显得你很懂工程真实状态。
+
+## 23.10 Historical Segment 为什么不同于 Summary
+
+Summary 是全局压缩，优点是短，缺点是细节会损失。Segment 是历史片段压缩和索引，优点是可按 query 找回具体段落。
+
+可以这样类比：
+
+```text
+Running Summary = 这本书到目前为止的剧情梗概
+Historical Segment = 某几章的压缩片段，可以按问题检索
+Recent Messages = 最新几页原文
+```
+
+三者都需要：
+
+| 机制 | 优点 | 缺点 |
+|---|---|---|
+| Recent messages | 精确、保留原文 | 覆盖范围短 |
+| Running summary | 覆盖全局主线 | 会丢细节 |
+| Historical segments | 能找回早期具体事实 | 需要切分、索引和触发策略 |
+
+segment 适合解决这种问题：
+
+```text
+第 5 轮用户说：我的目标岗位是 Agent 工程化方向。
+第 130 轮用户问：按照我最开始说的岗位方向重写。
+```
+
+如果只看最近 24 条，这个信息可能消失。summary 可能保留“用户在准备面试”，但未必保留“Agent 工程化方向”。segment 检索可以按 query 找回早期片段。
+
+面试表达：
+
+> summary 解决连续性，segment 解决可检索历史事实。summary 是全局压缩，segment 是局部历史索引，两者互补。
+
+## 23.11 GSSC 的 Gather 阶段
+
+Gather 阶段不是把所有内容直接塞进 prompt，而是收集候选上下文。候选来源包括：
+
+- 当前 task。
+- 最近 conversation history。
+- conversation running summary。
+- relevant historical segments。
+- relevant memory。
+- RAG evidence。
+- FeedCard/page context。
+- graph/checkpoint context。
+- dynamic preferences。
+- skill match 结果。
+
+Gather 的输出可以理解为一堆候选 section：
+
+```text
+CandidateContext[]
+  - source: memory / evidence / conversation_summary / ...
+  - content: 文本或结构化内容
+  - score: 相关性
+  - token_estimate: 预计 token
+  - priority: 初始优先级
+  - metadata: 来源、时间、文档、run 等
+```
+
+你可以说：
+
+> Gather 阶段要尽量全，但还不代表全部进入 prompt。它只是把可能相关的信息拿到桌面上，后面的 Select 再决定谁进上下文。
+
+## 23.12 GSSC 的 Select 阶段
+
+Select 是 GSSC 的核心。不同 route 对上下文需求不同：
+
+- RAG 问答：evidence 最高优先级。
+- 普通聊天：最近对话和用户偏好更重要。
+- 工具调用：task、确认信息、审批状态更重要。
+- Memory 写入：用户表达和历史记忆冲突更重要。
+- Skill 复用：历史 workflow 和 context contract 更重要。
+
+可以这样讲：
+
+> 我没有用一个固定 prompt 模板处理所有任务，而是按 route-aware weights 对上下文来源加权。RAG route 会优先 evidence，tool route 会优先 task 和 approval context，chat route 会更重 history/summary/memory。
+
+Select 需要解决的是“有限预算下的排序问题”：
+
+```text
+候选上下文很多
+LLM context budget 有限
+不同任务需要的信息不同
+所以需要按 route、answer_mode、相关性、来源权重和 token 预算选择
+```
+
+这也解释了为什么 GSSC 比“直接拼 prompt”更工程化。
+
+## 23.13 GSSC 的 Structure 阶段
+
+Structure 是把选中的上下文组织成稳定 section，而不是杂乱拼接。比如：
+
+```text
+## Task
+当前用户问题
+
+## Conversation Summary
+对话主线摘要
+
+## Relevant History
+召回的历史片段
+
+## Relevant Memory
+用户偏好和长期事实
+
+## Evidence
+RAG 检索证据
+
+## Constraints
+工具审批、安全边界、回答格式
+```
+
+结构化的好处：
+
+1. LLM 更容易区分证据、偏好、历史和任务。
+2. evaluator/final_response 可以明确使用哪些 section。
+3. debug 时能看出是哪个 source 污染了回答。
+4. 后续做 prompt 评估和 ablation 更容易。
+
+面试表达：
+
+> Structure 的价值是降低上下文歧义。模型不只需要内容，还需要知道这些内容属于什么角色：是证据、偏好、历史，还是当前任务约束。
+
+## 23.14 GSSC 的 Compress 阶段
+
+Compress 不是简单截断最后几段，而是在 token 超预算时有策略地压缩：
+
+- 低优先级 section 先裁剪。
+- 冗余 memory 合并。
+- 过长 history 用 summary 替代。
+- RAG evidence 保留高分证据，低分证据裁剪。
+- 保留来源标识，避免压缩后无法解释。
+
+你可以这样讲：
+
+> 直接截断 prompt 的风险是把最重要的约束截掉。GSSC 的 compress 至少知道每段上下文的 source 和优先级，可以更有策略地牺牲低价值内容。
+
+这也是为什么“上下文工程”不是简单 prompt engineering。它更像一个小型调度器：
+
+```text
+信息来源 = 任务
+token budget = 资源
+route weights = 调度策略
+selected prompt = 调度结果
+```
+
+## 23.15 Memory/GSSC 与 SummarizationMiddleware 的区别
+
+用户前面问过百轮记忆丢失。这里可以把区别讲清楚：
+
+**普通 SummarizationMiddleware** 通常解决的是：
+
+```text
+当消息太多时，把历史对话压缩成一个 summary，继续放进上下文。
+```
+
+它的优点是简单、通用、容易接入。缺点是：
+
+1. 主要是线性压缩，不一定支持按 query 找回某个早期事实。
+2. summary 会逐轮丢细节，尤其是数字、偏好、边界条件。
+3. 它通常不区分 memory、RAG evidence、tool approval、feed context 的不同角色。
+4. 它解决的是“历史太长”，不是完整的“上下文选择”问题。
+
+你的方法更像：
+
+```text
+recent messages + running summary + retrievable segments + long-term memory + GSSC route-aware selection
+```
+
+所以可以这样回答：
+
+> SummarizationMiddleware 是一个摘要中间件，主要解决上下文长度问题；我现在这套是上下文工程链路，除了 running summary，还把历史切成可检索 segment，把稳定偏好沉淀成 memory，再由 GSSC 按任务路线选择注入。它更复杂，但能解决 summary 单点压缩导致的早期事实丢失和上下文污染。
+
+但也要诚实：
+
+> 如果只是简单聊天，SummarizationMiddleware 更轻量；如果是长任务、多工具、RAG、用户偏好和历史事实都要参与的 Agent 平台，GSSC + summary + segment + memory 的组合更适合。
+
+## 23.16 Memory/GSSC 的失败路径和治理
+
+Memory 系统也会出错。你要能讲这些风险：
+
+1. **错误记忆写入**：模型误抽取，把临时话当长期偏好。
+2. **记忆冲突**：用户以前喜欢中文，现在要求英文。
+3. **记忆过期**：旧项目事实不再成立。
+4. **召回噪声**：相似但不相关的 memory 被选中。
+5. **summary 漂移**：连续摘要逐渐偏离原始对话。
+6. **segment 缺失**：切分触发不完整，某些历史没被索引。
+
+对应治理方式：
+
+- importance/confidence/stability 过滤。
+- evidence_count/last_seen 辅助判断稳定性。
+- 最近用户明确表达优先于旧 memory。
+- GSSC 用 route 权重和 token 预算控制注入。
+- debug 信息记录哪些 source 被选中。
+- 对关键事实尽量使用 segment/RAG 原文，而不是只信 summary。
+
+面试话术：
+
+> Memory 不是越多越好，它本身也会污染上下文。所以我把 memory 作为候选上下文，而不是绝对指令；最终是否注入由 GSSC 决定，并且要考虑时效、置信度和当前用户显式要求。
+
+## 23.17 Memory/GSSC 模块的面试亮点和诚实边界
+
+**可以重点讲：**
+
+- 三层 memory：working / episodic / semantic。
+- MemoryExtractor 抽取候选，写入前过滤和去重。
+- semantic/episodic memory 可进入向量召回。
+- 最近消息窗口使用配置 `conversation_recent_message_limit=24`。
+- running summary 缓解长对话主线丢失。
+- historical segment 用于早期事实可检索召回。
+- GSSC 按 Gather/Select/Structure/Compress 组织上下文。
+- route-aware weights 根据任务选择不同上下文。
+- 与 RAG、Tool、Skill、Runtime 都有交互。
+
+**不要夸大：**
+
+- 不要说“彻底解决百轮记忆”，说“缓解百轮对话早期事实丢失，并通过 summary/segment/memory 多层兜底”。
+- 不要说“GSSC 是学习型最优上下文选择器”，说“启发式 route-aware 上下文选择器”。
+- 不要说“segment 每轮普通对话都已自动创建”，当前普通 completed path 的 creation hook 还需要补。
+- 不要说“memory 永远正确”，说“通过过滤、去重、置信度和当前上下文优先级降低污染”。
+
+## 24. Memory/GSSC 要解决什么问题
+
+Agent 的上下文问题通常有四类：
+
+1. 用户偏好丢失。
+2. 历史任务不可复用。
+3. 早期对话事实在百轮后消失。
+4. 把所有东西塞进 prompt 导致 token 爆炸和上下文污染。
+
+你的解决思路不是“全部塞进去”，而是“分层存储 + 按任务选择”。
+
+```mermaid
+flowchart TD
+    A["用户输入"] --> B["Memory Search"]
+    A --> C["Conversation History"]
+    A --> D["Running Summary"]
+    A --> E["Historical Segments"]
+    A --> F["RAG Evidence"]
+    A --> G["FeedCard / Page Context"]
+    B --> H["GSSC"]
+    C --> H
+    D --> H
+    E --> H
+    F --> H
+    G --> H
+    H --> I["Selected Context"]
+    I --> J["Final Response / Agents"]
+```
+
+## 25. 三层 Memory
+
+| 类型 | 存什么 | 例子 | 生命周期 |
+|---|---|---|---|
+| working | 当前任务临时状态 | 当前正在分析某个文档 | 短 |
+| episodic | 历史任务和事件 | 用户上次生成了研究报告 | 中 |
+| semantic | 稳定偏好和事实 | 用户喜欢中文回答、项目技术栈 | 长 |
+
+写入流程：
+
+```mermaid
+flowchart TD
+    A["memory_agent"] --> B["MemoryExtractor"]
+    B --> C{"LLM 抽取成功?"}
+    C -->|是| D["结构化 candidates"]
+    C -->|否| E["Regex fallback"]
+    D --> F["importance / confidence / stability 过滤"]
+    E --> F
+    F --> G["相似度去重"]
+    G --> H{"已有相似 memory?"}
+    H -->|是| I["更新 evidence_count / last_seen"]
+    H -->|否| J["创建新 memory"]
+    I --> K["PostgreSQL"]
+    J --> K
+    K --> L["semantic / episodic 写 Qdrant"]
+```
+
+## 26. GSSC：Gather / Select / Structure / Compress
+
+GSSC 是上下文选择器：
+
+```mermaid
+flowchart LR
+    A["Gather<br/>收集所有候选上下文"] --> B["Select<br/>按 route 权重和预算选择"]
+    B --> C["Structure<br/>组织成固定 section"]
+    C --> D["Compress<br/>超预算压缩"]
+```
+
+### 26.1 Gather 收什么
+
+| source | section |
 |---|---|
-| confidence | 抽取器有多确定 |
-| importance | 这条记忆有多重要 |
-| stability | 是 session、medium_term 还是 long_term |
-| category | 属于偏好、项目目标、技术栈、边界还是普通事件 |
+| `task` | Task |
+| `profile` | User Profile |
+| `conversation_history` | Conversation History |
+| `conversation_segments` | Conversation Continuity |
+| `conversation_summary` | Conversation Summary |
+| `memory` | Relevant Memory |
+| `evidence` | Evidence |
+| `feed_card` | Feed Card Context |
+| `dynamic_preferences` | Dynamic Preferences |
+| `graph_context` | Graph Context |
+| `checkpoint_summary` | Checkpoint Summary |
 
-低置信度、低重要度的会 filtered_out。
+### 26.2 Select 怎么选
 
-面试可以讲：
+不同 route 权重不同。比如：
 
-> 我给 Memory 写入加了质量门槛。LLM 抽取出的内容要过 confidence 和 importance 阈值，避免把临时闲聊或不确定推断写成长记忆。
-
-### 10.4.6 Memory 搜索为什么要 PG + Qdrant
-
-PostgreSQL 和 Qdrant 分工：
-
-| 存储 | 作用 |
+| route | 高优先级上下文 |
 |---|---|
-| PostgreSQL | 权威记录、过滤、状态、metadata、删除 |
-| Qdrant | semantic/episodic 语义召回 |
+| chat | conversation_history、conversation_summary、memory |
+| rag | evidence、task、conversation_history |
+| tool | task、conversation_history、checkpoint_summary |
+| skill | memory、conversation_history、conversation_segments |
+| research | feed_card、evidence、checkpoint_summary |
 
-为什么不能只用 Qdrant？
+解释：
 
-1. 删除/归档/状态管理不方便。
-2. metadata 更新和审计不如 DB。
-3. Qdrant 是检索索引，不适合作为唯一事实源。
+> RAG 问答时 evidence 最重要，普通聊天时最近对话和用户偏好更重要，工具动作时 task 和 tool boundary 更重要。GSSC 用 route-aware weights 控制不同上下文进入 prompt 的概率。
 
-为什么不能只用 PostgreSQL LIKE？
+## 27. Conversation Summary 与 Segment
 
-1. 语义召回弱。
-2. 用户换一种说法就搜不到。
+### 27.1 为什么需要长对话记忆
 
-所以组合是合理的：
+100 轮对话 = 200 条 message。如果只取最近 24 条，早期事实一定会消失。所以当前方案分三层：
 
-```text
-PG authoritative store + Qdrant semantic index
+```mermaid
+flowchart TD
+    A["长对话消息"] --> B["最近 24 条原文<br/>Conversation History"]
+    A --> C["Running Summary<br/>全局连续摘要"]
+    A --> D["Historical Segments<br/>旧消息分段压缩"]
+    D --> E["PG 权威存储"]
+    D --> F["Qdrant 向量索引"]
+    B --> G["GSSC"]
+    C --> G
+    F --> H["按 query 召回相关 segment"]
+    E --> H
+    H --> G
 ```
 
-### 10.4.7 GSSC 不是 prompt 拼接，而是上下文路由
+### 27.2 当前真实状态
 
-你要把 GSSC 讲成一个“上下文路由器”。
+已实现：
 
-它回答的问题是：
+- 最近消息窗口读取 `conversation_recent_message_limit=24`。
+- `update_after_turn()` 服务已实现。
+- `agent_service.py` 已在 completed / failed / resume finalize 后调用 running summary 更新。
+- segment 表、服务、Qdrant 索引、PG fallback、GSSC 注入、测试已实现。
+- 100-turn regression 覆盖早期事实召回。
 
-```text
-当前任务需要哪些上下文？
-哪些上下文优先级更高？
-token 不够时丢哪些？
-最终 prompt 应该怎么结构化？
+需要诚实说明：
+
+- 当前普通 completed path 已接 running summary。
+- segment creation trigger 在 `_finalize_resume()` 中存在；普通 completed path 还需要补一处 `create_segment_if_needed()` 调用，才能说“每轮普通对话自动冻结 segment”。
+
+面试不要怕讲边界：
+
+> 这反而显得你知道代码真实状态。你可以说服务、表、召回和测试已经完成，普通完成路径的触发 hook 是下一步补强点。
+
+## 28. Skill 复用怎么归入 Memory/GSSC
+
+Skill 不是四大模块之一，但它挂在上下文复用层。
+
+```mermaid
+flowchart TD
+    A["成功 Agent Run"] --> B["skill_agent 评估可复用性"]
+    B --> C{"reusable_score 足够?"}
+    C -->|是| D["生成 Skill 草稿"]
+    C -->|否| E["不沉淀"]
+    D --> F["人工/系统 approved"]
+    F --> G["后续请求 skill_matcher 匹配"]
+    G --> H["注入 GSSC<br/>tool_plan / context_recipe / output_contract"]
 ```
 
-例如：
+准确说法：
 
-#### 用户问文档问题
+> 当前 Skill 是 workflow memory 和 context contract，不是可自动重放的 DAG 执行引擎。
 
-保留：
+## 29. Memory/GSSC 模块面试话术
 
-```text
-Task
-Evidence
-Conversation History
-Document Preference
-Output Contract
+> 上下文工程这块我没有采用“所有历史全塞进 prompt”的方式，而是做了分层和选择。Memory 层负责抽取 working、episodic、semantic 三类记忆，写入前做过滤和相似去重，semantic/episodic 额外写 Qdrant 召回。Conversation 层保留最近 24 条原文，同时更新 running summary，历史消息可以压缩成 segment 并按 query 召回。最后 GSSC 统一收集 task、history、summary、segments、memory、RAG evidence、FeedCard 等候选上下文，按 route 权重、answer_mode policy 和 token budget 选择注入。这样能减少上下文污染和 token 浪费，也能缓解百轮对话早期事实丢失。
+
+---
+
+## 30. 四个模块如何一起完成一个真实任务
+
+### 30.1 场景一：用户问文档问题
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant RT as Runtime
+    participant G as GSSC
+    participant R as RAG
+    participant Q as Qdrant
+    participant F as Final
+
+    U->>RT: 问上传文档里的合同编号
+    RT->>RT: planner -> route=rag_agent
+    RT->>G: 构建上下文
+    G->>G: 加载最近对话 / memory / segments
+    RT->>R: rag_agent
+    R->>Q: dense + sparse hybrid search
+    Q-->>R: child hits
+    R->>R: parent context enrichment
+    R-->>RT: rag_result + evidence
+    RT->>F: final_response
+    F-->>U: 基于证据回答
 ```
 
-弱化：
+四模块角色：
 
-```text
-Feed Card
-Project Goal
-Random old episodic memory
+| 模块 | 做了什么 |
+|---|---|
+| Runtime | 判断这是 RAG 任务，路由到 rag_agent |
+| MCP | 不参与或只参与只读工具 |
+| RAG | 检索文档证据 |
+| Memory/GSSC | 给 RAG 和 final_response 提供最近对话、偏好、历史上下文 |
+
+### 30.2 场景二：用户要求发邮件
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant RT as Runtime
+    participant T as MCP Tool
+    participant CP as Checkpoint
+    participant AS as AgentService
+
+    U->>RT: 帮我发邮件
+    RT->>RT: planner -> route=tool_agent, risk=L3
+    RT->>T: tool_agent 选择 email tool
+    T->>T: 参数校验 + 风险分级
+    T-->>RT: waiting_approval
+    RT->>CP: interrupt + checkpoint
+    RT-->>U: approval_required
+    U->>AS: approve
+    AS->>T: execute_approved_tool
+    AS->>RT: Command(resume)
+    RT-->>U: 告知执行结果
 ```
 
-#### 用户问“我之前说过什么”
+四模块角色：
 
-保留：
+| 模块 | 做了什么 |
+|---|---|
+| Runtime | 进入 tool_agent，审批后恢复 |
+| MCP | 参数校验、L3 审批、ToolCall/Approval |
+| RAG | 通常不参与 |
+| Memory/GSSC | 提供用户偏好、上下文、邮件草稿信息 |
 
-```text
-Conversation History
-Relevant Memory
+### 30.3 场景三：用户说“以后都用中文回答”
+
+```mermaid
+flowchart TD
+    A["用户表达偏好"] --> B["planner 判断 memory intent"]
+    B --> C["memory_agent"]
+    C --> D["MemoryExtractor"]
+    D --> E["semantic memory candidate"]
+    E --> F["过滤 + 去重"]
+    F --> G["PostgreSQL + Qdrant Memory"]
+    G --> H["后续请求"]
+    H --> I["GSSC baseline memory"]
+    I --> J["final_response 按偏好回答"]
 ```
 
-弱化：
+四模块角色：
 
-```text
-RAG Evidence
-Feed Card
-Research Results
-```
-
-#### 用户要求工具动作
-
-保留：
-
-```text
-Task
-Tool State
-Boundary Memory
-Conversation History
-```
-
-弱化：
-
-```text
-Long project memories unless relevant
-```
-
-这就是动态上下文。
-
-### 10.4.8 Skill 为什么属于上下文层
-
-当前 Skill 还不是自动执行引擎，所以它真正发挥作用的位置是 GSSC。
-
-命中 Skill 后，系统把这个 Skill 转成上下文 contract：
-
-```text
-Reusable Skill Applied:
-- Skill Name
-- Why matched
-- Expected Inputs
-- Execution Steps
-- Output Contract
-- Constraints
-```
-
-这会影响后续 planner/final_response。  
-所以当前 Skill 更像“可复用工作流记忆”。
-
-### 10.4.9 Memory/GSSC/Skill 长版面试讲法
-
-> 这块我做的是 Agent 的上下文层。因为 Agent 不能每次都像第一次见用户，但也不能把所有历史都塞进 prompt，所以我拆成 Memory、GSSC 和 Skill 三部分。  
-> 
-> Memory 分 working、episodic、semantic。working 存当前页面和临时任务上下文，episodic 存历史任务事件，semantic 存长期偏好、项目目标、技术栈和边界约束。写入时优先用 LLM extractor 抽结构化 memory，失败 fallback regex；保存前按 confidence 和 importance 过滤；写入时做相似度去重，重复记忆更新 evidence_count、last_seen_at 和 importance；高价值 memory 会从 working 固化到 episodic，再从 episodic 固化到 semantic。PostgreSQL 是权威存储，semantic/episodic 额外写入 Qdrant 做语义召回。  
-> 
-> 读取时不是全量注入，而是通过 GSSC 做动态上下文选择。GSSC 分 Gather、Select、Structure、Compress。它会收集 task、conversation history、memory、RAG evidence、feed card、graph context 等，然后根据 route 权重、answer_mode 的 memory policy 和 token budget 选择上下文，最后结构化成 Role、Task、Memory、Evidence、Conversation 等 section。  
-> 
-> Skill 是复用层。一次成功 run 结束后，skill_agent 会根据用户意图、workflow 结构、artifact 输出、工具链和成功状态评估是否值得复用，分数够高就生成 Skill 草稿。后续请求中 skill_matcher 会匹配 approved Skill，命中后把 workflow steps、tool_plan 和 output_contract 注入 GSSC。当前它是复用雏形，还不是完整自动执行引擎。
-
-### 10.4.10 Memory/GSSC/Skill 常见追问
-
-**问：怎么避免记忆污染？**
-
-答：
-
-> 写入时用 confidence/importance 阈值过滤，读取时用 answer_mode 的 MEMORY_CONTEXT_POLICY 控制类别。比如 general_qa 不注入 project_goal/tech_stack，casual 只注入名字、语言、语气偏好。
-
-**问：用户改变偏好怎么办？**
-
-答：
-
-> 当前有 dedup 和 evidence_count 机制，可以更新已有 memory 的 last_seen 和 importance。更完整的偏好冲突解决可以继续做 supersede 关系，比如新偏好覆盖旧偏好。
-
-**问：Skill 和 Memory 有什么区别？**
-
-答：
-
-> Memory 记录事实和偏好，Skill 记录可复用流程。比如“用户偏好中文”是 memory；“对 FeedCard 做研究并生成报告的流程”是 skill。
-
-**问：GSSC 和普通 prompt template 有什么区别？**
-
-答：
-
-> 普通 prompt template 是固定拼接，GSSC 是按 route、relevance、token budget 动态选择上下文，并输出 selected/dropped debug。它解决的是多源上下文治理问题。
+| 模块 | 做了什么 |
+|---|---|
+| Runtime | 路由到 memory_agent |
+| MCP | 不参与 |
+| RAG | 不参与 |
+| Memory/GSSC | 抽取长期偏好，后续注入 |
 
 ---
 
-# 11. 四个模块的“项目故事版”串讲
+## 31. 代码地图
 
-如果面试官让你“整体介绍一下这个项目”，你可以不要从技术名词开始，而是这样讲：
-
-> 这个项目本质上是把 open deep research 二开成一个更完整的 Agent OS。我主要做了四块工程化能力。  
-> 
-> 第一块是 Runtime。我用 LangGraph StateGraph 把 Agent 的执行过程拆成节点，包括权限检查、意图识别、规划、上下文读取、RAG、工具调用、Memory、Skill、评估和最终回复。这样一次请求不是黑盒，而是能看到每个节点做了什么，也能在工具审批时中断。  
-> 
-> 第二块是工具治理。Agent 调工具不能直接让模型调用函数，所以我做了 MCP ToolExecutor。每个工具都有 spec、schema、risk level 和 approval_required。调用前做参数校验，L3 进入人工审批，L4 直接阻断，所有 ToolCall 和 Approval 落库审计。  
-> 
-> 第三块是 RAG。我把普通 chunking 改成 Parent-Child，只让 child 入 Qdrant，命中后回查 parent context。检索上做 Qdrant dense+sparse hybrid，并用 native RRF 融合。为了证明优化有效，我写了 synthetic eval runner，保留 hit@5 评估记录。  
-> 
-> 第四块是上下文和复用。我做了三层 Memory，支持抽取、去重、固化和语义召回；又做了 GSSC，根据 route 和 token budget 动态选择上下文；最后做了 Skill 复用雏形，把成功 workflow 生成草稿，后续匹配后注入上下文。  
-> 
-> 所以这个项目不是单点功能，而是围绕 Agent 平台的执行、安全、检索、记忆和复用做了一套工程闭环。
-
-这就是你的高层项目故事。
-
----
-
-# 12. 四大模块代码地图：面试官要看代码时怎么带
-
-## 12.1 Runtime 代码地图
-
-| 你要讲的点 | 带面试官看哪个文件 | 看什么 |
-|---|---|---|
-| StateGraph 构建 | `src/web_app/agent/runtime/graph_builder.py` | `StateGraph(AgentRuntimeState)`、add_node、conditional edges |
-| 节点列表 | `src/web_app/agent/runtime/graph_registry.py` | runtime nodes 分类 |
-| State 字段 | `src/web_app/agent/runtime/state.py` | route_plan、context、pending approval、node_results |
-| Planner | `src/web_app/agent/runtime/planner.py` | RoutePlan、risk、answer_mode |
-| Dispatcher | `src/web_app/agent/runtime/dispatch.py` | waiting_approval -> END，next node logic |
-| Runtime run | `src/web_app/agent/runtime/graph.py` | graph.ainvoke、AsyncPostgresSaver、resume_from_interrupt (Command resume)、_legacy_resume_from_approval (deprecated) |
-| Checkpointer | `src/web_app/agent/runtime/checkpointers.py` | _AsyncPostgresSaverHandle、build_checkpointer、check_checkpointer_health |
-| Cleanup | `src/web_app/agent/runtime/checkpoint_cleanup.py` | cleanup_checkpoints (TTL-based)、estimate_checkpoint_size |
-| Approval Expiry | `src/web_app/services/approval_expiry.py` | expire_stale_approvals (24h TTL) |
-| Context node | `src/web_app/agent/runtime/node_groups/read_nodes.py` | parallel_read_stage、context_builder |
-| Agent nodes | `src/web_app/agent/runtime/node_groups/agent_nodes.py` | rag/tool/memory/skill agent（含 _interrupt_approval） |
-| Final response | `src/web_app/agent/runtime/node_groups/eval_final_nodes.py` | GSSC prompt、constraints |
-
-## 12.2 MCP 代码地图
-
-| 你要讲的点 | 文件 | 看什么 |
-|---|---|---|
-| Tool spec schema | `src/web_app/mcp/schemas.py` | MCPToolSpec |
-| Builtin tools | `src/web_app/mcp/registry.py` | BUILTIN_TOOLS、safety_level |
-| Tool input validation | `src/web_app/mcp/tool_router.py` | validate_tool_input |
-| Tool execution | `src/web_app/mcp/tool_executor.py` | call_tool、execute_approved_tool |
-| Risk decision | `src/web_app/services/permission_service.py` | L3 approval、L4 blocked |
-| Approval update | `src/web_app/services/approval_service.py` | update_approval_status |
-| DB models | `src/web_app/models/orm.py` | ToolCall、Approval、AgentEvent |
-| Tests | `src/web_app/tests/test_mcp_stage7.py` | waiting_approval、high_risk_denied |
-
-## 12.3 RAG 代码地图
-
-| 你要讲的点 | 文件 | 看什么 |
-|---|---|---|
-| Structured chunks | `src/web_app/rag/structured_chunker.py` | overview/parent/child |
-| Ingestion | `src/web_app/services/document_service.py` | child-only embedding/upsert |
-| Qdrant store | `src/web_app/rag/vector_store.py` | dense+sparse vectors、Fusion.RRF |
-| Sparse encoder | `src/web_app/rag/sparse_encoder.py` | sparse vector generation |
-| Retriever | `src/web_app/rag/retriever.py` | qdrant_hybrid、fallback、parent enrichment |
-| Reranker | `src/web_app/rag/reranker.py` | query-aware scoring |
-| Eval runner | `scripts/run_rag_hybrid_eval.py` | hit@1/3/5、reports |
-| Eval reports | `uploads/artifacts/rag_eval/*.md` | 0.54 -> 0.92 |
-| Tests | `src/web_app/tests/test_rag_stage3.py`、`test_rag_qdrant_hybrid.py` | parent-child/hybrid 覆盖 |
-
-## 12.4 Memory/GSSC/Skill 代码地图
-
-| 你要讲的点 | 文件 | 看什么 |
-|---|---|---|
-| Memory model | `src/web_app/models/orm.py` | Memory.memory_type |
-| Memory service | `src/web_app/services/memory_service.py` | add_with_dedup、search、consolidate |
-| Extractor | `src/web_app/memory/extractor.py` | LLM extractor、regex fallback |
-| Qdrant memory | `src/web_app/memory/qdrant_memory_store.py` | semantic/episodic vector index |
-| Context builder | `src/web_app/context/builder.py` | Gather/Select/Structure/Compress |
-| Runtime context | `src/web_app/agent/runtime/node_groups/read_nodes.py` | memory policy、gssc_debug |
-| Final GSSC prompt | `src/web_app/agent/runtime/node_groups/eval_final_nodes.py` | Structured GSSC Context |
-| Skill service | `src/web_app/services/skill_service.py` | match、draft、usage stats |
-| Skill model | `src/web_app/models/orm.py` | Skill fields |
+| 领域 | 文件 |
+|---|---|
+| AgentService | `src/web_app/services/agent_service.py` |
+| Runtime graph | `src/web_app/agent/runtime/graph.py` |
+| Graph builder | `src/web_app/agent/runtime/graph_builder.py` |
+| Node registry | `src/web_app/agent/runtime/graph_registry.py` |
+| Dispatcher | `src/web_app/agent/runtime/dispatch.py` |
+| Planner | `src/web_app/agent/runtime/planner.py` |
+| Runtime nodes | `src/web_app/agent/runtime/node_groups/*.py` |
+| Checkpointer | `src/web_app/agent/runtime/checkpointers.py` |
+| Checkpoint cleanup | `src/web_app/agent/runtime/checkpoint_cleanup.py` |
+| MCP registry | `src/web_app/mcp/registry.py` |
+| MCP router | `src/web_app/mcp/tool_router.py` |
+| MCP executor | `src/web_app/mcp/tool_executor.py` |
+| Permission | `src/web_app/services/permission_service.py` |
+| RAG retriever | `src/web_app/rag/retriever.py` |
+| RAG vector store | `src/web_app/rag/vector_store.py` |
+| RAG chunker | `src/web_app/rag/structured_chunker.py` |
+| Memory service | `src/web_app/services/memory_service.py` |
+| Memory extractor | `src/web_app/memory/extractor.py` |
+| Conversation summary | `src/web_app/services/conversation_summary_service.py` |
+| GSSC | `src/web_app/context/builder.py` |
+| Skill service | `src/web_app/services/skill_service.py` |
 
 ---
 
-# 13. 你最后要形成的“面试脑图”
+# 32. 面试官可能追问的 100 个工程问题与回答
 
-你要能随时从任何一个点展开：
+下面这 100 题不是让你死背，而是让你知道“面试官从哪里打”。每个答案都按工程面试口吻写，尽量短但有信息密度。
 
-```text
-Agent OS
-├── Runtime
-│   ├── StateGraph
-│   ├── AgentRuntimeState
-│   ├── Planner RoutePlan
-│   ├── Dispatcher
-│   ├── Approval Interrupt
-│   └── Evaluator/Final
-├── MCP
-│   ├── ToolSpec
-│   ├── Registry
-│   ├── Required validation
-│   ├── L0-L4
-│   ├── L3 approval
-│   ├── L4 block
-│   └── ToolCall audit
-├── RAG
-│   ├── Parse
-│   ├── Parent-Child
-│   ├── Child-only vector
-│   ├── Dense + Sparse
-│   ├── Fusion.RRF
-│   ├── Parent enrichment
-│   └── hit@5 eval
-└── Context
-    ├── Memory
-    │   ├── working
-    │   ├── episodic
-    │   ├── semantic
-    │   ├── extract
-    │   ├── dedup
-    │   └── consolidate
-    ├── GSSC
-    │   ├── gather
-    │   ├── select
-    │   ├── structure
-    │   └── compress
-    └── Skill
-        ├── evaluate reuse
-        ├── create draft
-        ├── match approved
-        └── inject context
-```
+## A. 项目总览与架构
 
-如果你能把这张脑图讲顺，这个项目就不是“背简历”，而是真能讲清楚。
+### Q1：这个项目一句话是什么？
+
+这是一个 Deep Research Agent OS 原型，用 LangGraph 编排多节点 Agent，用 MCP 治理工具，用 Qdrant Hybrid RAG 做文档检索，用 Memory/GSSC 管理长期上下文和多轮连续性。
+
+### Q2：它和普通 RAG Demo 最大区别是什么？
+
+普通 RAG Demo 主要是“检索文档然后回答”。这个项目多了 Runtime、工具治理、审批恢复、Memory、Skill 和上下文选择。也就是说它解决的是 Agent 平台工程问题，不只是知识问答。
+
+### Q3：四个核心模块是什么？
+
+Runtime 管执行流程，MCP 管工具安全，RAG 管文档证据，Memory/GSSC 管上下文和长期记忆。四者通过 AgentRuntimeState、数据库和 GSSC 连接。
+
+### Q4：为什么叫 Agent OS？
+
+因为它不是单个 agent function，而是提供了运行时、工具权限、状态持久化、上下文管理、记忆、检索和事件观测等基础能力，有点像 Agent 应用的操作系统层。
+
+### Q5：项目里最硬的工程点是什么？
+
+我会选三个：LangGraph interrupt + PostgresSaver 的审批恢复，Parent-Child + Qdrant Hybrid RAG，Memory/GSSC 的上下文选择机制。它们分别解决执行恢复、知识检索和上下文治理。
+
+### Q6：这个项目现在最不能夸大的地方是什么？
+
+Skill 还不是自动执行 DAG；GSSC 是启发式选择器，不是学习型 optimizer；参数校验不是完整 JSON Schema；Conversation Segment 普通 completed path 的自动创建触发点还需要补齐。
+
+### Q7：项目的数据主线是什么？
+
+服务层创建 Conversation、AgentRun、AgentChatMessage；Runtime 节点通过 AgentRuntimeState 传递执行状态；工具调用写 ToolCall/Approval；RAG 文档写 Document/DocumentChunk/Qdrant；Memory 写 Memory/Memory vectors；最终回答写回 run 和 assistant message。
+
+### Q8：怎么证明项目不是空壳？
+
+可以看 `graph_builder.py` 的 StateGraph、`tool_executor.py` 的审批逻辑、`retriever.py` 和 `vector_store.py` 的 hybrid 检索、`memory_service.py` 的记忆处理、`conversation_summary_service.py` 的 summary/segment，以及大量 `test_agent_runtime_*`、RAG、Memory、Checkpoint 测试。
+
+### Q9：如果只给 30 秒介绍，你讲什么？
+
+我会说：这是一个 LangGraph Agent OS，四层闭环分别是 Runtime 编排、MCP 工具治理、Qdrant Hybrid RAG、Memory/GSSC 上下文管理；高风险工具可审批恢复，文档检索可评估，长对话可通过 summary 和 segments 缓解遗忘。
+
+### Q10：项目的核心取舍是什么？
+
+我没有追求模型自由发挥，而是牺牲一部分灵活性，换取流程可控、工具安全、状态可恢复和上下文可解释。这更适合真实 Agent 平台。
+
+## B. Runtime 编排
+
+### Q11：为什么用 LangGraph？
+
+因为这个项目需要把 Agent 拆成多个有状态节点，并且支持 conditional edge、interrupt、checkpoint 和 resume。LangGraph 比手写 if/else 更适合表达可恢复的状态机。
+
+### Q12：StateGraph 里有哪些节点？
+
+主要有 permission_guard、home_intent_react、planner、parallel_prefetch、parallel_read_stage、supervisor_observer、llm_supervisor_route、rag_agent、tool_agent、memory_agent、skill_agent、research_agent、artifact_agent、evaluator、final_response。
+
+### Q13：有没有独立 router 节点？
+
+没有独立叫 router 的 StateGraph 节点。路由由 planner 生成 route_plan，LLM supervisor 可选改写，dispatch_next_route_node 负责 conditional edge 跳转。
+
+### Q14：为什么拆成 planner 和 dispatcher？
+
+planner 负责“决定要做什么”，dispatcher 负责“按计划跳到哪里”。这样 planner 可解释，dispatcher 简单稳定，也便于测试和观察。
+
+### Q15：LLM Supervisor 有什么用？
+
+它在上下文准备后观察当前 state，可以在 shadow 模式记录建议，也可以在 full 模式改写 route_plan。它解决初始 planner 在信息不足时可能规划不准的问题。
+
+### Q16：parallel_prefetch 和 parallel_read_stage 区别是什么？
+
+parallel_prefetch 偏低风险预取，比如 memory、RAG、skill、graph context 的候选结果；parallel_read_stage 把这些结果整合，构造最终上下文、匹配 skill，并写入 state。
+
+### Q17：context_builder 为什么不是直接独立节点执行？
+
+代码里保留了兼容节点，但主链路在 parallel_read_stage 里执行 context_builder 和 skill_matcher，这样读阶段可以集中完成上下文准备，减少节点间重复查询。
+
+### Q18：AgentRuntimeState 里最关键字段有哪些？
+
+`user_id`、`run_id`、`thread_id`、`conversation_id`、`user_input`、`route_plan`、`context`、`rag_result`、`tool_result`、`memory_updates`、`skill_drafts`、`final_payload`。
+
+### Q19：怎么避免一个节点乱改别的节点状态？
+
+工程上通过节点职责划分、StateDelta 记录、record_node_result 和测试约束。比如 rag_agent 写 rag_result，tool_agent 写 tool_call/tool_result，final_response 聚合最终输出。
+
+### Q20：Runtime 如何做链路可观测？
+
+通过 AgentStep、AgentEvent、LLMCall、ToolCall、visible_thoughts、pipeline_steps、runtime_latency_trace 和 gssc_debug 记录执行过程。
+
+### Q21：为什么需要 evaluator？
+
+evaluator 在 final_response 前检查 agent results、rag/tool/memory 输出和约束，生成 final_response_constraints 和 warnings，避免 final_response 完全裸奔。
+
+### Q22：如果某个 agent 节点失败怎么办？
+
+节点会把错误写入 state 或 AgentResult，Runtime 后续由 evaluator/final_response 处理降级回答；服务层也会捕获异常，把 run 标记 failed 并写回错误信息。
+
+### Q23：Runtime 怎么支持流式返回？
+
+AgentService 使用 stream_queue 推送 SSE 事件，运行过程中会发送 visible_progress_delta、answer_delta、approval_required、run_completed 等事件。
+
+### Q24：为什么不直接让 LLM 一次性返回全部计划和答案？
+
+因为工具调用、RAG 检索、审批、记忆写入都需要真实系统状态。拆节点后每一步可验证、可暂停、可恢复，也方便审计。
+
+### Q25：Runtime 最大的改进空间是什么？
+
+可以进一步强化节点输入输出协议，减少 state 字段松散问题；也可以把 Skill tool_plan 编译成受权限控制的可执行子图。
+
+## C. Checkpoint 与审批恢复
+
+### Q26：checkpoint 解决了什么问题？
+
+解决审批暂停和服务重启后的状态恢复。如果 L3 工具需要用户确认，graph 在 interrupt 点暂停，checkpoint 保存当前状态，审批后从原点继续。
+
+### Q27：为什么不用 DB graph_state 直接恢复？
+
+DB graph_state 可以保存快照，但恢复时容易从头 replay，可能重复执行节点或产生副作用。LangGraph checkpoint + Command(resume) 可以从 interrupt 点继续。
+
+### Q28：为什么使用 PostgresSaver？
+
+PostgresSaver 是持久化后端，适合跨进程恢复。内存 saver 服务重启就丢，RedisSaver 当前代码里标记 experimental，不作为生产主路径。
+
+### Q29：审批流程具体怎么走？
+
+tool_agent 判断 L3 后创建 ToolCall/Approval，然后 interrupt。用户 approve 后，AgentService 先执行 approved tool，再 Command(resume) 把 tool_result 传回 graph。
+
+### Q30：拒绝审批怎么办？
+
+拒绝时不会执行工具，resume payload 会带 rejected 信息，graph 从 interrupt 点继续，最终回答告诉用户操作未执行。
+
+### Q31：审批前工具会不会已经执行？
+
+不会。L3 分支只创建审批记录和 pending 状态，然后 interrupt；真实 provider 在用户批准后由服务层执行。
+
+### Q32：为什么服务层执行 approved tool，而不是 graph 内执行？
+
+审批发生在 graph 暂停之后，服务层处理用户动作更自然；执行结果再 resume 给 graph，避免 graph 在等待期间占用执行上下文。
+
+### Q33：如何防止悬挂审批永久占资源？
+
+有 approval expiry 逻辑，过期后同步更新 run/message/tool_call/approval 状态；checkpoint cleanup 也会按 TTL 清理完成、失败、过期的 checkpoint。
+
+### Q34：waiting_approval 的 checkpoint 会不会被清理？
+
+清理逻辑要保护 waiting_approval、paused、resuming 状态，避免用户还没处理审批时 checkpoint 被删。
+
+### Q35：跨进程恢复怎么验证？
+
+`test_postgres_checkpoint_e2e.py` 里构造了 PostgresSaver checkpoint 测试，验证 approve/reject 和 restart recovery。
+
+### Q36：checkpoint 表有哪些？
+
+PostgresSaver 通常涉及 `checkpoints`、`checkpoint_blobs`、`checkpoint_writes`、`checkpoint_migrations` 四类表。
+
+### Q37：thread_id 为什么重要？
+
+LangGraph 用 thread_id 定位 checkpoint。当前使用 `run:{run_id}` 作为稳定 key，避免不同 run 的 checkpoint 混淆。
+
+### Q38：checkpoint 和 AgentRun graph_state 是什么关系？
+
+checkpoint 是 LangGraph 恢复执行用；AgentRun graph_state 是业务侧保存状态、展示、兼容和审计用。两者不是一回事。
+
+### Q39：如果 PostgresSaver 不可用怎么办？
+
+生产配置应该 require_durable fail-fast，不应该静默降级到内存。开发环境可以降级，但生产审批恢复必须持久化。
+
+### Q40：这个模块怎么在简历上体现？
+
+写“接入 AsyncPostgresSaver + interrupt() + Command(resume)，实现 L3 工具审批暂停、跨进程恢复和链路可观测”，这比泛泛写 checkpoint 强。
+
+## D. MCP 工具治理
+
+### Q41：MCP 工具治理的核心是什么？
+
+核心是工具调用不能只由 LLM 决定，必须经过 registry、参数校验、风险分级、审批和审计。
+
+### Q42：工具注册里有什么信息？
+
+工具名、描述、input_schema、output_schema、permission_level、approval_required、enabled 等。
+
+### Q43：ToolRouter 做什么？
+
+规范化工具名、选择工具、校验输入参数，并把规范化后的 tool_name/tool_args 交给执行器。
+
+### Q44：ToolExecutor 做什么？
+
+读取工具 spec，判断 permission/risk，创建 ToolCall，必要时创建 Approval；低风险工具则调用具体 provider 执行。
+
+### Q45：参数校验有多完整？
+
+当前主要是 required 字段和部分格式校验，比如 email 格式。不能说是完整 JSON Schema validator。
+
+### Q46：L3 和 L4 区别是什么？
+
+L3 是外部写入或需要用户确认的操作，进入人工审批；L4 是高危不可逆操作，默认直接阻断。
+
+### Q47：为什么写文件也是风险？
+
+写文件会改变用户工作区状态，可能覆盖或污染文件。即使是本地写，也需要限制路径、记录审计，高风险写入需要审批。
+
+### Q48：如何防止 prompt injection 让工具乱执行？
+
+文档内容只作为 evidence，不直接控制工具。工具是否执行由 planner、permission_service、ToolExecutor 和 risk policy 决定，不因文档里写“请删除文件”就执行。
+
+### Q49：工具执行结果怎么进入最终回答？
+
+tool_agent 把 tool_result 写入 state，evaluator 检查后 final_response 聚合成用户可读回答。
+
+### Q50：ToolCall 记录有什么价值？
+
+它能审计工具名、参数、状态、输出和错误；审批恢复时也能根据 pending tool_call_id 找回要执行的工具。
+
+### Q51：Approval 记录有什么价值？
+
+它记录风险等级、审批状态、审批 payload 和用户动作，是人类在环和审计的核心。
+
+### Q52：如果用户批准后工具执行失败怎么办？
+
+服务层会把失败结果写入 tool_result，resume 回 graph，最终回答不能假装成功，而要明确告诉用户执行失败和错误摘要。
+
+### Q53：如果工具参数缺失怎么办？
+
+validate_tool_input 返回 missing 字段，tool_agent 不应执行工具，而是给出需要补充的信息或失败状态。
+
+### Q54：为什么不让 LLM 自己判断风险？
+
+LLM 可以参与意图识别，但最终风险策略必须由代码控制。安全边界不能交给概率模型。
+
+### Q55：MCP 模块的下一步是什么？
+
+补完整 JSON Schema validator、外部 MCP server trust policy、工具 dry-run preview 和更细粒度权限策略。
+
+## E. RAG 检索
+
+### Q56：为什么做 Parent-Child Chunking？
+
+child 小，适合精准检索；parent 大，适合回答补上下文。这样把“检索精度”和“回答完整性”拆开解决。
+
+### Q57：为什么只让 child 入 Qdrant？
+
+因为 child 粒度小，更适合向量检索。parent/overview 留在 PG，命中 child 后再回查 parent，减少向量库噪声。
+
+### Q58：Overview chunk 有什么用？
+
+Overview 适合文档整体摘要和“总结这份文档”类问题，可以避免只从局部 child 拼凑全局回答。
+
+### Q59：Qdrant Hybrid 解决什么问题？
+
+Dense embedding 擅长语义相似，Sparse/BM25 擅长编号、关键词、表字段。Hybrid 让两类信号互补。
+
+### Q60：RRF 是什么？
+
+RRF 是 Reciprocal Rank Fusion，用排名而不是原始分数融合 dense 和 sparse 结果，适合不同检索器分数不可比的场景。
+
+### Q61：为什么不用单纯 dense search？
+
+单纯 dense 对“HT-2026-001”“字段名”“精确数字”这类 token 容易不稳定，hybrid 能补这个短板。
+
+### Q62：为什么不用单纯 BM25？
+
+BM25 不理解语义表达，比如用户换一种说法问同一问题时可能召回不到。dense 能补语义泛化能力。
+
+### Q63：parent enrichment 怎么做？
+
+检索命中 child 后，根据 metadata 里的 parent_id 回查 parent chunk，把 parent content 作为更完整上下文放进 evidence。
+
+### Q64：RAG eval 怎么设计？
+
+构造固定文档和 query，定义 expected evidence 或 expected answer，分别跑不同 backend，统计 hit@1、hit@3、hit@5、keyword_hit_rate、fallback_count 和 latency。
+
+### Q65：hit@5 从 0.54 到 0.92 怎么讲才稳？
+
+必须说是在自建 synthetic RAG eval 上，不是线上真实流量。它证明方案在该评估集上有效，但不能泛化成所有场景。
+
+### Q66：Qdrant 不可用怎么办？
+
+检索层有 fallback 到 Python BM25 hybrid 的路径，结果里也会记录 retrieval_warning 或 fallback_count。
+
+### Q67：文档解析失败怎么办？
+
+DocumentService 会记录文档状态和错误，前端/回答中应该提示文档尚未就绪或解析失败，而不是胡乱回答。
+
+### Q68：如何处理用户上传多个文档？
+
+检索时可以带 document_ids filter，确保只在当前会话附件或用户指定文档范围内搜索。
+
+### Q69：如何避免跨用户数据泄漏？
+
+Qdrant payload 和 PG 查询都带 user_id；文档、chunk、memory、segment 召回都要按 user_id 隔离。
+
+### Q70：RAG 模块下一步怎么优化？
+
+引入线上 query log eval、人工标注集、cross-encoder reranker、更强表格解析、增量索引和更细粒度 chunk quality metrics。
+
+## F. Memory / GSSC / Conversation
+
+### Q71：为什么需要 Memory？
+
+因为用户偏好、长期目标、历史任务经验不能每轮都靠最近对话保存。Memory 让 Agent 能跨会话记住稳定信息。
+
+### Q72：三层 Memory 分别是什么？
+
+working 是当前任务状态，episodic 是历史事件和任务经验，semantic 是长期偏好和稳定事实。
+
+### Q73：Memory 怎么写入？
+
+memory_agent 收集用户输入、agent 输出、page_context、skill 信息，MemoryExtractor 抽取 candidates，然后按 importance、confidence、stability 过滤，最后去重保存。
+
+### Q74：为什么要去重？
+
+用户可能多次表达同一偏好。如果每次新增，会污染长期记忆。去重后更新 evidence_count 和 last_seen，更稳定。
+
+### Q75：semantic memory 为什么要写 Qdrant？
+
+长期事实数量增加后，不能每次全扫。写 Qdrant 可以按 query 语义召回相关记忆。
+
+### Q76：GSSC 是什么？
+
+GSSC 是 Gather、Select、Structure、Compress。它收集候选上下文，按 route 权重和 token budget 选择，再结构化成 prompt sections。
+
+### Q77：GSSC 和 Memory 是什么关系？
+
+Memory 负责存和搜，GSSC 负责决定哪些 memory 进入当前 prompt。Memory 是材料库，GSSC 是上下文编排器。
+
+### Q78：answer_mode policy 有什么用？
+
+它控制不同回答模式允许注入哪些 memory category，避免普通闲聊被 project_goal、tech_stack 等长期项目上下文污染。
+
+### Q79：最近对话窗口为什么默认 24？
+
+24 条消息大约覆盖最近 12 轮对话，能保留近端原文，又不至于把 prompt 撑爆。更早的信息交给 summary 和 segment。
+
+### Q80：running summary 解决什么？
+
+它给对话提供全局连续摘要，保留事实、偏好、决策、open threads 和 key entities，避免只靠最近窗口。
+
+### Q81：Conversation Segment 解决什么？
+
+它把旧消息分批压缩成可检索历史段，写 PG 并可写 Qdrant。后续按 query 召回相关段，解决第 100 轮找回第 5 轮事实的问题。
+
+### Q82：Segment 和 running summary 区别是什么？
+
+running summary 是一份滚动全局摘要；segment 是多个冻结历史片段。summary 适合连续性，segment 适合按问题精确召回历史。
+
+### Q83：Qdrant segment 召回失败怎么办？
+
+fallback 到 PostgreSQL ILIKE 关键词搜索。Qdrant 是加速和语义召回，PG 是权威存储。
+
+### Q84：segment 会不会挤掉最近消息？
+
+GSSC 给 conversation_history 更高权重，segment 还有独立 token budget；冲突时输出指令要求以最近消息为准。
+
+### Q85：当前 Conversation Segment 的边界是什么？
+
+表、服务、召回、GSSC 注入和测试都已实现；普通 completed run 的 segment creation trigger 还需要补齐，不能夸成每轮普通对话自动冻结。
+
+### Q86：Skill 和 Memory 有什么关系？
+
+Skill 可以看成 workflow memory。Memory 记事实和偏好，Skill 记可复用流程、上下文配方和输出契约。
+
+### Q87：Skill 当前做到哪一步？
+
+当前能生成草稿、匹配 approved skill、注入 GSSC、记录使用统计。还不是自动执行 tool_plan 的 DAG 引擎。
+
+### Q88：如何排查 Memory 注入错误？
+
+看 memory extraction、memory metadata、search result、answer_mode policy、GSSC selected_sources/dropped_sources 和最终 prompt。
+
+### Q89：如何避免上下文污染？
+
+靠 memory category policy、route weights、token budget、recent-over-history 的优先级和 final output consistency instruction。
+
+### Q90：Memory/GSSC 下一步怎么优化？
+
+做 memory eval、冲突检测、过期策略、用户可编辑记忆、segment creation 普通路径触发、以及更强的上下文质量评分。
+
+## G. 工程质量与排障
+
+### Q91：如何排查一次 Agent 执行失败？
+
+先看 AgentRun 状态和 graph_state，再看 AgentStep/AgentEvent，确认停在哪个节点；工具问题看 ToolCall/Approval，RAG 问题看 evidence 和 retrieval_warning，LLM 问题看 LLMCall。
+
+### Q92：如何排查 RAG 召回效果下降？
+
+检查文档解析状态、chunk 数量、child 是否入库、Qdrant collection schema、dense/sparse 是否写入、query filter、fallback_count 和 eval report。
+
+### Q93：如何排查审批恢复失败？
+
+检查 run_id 对应 thread_id、checkpoint 表是否存在、Approval/ToolCall 状态、pending_tool_call_id、resume payload 和 PostgresSaver 健康状态。
+
+### Q94：如何排查工具误调用？
+
+看 planner route_plan、tool selection、validate_tool_input、permission decision、ToolCall input_json 和 approval payload。
+
+### Q95：如何排查 final answer 和 evidence 不一致？
+
+看 rag_result/evidence、gssc_context、evaluator constraints 和 final_response prompt。必要时让 final_response 引用 evidence id。
+
+### Q96：如何保证多用户隔离？
+
+所有业务表都带 user_id，RAG/Memory/Segment 查询都按 user_id 和 conversation_id/document_ids filter，不能只靠前端隔离。
+
+### Q97：如何处理长任务？
+
+通过 AgentRun 状态、SSE 事件、pipeline_steps、runtime_latency_trace 和 checkpoint/approval 状态，让任务可观察、可恢复。
+
+### Q98：这个项目可以怎么上线？
+
+需要生产 DB、Qdrant、PostgresSaver 表健康检查、后台任务/worker、日志监控、审批超时清理、RAG eval pipeline 和权限配置。
+
+### Q99：下一步最应该补什么？
+
+我会补普通 completed path 的 segment creation trigger、完整 JSON Schema 校验、Skill 可执行子图、线上 query log RAG eval 和 memory eval。
+
+### Q100：如果只能保留三个设计，你保留什么？
+
+保留 LangGraph Runtime、MCP 工具治理、Parent-Child + Qdrant Hybrid RAG。它们分别保证执行可控、工具安全和知识可靠；Memory/GSSC 是上层增强，但前三个是平台底座。
 
 ---
 
-# 14. Agent 开发高频面试 100 问
+## 33. 最后复习路线
 
-这一章是面试题库。它不是为了让你死背，而是训练你把 Agent 工程讲成体系。每道题都给出：
+不要从头背到尾。按下面顺序复习：
 
-1. **面试官想考什么**
-2. **推荐回答**
-3. **如何结合你的项目讲**
+1. 先背 60 秒总览。
+2. 再背四模块职责边界。
+3. Runtime 重点背 StateGraph、RoutePlan、LLM supervisor、checkpoint。
+4. MCP 重点背 L0-L4、ToolCall/Approval、interrupt 审批。
+5. RAG 重点背 Parent-Child、Hybrid、RRF、parent enrichment、eval。
+6. Memory/GSSC 重点背三层记忆、GSSC、running summary、segments、Skill 边界。
+7. 最后看 100 问，重点准备 Q11-Q40、Q56-Q90。
 
-你可以按模块复习：Agent 架构、LangGraph、Tool/MCP、安全审批、RAG、Memory、Context、Evaluation、工程化、系统设计。
+你最适合的面试定位是：
 
----
-
-## 14.1 Agent 基础与架构
-
-### Q1：什么是 AI Agent？它和普通 Chatbot 有什么区别？
-
-**面试官想考什么：**  
-他想看你是否理解 Agent 的核心不是“会聊天”，而是“能感知上下文、做决策、调用工具、执行任务、观察结果并迭代”。
-
-**推荐回答：**  
-普通 Chatbot 主要是输入一段文本，输出一段文本。Agent 则更像一个任务执行系统，它会根据目标进行规划，读取上下文，选择工具，执行动作，观察结果，并在必要时调整计划。Agent 的关键组成通常包括 planning、memory、tools、environment feedback、reflection/evaluation 和 final response。
-
-**结合你的项目：**  
-你可以说：我的项目不是简单聊天接口，而是把请求拆到 LangGraph Runtime 里。用户请求经过 planner 生成 RoutePlan，再进入 RAG、tool、memory、skill 等节点，最后 evaluator 检查结果，final_response 输出。这就是从 Chatbot 到 Agent Runtime 的区别。
-
-### Q2：一个工程化 Agent 系统通常包含哪些核心模块？
-
-**面试官想考什么：**  
-他想确认你有没有系统视角，而不是只知道 LangChain 或 prompt。
-
-**推荐回答：**  
-一个工程化 Agent 系统通常包括：入口 API、用户和会话状态、Planner、Router/Dispatcher、Context Builder、Tool Layer、RAG Layer、Memory Layer、Execution Runtime、Evaluation/Guardrail、Observability、Persistence 和权限治理。
-
-**结合你的项目：**  
-你的项目正好可以映射：AgentService 是入口，LangGraph 是 runtime，planner 生成 RoutePlan，dispatcher 做条件跳转，GSSC 是 Context Builder，MCP 是 Tool Layer，Qdrant Hybrid 是 RAG Layer，MemoryService 是 Memory Layer，AgentEvent/ToolCall/Approval 是观测和审计。
-
-### Q3：Agent 的 planning 和 routing 有什么区别？
-
-**面试官想考什么：**  
-他想看你是否能区分“决定任务步骤”和“执行时选择下一个节点”。
-
-**推荐回答：**  
-Planning 是生成任务计划，例如要不要查文档、要不要调用工具、要不要写记忆。Routing 是在执行过程中根据状态选择下一步走哪个节点。Planning 更偏语义决策，Routing 更偏运行时控制。
-
-**结合你的项目：**  
-你可以说：我的 planner 输出 RoutePlan，包括 intent、route、risk_level、answer_mode；实际跳转前 llm_supervisor_route（full 模式下）可以由 LLM 接管并改写 route_plan，最终由 dispatch_next_route_node 执行。严格说我没有单独 router node，而是 planner + LLM supervisor + dispatcher 的组合。
-
-### Q4：为什么 Agent 系统需要状态管理？
-
-**面试官想考什么：**  
-他想看你是否知道 Agent 不是无状态函数调用。
-
-**推荐回答：**  
-Agent 需要跨步骤保存计划、上下文、工具结果、错误、审批状态、最终答案等。如果没有统一状态，节点之间会靠隐式变量传递，难以恢复、调试和审计。
-
-**结合你的项目：**  
-你可以讲 AgentRuntimeState。里面有 route_plan、context、rag_result、tool_result、pending_approval_id、completed_nodes、node_results 等。这个 state 是整个 LangGraph 执行的总线。
-
-### Q5：什么是 ReAct？它有什么局限？
-
-**面试官想考什么：**  
-他想看你是否理解经典 Agent 模式和工程化限制。
-
-**推荐回答：**  
-ReAct 是 Reasoning + Acting，让模型在思考和工具调用之间循环。它适合简单工具调用，但在复杂业务里会有局限，比如状态不稳定、工具安全难治理、审批中断难处理、可观测性不足、流程不可控。
-
-**结合你的项目：**  
-你可以说：我没有只依赖 ReAct 循环，而是把关键流程拆到 LangGraph StateGraph 节点里。模型参与 planner 和 final_response，但工具审批、风险分级、节点跳转由代码控制。
-
-### Q6：Agent 系统里哪些逻辑应该交给 LLM，哪些应该用确定性代码？
-
-**面试官想考什么：**  
-他想考你的工程边界感。
-
-**推荐回答：**  
-语义理解、开放式规划、自然语言生成适合 LLM；权限判断、风险分级、审批拦截、状态跳转、参数校验、数据持久化应该用确定性代码。Agent 工程的关键是不要把安全和一致性完全交给 LLM。
-
-**结合你的项目：**  
-planner 可以结合规则和 LLM 判断意图，但 MCP L3/L4、ToolCall 状态、approval interrupt、dispatcher 跳转都是代码控制。这是你项目的工程亮点。
-
-### Q7：Agent 为什么容易不稳定？
-
-**面试官想考什么：**  
-他想看你是否踩过真实工程问题。
-
-**推荐回答：**  
-Agent 不稳定主要来自模型输出不确定、上下文污染、工具参数不完整、检索证据不足、状态跨步骤丢失、错误无法反馈给 planner、最终回答过度声称等。
-
-**结合你的项目：**  
-你可以讲你的解决方式：GSSC 控制上下文，MCP 校验参数和审批，RAG evaluator 防止无证据声称，AgentRuntimeState 保存跨节点状态，node_results/AgentEvent 做观测。
-
-### Q8：如何设计一个多 Agent 系统？
-
-**面试官想考什么：**  
-他想知道你是否理解多 Agent 不是简单创建多个角色。
-
-**推荐回答：**  
-多 Agent 系统应该先定义任务边界，再定义共享状态、调度策略、结果协议和失败处理。每个 Agent 应该有明确职责，比如 RAG Agent 负责文档检索，Tool Agent 负责工具调用，Memory Agent 负责记忆写入。
-
-**结合你的项目：**  
-你的 agent_nodes 包含 research_agent、rag_agent、tool_agent、memory_agent、skill_agent、artifact_agent。它们通过 AgentRuntimeState 共享状态，由 planner route 和 dispatcher 调度。
-
-### Q9：多 Agent 系统的最大风险是什么？
-
-**面试官想考什么：**  
-他想看你是否知道多 Agent 容易失控。
-
-**推荐回答：**  
-最大风险是职责重叠、状态冲突、重复执行、成本膨胀和最终结果不一致。必须有统一状态、明确节点完成标记、结果聚合和 evaluator。
-
-**结合你的项目：**  
-你可以讲 completed_nodes 防止重复执行，node_results 记录每个 agent 输出，evaluator 检查最终一致性，final_response 负责统一收口。
-
-### Q10：Agent 平台和单个 Agent 应用有什么区别？
-
-**面试官想考什么：**  
-他想看你是否有平台化思维。
-
-**推荐回答：**  
-单个 Agent 应用解决一个任务，比如文档问答。Agent 平台要解决通用运行时、工具治理、权限、记忆、检索、观测、评估、可恢复、可扩展等问题。
-
-**结合你的项目：**  
-你可以说：我的项目不是只做 RAG QA，而是围绕 Runtime、MCP、RAG、Memory、GSSC、Skill 做平台化能力。
-
----
-
-## 14.2 LangGraph 与运行时
-
-### Q11：为什么选择 LangGraph，而不是普通 LangChain chain？
-
-**面试官想考什么：**  
-他想确认你是否知道 LangGraph 适合有状态、多步骤、可分支流程。
-
-**推荐回答：**  
-LangChain chain 更适合线性流程，LangGraph 更适合状态机式 Agent。它支持 StateGraph、节点、条件边、checkpoint，适合多步骤、多分支、可中断的 Agent Runtime。
-
-**结合你的项目：**  
-你可以说：我需要 planner、parallel_read、rag/tool/memory/skill、evaluator、final_response 这些节点，还要处理 approval interrupt，所以用 StateGraph 比普通 chain 更合适。
-
-### Q12：StateGraph 的核心思想是什么？
-
-**面试官想考什么：**  
-他想听你讲状态图，而不是只说“我用了 LangGraph”。
-
-**推荐回答：**  
-StateGraph 的核心是用一个共享 state 在节点之间流动。每个节点读取 state 的一部分，写回自己的结果。边决定节点执行顺序，条件边可以根据 state 动态跳转。
-
-**结合你的项目：**  
-你的 AgentRuntimeState 存 route_plan、context、pending approval、agent results。节点如 rag_agent、tool_agent 都只更新自己的字段。
-
-### Q13：LangGraph 里的节点应该怎么设计？
-
-**面试官想考什么：**  
-他想看你有没有节点粒度设计经验。
-
-**推荐回答：**  
-节点要有单一职责，输入输出明确，副作用可控，错误可记录。不要把所有逻辑塞进一个节点，也不要拆得太碎导致状态难追踪。
-
-**结合你的项目：**  
-你的节点按 setup/read/agent/eval 分组。planner 只规划，parallel_read 只准备上下文，tool_agent 只处理工具，final_response 只负责输出。
-
-### Q14：LangGraph 条件边适合处理什么场景？
-
-**面试官想考什么：**  
-他想看你是否用过动态路由。
-
-**推荐回答：**  
-条件边适合根据 state 决定下一步，比如根据 intent 路由到 RAG 或 tool，根据 approval 状态中断，根据错误状态进入 fallback。
-
-**结合你的项目：**  
-dispatch_next_route_node 会根据（可能已被 llm_supervisor_route 改写后的）route_plan 和 completed_nodes 选择下一个 agent。如果 status 是 waiting_approval，就路由到 END。
-
-### Q15：什么是 checkpoint？为什么 Agent 需要 checkpoint？
-
-**面试官想考什么：**  
-他想考状态恢复。
-
-**推荐回答：**  
-checkpoint 是保存图执行状态的机制。Agent 可能运行时间长，中间可能等待审批、服务重启或失败。checkpoint 可以让系统从某个状态恢复，而不是从头执行。
-
-**结合你的项目：**  
-你的项目以 PostgresSaver 为生产后端（AsyncPostgresSaver），默认开启。审批暂停时通过 LangGraph interrupt() 写入 4 张 PG 表（checkpoints、checkpoint_blobs、checkpoint_writes、checkpoint_migrations）。恢复时用 Command(resume=...) 从 checkpoint 精确继续，不重跑 graph。启动有健康检查，require_durable=True 确保不会静默降级到内存模式。跨进程 recovery E2E 测试已通过。
-
-### Q16：MemorySaver、RedisSaver、PostgresSaver 的区别是什么？
-
-**面试官想考什么：**  
-他想看你是否知道本地开发和生产持久化的区别。
-
-**推荐回答：**  
-MemorySaver 是进程内存级，适合 dev/test，服务重启丢失。RedisSaver 是外部存储但当前版本（0.4.1）有 Command(resume) 内部 bug。PostgresSaver 是生产级选择：async 版本支持 graph.ainvoke()，数据持久在 PG，跨进程 recovery 已验证通过。项目默认 PostgresSaver + require_durable=True 启动时 fail-fast。
-
-**结合你的项目：**  
-生产默认 agent_checkpointer_backend=postgres，agent_checkpointer_require_durable=True。启动时 check_checkpointer_health() 验证 4 张表存在。MemorySaver 仅 dev/test，RedisSaver 标记 experimental（等上游修 bug）。审批超时 24h 自动过期，completed/failed/expired checkpoint 按 TTL 自动清理。
-
-### Q17：如何避免 LangGraph 节点重复执行？
-
-**面试官想考什么：**  
-他想考幂等和状态控制。
-
-**推荐回答：**  
-可以通过 completed_nodes、node result、idempotency key、pending state 判断节点是否已经执行。对于有副作用的节点，尤其要避免重复执行。
-
-**结合你的项目：**  
-你的 state 里有 completed_nodes。tool_agent 在 waiting_approval 时不会 mark_completed，因为工具还没真正执行；审批恢复后才清理 pending 并继续。
-
-### Q18：LangGraph 中如何处理异常？
-
-**面试官想考什么：**  
-他想看你是否只写 happy path。
-
-**推荐回答：**  
-节点内部捕获异常，写入 errors 和 node_results，必要时设置 status failed。最终 evaluator/final_response 根据错误状态给用户可靠反馈，而不是让异常直接泄漏。
-
-**结合你的项目：**  
-agent_nodes 中会 append_error，record_agent_node_result，final_response 会根据 errors 和 warnings 生成最终回答。
-
-### Q19：Agent Runtime 如何支持流式输出？
-
-**面试官想考什么：**  
-他想看你是否考虑用户体验和事件流。
-
-**推荐回答：**  
-通常可以通过 stream queue 或 event emitter，在节点开始、节点完成、answer delta、approval required 等事件上推送给前端。
-
-**结合你的项目：**  
-state 中有 `_stream_queue`，AgentEvent 和 queue_stream_event 会记录/推送 answer_started、answer_delta、approval_required、runtime_latency_trace 等事件。
-
-### Q20：如何设计 Agent Runtime 的可观测性？
-
-**面试官想考什么：**  
-他想看你是否能排查 Agent 问题。
-
-**推荐回答：**  
-需要记录 run、step、event、node_result、latency、LLM call、tool call、approval、retrieval evidence、final payload。可观测性要覆盖每个节点和每个外部调用。
-
-**结合你的项目：**  
-你有 AgentRun、AgentEvent、ToolCall、Approval、LLMCall、runtime_latency_trace、node_results。可以追踪一次请求从 planner 到 final_response 的全过程。
-
----
-
-## 14.3 Tool Calling、MCP 与安全
-
-### Q21：Tool Calling 的核心风险是什么？
-
-**面试官想考什么：**  
-他想看你是否理解工具调用比文本生成危险。
-
-**推荐回答：**  
-核心风险包括误调用、越权调用、参数幻觉、外部副作用、数据泄露、重复执行和审计缺失。工具调用必须有权限、审批、校验和记录。
-
-**结合你的项目：**  
-你的 MCP ToolExecutor 会统一工具入口，L3 审批、L4 阻断，ToolCall 和 Approval 落库。
-
-### Q22：为什么不能让 LLM 直接调用后端函数？
-
-**面试官想考什么：**  
-他想考安全边界。
-
-**推荐回答：**  
-LLM 输出不可完全信任。直接调用函数会绕过权限、参数校验和审计。应该通过工具网关统一控制。
-
-**结合你的项目：**  
-你可以说：tool_agent 不直接调用 provider，而是通过 MCPService 和 ToolExecutor。执行前先 registry lookup、validate input、permission guard。
-
-### Q23：MCP 在 Agent 系统里解决什么问题？
-
-**面试官想考什么：**  
-他想看你是否理解 MCP 的抽象价值。
-
-**推荐回答：**  
-MCP 提供一种标准化工具/资源接入方式，让 Agent 可以用统一协议发现和调用工具。工程上还需要在 MCP 外层加治理，比如权限、审批、审计。
-
-**结合你的项目：**  
-你的 MCP 层包括 registry、schemas、tool_executor、local_provider、permission_service、approval_service，不只是协议名。
-
-### Q24：工具 Schema 有什么作用？
-
-**面试官想考什么：**  
-他想看你是否理解结构化调用。
-
-**推荐回答：**  
-Schema 用于描述工具输入输出，帮助模型生成参数，也帮助后端校验参数。它能减少参数缺失和类型错误。
-
-**结合你的项目：**  
-MCPToolSpec 有 input_schema/output_schema。当前 validate_tool_input 做 required 字段和格式校验，但不是完整 JSON Schema validator。
-
-### Q25：如果模型给了错误工具名怎么办？
-
-**面试官想考什么：**  
-他想考鲁棒性。
-
-**推荐回答：**  
-可以做工具名 normalize、alias mapping、候选工具重排和缺省 fallback。如果仍无法识别，应该返回可用工具提示，而不是瞎执行。
-
-**结合你的项目：**  
-registry 支持 normalize_tool_name 和 aliases，tool_agent 还有 infer/select tool 逻辑。
-
-### Q26：如何处理工具参数缺失？
-
-**面试官想考什么：**  
-他想看你是否知道 Agent 不能编参数。
-
-**推荐回答：**  
-缺少 required 参数时，不应该调用工具，也不应该让模型编造。应该返回 missing fields，让用户补充。
-
-**结合你的项目：**  
-tool_agent 调用 validate_tool_input，如果缺字段，会设置 missing_fields 状态并生成让用户补充的信息。
-
-### Q27：L3 审批和 L4 阻断有什么区别？
-
-**面试官想考什么：**  
-他想确认你的安全模型。
-
-**推荐回答：**  
-L3 是可以执行但需要用户确认的动作，比如外部写入、发邮件、本地文件写入。L4 是当前系统策略下不允许 Agent 执行的高危动作，比如删除、破坏性命令。L3 进入审批，L4 直接阻断。
-
-**结合你的项目：**  
-PermissionGuard 中 L3 returns requires_approval，L4 returns high_risk_denied。test_mcp_stage7 覆盖了 waiting_approval 和 high_risk_denied。
-
-### Q28：审批通过后怎么保证执行的是用户批准的内容？
-
-**面试官想考什么：**  
-他想考审批一致性。
-
-**推荐回答：**  
-审批应该绑定具体 ToolCall，而不是抽象意图。批准后执行保存的 tool_call_id 和 input，不能重新让 LLM 生成参数。
-
-**结合你的项目：**  
-ToolExecutor.call_tool 先创建 ToolCall 和 Approval；审批通过后 execute_approved_tool(tool_call_id) 执行保存参数。
-
-### Q29：工具调用如何做审计？
-
-**面试官想考什么：**  
-他想看你是否考虑合规和排障。
-
-**推荐回答：**  
-审计需要记录 user、run、tool_name、input、output、risk level、status、approval_id、error、created_at。敏感字段需要脱敏。
-
-**结合你的项目：**  
-ToolCall、Approval、AgentEvent 都落库，mcp/audit.py 有 redaction helper。
-
-### Q30：如何防止工具重复执行？
-
-**面试官想考什么：**  
-他想考副作用幂等。
-
-**推荐回答：**  
-可以使用 tool_call_id、resolved_tool_call_ids、状态机、幂等 key。审批恢复时要检查是否已经执行过。
-
-**结合你的项目：**  
-state 有 pending_tool_call_id 和 resolved_tool_call_ids。tool_agent 在恢复路径会判断 pending tool 是否已 resolved。
-
-### Q31：如果审批被拒绝，Agent 应该怎么处理？
-
-**面试官想考什么：**  
-他想看你是否处理非 happy path。
-
-**推荐回答：**  
-审批拒绝后不能执行工具，应更新 run/tool/approval 状态，清理 pending state，并向用户说明操作未执行。
-
-**结合你的项目：**  
-approval_service 会更新 approval status，resume 逻辑会处理 rejected/failed context，final_response 不会声称工具完成。
-
-### Q32：如何设计工具风险分级？
-
-**面试官想考什么：**  
-他想看你是否能抽象风险模型。
-
-**推荐回答：**  
-可以按副作用范围和不可逆程度分级：只读、草稿、本地写入、外部写入、高危破坏。分级要对应执行策略，而不是只做标签。
-
-**结合你的项目：**  
-你的 L0-L4 分级直接影响执行：L3 approval，L4 block，这就是风险标签和运行策略绑定。
-
-### Q33：Tool result 应该直接给用户吗？
-
-**面试官想考什么：**  
-他想考最终输出治理。
-
-**推荐回答：**  
-不一定。Tool result 可能包含内部字段、错误栈、敏感信息。应该由 final_response 转成用户可读信息，并遵守安全约束。
-
-**结合你的项目：**  
-final_response 有输出规则，禁止暴露内部 JSON/status/tool payload，并根据 evaluator constraints 生成自然语言。
-
-### Q34：如何处理工具超时？
-
-**面试官想考什么：**  
-他想看稳定性。
-
-**推荐回答：**  
-应设置超时、重试策略、失败状态、用户反馈和审计记录。高风险工具不应自动重试副作用操作。
-
-**结合你的项目：**  
-你可以说当前 ToolCall 有 failed 状态和 error_message，下一步可以针对 provider 增加 timeout/retry/circuit breaker。
-
-### Q35：外部 MCP server 接入后最需要补什么？
-
-**面试官想考什么：**  
-他想看你是否知道内置工具和第三方工具的差异。
-
-**推荐回答：**  
-需要补标准 JSON Schema 校验、server trust policy、tool allowlist、OAuth/credential isolation、rate limit、sandbox 和更严格审计。
-
-**结合你的项目：**  
-当前内置工具治理已完成基础闭环，外部 MCP 接入时需要把 validate_tool_input 升级为标准 JSON Schema validator。
-
----
-
-## 14.4 RAG 与检索增强
-
-### Q36：RAG 的基本流程是什么？
-
-**面试官想考什么：**  
-他想确认你是否理解 RAG 主链路。
-
-**推荐回答：**  
-RAG 包括文档解析、chunking、embedding、索引、query rewrite/embedding、retrieval、rerank、context construction 和 answer generation。
-
-**结合你的项目：**  
-你的链路是 parse_document -> build_structured_chunks -> child embedding -> Qdrant upsert -> hybrid search -> parent enrichment -> final response。
-
-### Q37：为什么 chunking 很重要？
-
-**面试官想考什么：**  
-他想看你是否知道 RAG 效果不只取决于模型。
-
-**推荐回答：**  
-chunking 决定检索粒度。chunk 太大，embedding 噪声高；chunk 太小，上下文不完整。好的 chunking 要兼顾召回精度和回答完整性。
-
-**结合你的项目：**  
-你用 Parent-Child Chunking：child 负责召回，parent 负责上下文。
-
-### Q38：Parent-Child Chunking 解决什么问题？
-
-**面试官想考什么：**  
-他想听你解释具体收益。
-
-**推荐回答：**  
-它把检索单元和回答单元分开。child 小而准，适合召回；parent 大而完整，适合生成答案。命中 child 后回查 parent context。
-
-**结合你的项目：**  
-structured_chunker 生成 overview/parent/child，document_service 只把 child upsert 到 Qdrant，retriever 根据 parent_id enrich。
-
-### Q39：为什么只把 child chunk 写入向量库？
-
-**面试官想考什么：**  
-他想确认你不是随便设计。
-
-**推荐回答：**  
-向量召回需要高信息密度的小文本。parent 太长会稀释语义，overview 太概括会污染召回。child-only upsert 能提高召回精度。
-
-**结合你的项目：**  
-eval runner 的 validate_ingestion 会检查 child 有 qdrant_point_id，non-child 没有 vector。
-
-### Q40：Dense retrieval 和 Sparse retrieval 有什么区别？
-
-**面试官想考什么：**  
-他想考检索基础。
-
-**推荐回答：**  
-Dense retrieval 基于 embedding，擅长语义相似；Sparse retrieval 基于词项/稀疏向量，擅长关键词、编号、术语精确匹配。两者互补。
-
-**结合你的项目：**  
-Qdrant hybrid 同时写 dense 和 sparse，用于语义问题和合同号、邮箱、中文关键词等精确问题。
-
-### Q41：Hybrid Search 为什么比纯向量检索更稳？
-
-**面试官想考什么：**  
-他想看你是否理解业务 query 多样性。
-
-**推荐回答：**  
-纯向量检索对语义问法好，但对编号、金额、邮箱、专业术语不一定稳定。Hybrid 同时使用语义和关键词信号，可以覆盖更多 query 类型。
-
-**结合你的项目：**  
-你的 qdrant_hybrid benchmark hit@5 达到 0.92，baseline python_bm25 是 0.54。
-
-### Q42：RRF 是什么？为什么适合 Hybrid Search？
-
-**面试官想考什么：**  
-他想考融合方法。
-
-**推荐回答：**  
-RRF 是 Reciprocal Rank Fusion，按不同检索器中的排名融合结果。它不依赖不同检索器的原始分数尺度，所以适合 dense 和 sparse 这类分数不可直接比较的召回器。
-
-**结合你的项目：**  
-Qdrant native hybrid 里使用 `FusionQuery(fusion=Fusion.RRF)`。注意 Python fallback 不是 RRF。
-
-### Q43：BM25 和向量检索怎么融合？
-
-**面试官想考什么：**  
-他想看你是否知道 fallback 方案。
-
-**推荐回答：**  
-可以用 RRF 按 rank 融合，也可以把 BM25 score 和 vector score 归一化后加权，再做 rerank。RRF 更少依赖分数校准。
-
-**结合你的项目：**  
-Qdrant native hybrid 用 RRF；python_bm25 fallback 是 vector + local BM25 merge，再 weighted rerank。
-
-### Q44：什么是 rerank？它和 retrieval 有什么区别？
-
-**面试官想考什么：**  
-他想考检索阶段分层。
-
-**推荐回答：**  
-Retrieval 是从大规模索引里召回候选，重在召回率；rerank 是对候选重新排序，重在精度。rerank 可以使用 cross-encoder、LLM 或业务规则。
-
-**结合你的项目：**  
-你的 reranker 根据 query_type、vector_score、bm25_score、keyword_score、hybrid bonus、parent context 等做业务排序。
-
-### Q45：RAG 如何做引用和可追溯？
-
-**面试官想考什么：**  
-他想看你是否关注可信度。
-
-**推荐回答：**  
-检索结果需要保留 document_id、filename、chunk_id、parent_id、page_number、heading_path 等 metadata。最终回答可以引用来源并避免编造。
-
-**结合你的项目：**  
-Qdrant payload 和 DocumentChunk metadata 保留 chunk_id、parent_id、filename、heading_path，retriever 返回 citation。
-
-### Q46：如何处理 RAG 没检索到证据的情况？
-
-**面试官想考什么：**  
-他想考幻觉控制。
-
-**推荐回答：**  
-不要让模型基于空证据回答。应该明确说明没有找到足够证据，或请求用户提供文档/扩大范围。
-
-**结合你的项目：**  
-evaluator 检查 rag_result 没 evidence 时添加 warning 和 constraint，final_response 不能声称有文档依据。
-
-### Q47：RAG 如何做用户隔离？
-
-**面试官想考什么：**  
-他想考多租户安全。
-
-**推荐回答：**  
-索引 payload 必须包含 user_id，查询必须加 user_id filter。数据库查询也要按 user_id 限制。
-
-**结合你的项目：**  
-Qdrant payload 有 user_id，vector_store search 有 user filter，DocumentChunkRepository 也按用户/文档查询。
-
-### Q48：RAG 评估指标有哪些？
-
-**面试官想考什么：**  
-他想看你是否知道 RAG 不能只靠人工感觉。
-
-**推荐回答：**  
-常见指标包括 hit@k、recall@k、MRR、nDCG、answer faithfulness、context precision、latency、fallback rate、cost。
-
-**结合你的项目：**  
-你的 eval runner 计算 hit@1、hit@3、hit@5、keyword_hit_rate、fallback_count、warning_count、avg_latency。
-
-### Q49：hit@5 是什么意思？
-
-**面试官想考什么：**  
-他想确认你能解释指标。
-
-**推荐回答：**  
-hit@5 表示前 5 个检索结果中是否至少有一个命中目标答案或目标证据。它衡量召回能力，适合检索阶段评估。
-
-**结合你的项目：**  
-你可以说 synthetic eval 中 qdrant_hybrid hit@5 0.92，表示 92% query 的前 5 个结果里有目标关键词命中。
-
-### Q50：RAG 的 latency 怎么优化？
-
-**面试官想考什么：**  
-他想看工程优化能力。
-
-**推荐回答：**  
-可以优化 embedding batch、索引过滤、top_k、并行检索、缓存、rerank 候选数、向量库索引参数、文档预处理和超时 fallback。
-
-**结合你的项目：**  
-parallel_prefetch 提前准备 RAG evidence，eval report 记录 avg_latency_ms，retriever 有 fallback 避免 hybrid 异常卡死。
-
-### Q51：如何处理中文 RAG？
-
-**面试官想考什么：**  
-他想看你是否知道中文分词和关键词问题。
-
-**推荐回答：**  
-中文 RAG 要考虑分词、字符 n-gram、专业术语、混合中英文、编号和表格字段。Hybrid Search 往往比纯 dense 更稳。
-
-**结合你的项目：**  
-你的 BM25/sparse encoder 有 CJK n-gram 思路，fixture 里有中文风险说明，qdrant_hybrid 用 dense+sparse 处理中文关键词。
-
-### Q52：RAG 中 metadata filter 有什么作用？
-
-**面试官想考什么：**  
-他想考检索精度和权限。
-
-**推荐回答：**  
-metadata filter 可以做用户隔离、文档范围限制、文件类型过滤、时间过滤、目录过滤。它能减少噪声并保证权限。
-
-**结合你的项目：**  
-Qdrant 创建 user_id、document_id、file_type、created_at payload index，查询时可以 filter。
-
-### Q53：如何避免 RAG 把旧文档或无关文档检索出来？
-
-**面试官想考什么：**  
-他想看数据治理。
-
-**推荐回答：**  
-可以使用 document_id filter、时间 filter、文档状态、用户选择上下文、rerank、query rewrite 和 source priority。
-
-**结合你的项目：**  
-page_context/feed_card/current document 可以进入 GSSC，retriever 支持 document_ids，reranker 有 requested docs/filename bonus。
-
-### Q54：RAG 系统为什么需要 fallback？
-
-**面试官想考什么：**  
-他想看可靠性。
-
-**推荐回答：**  
-向量库、embedding、sparse encoder 或 schema 都可能失败。fallback 能保证系统在高级检索不可用时仍提供基本能力。
-
-**结合你的项目：**  
-qdrant_hybrid 失败会 fallback 到 python_bm25_hybrid，并记录 warning/fallback_count。
-
-### Q55：如何判断 RAG 答案是否忠实于证据？
-
-**面试官想考什么：**  
-他想考 hallucination mitigation。
-
-**推荐回答：**  
-可以检查答案是否引用检索证据，是否出现证据外事实，是否有足够 evidence。可以用规则、LLM judge、人工标注或自动评估。
-
-**结合你的项目：**  
-evaluator 会在 evidence missing 时加 constraint，final_response 明确不要编造文档中没有的内容。
-
----
-
-## 14.5 Memory、Context 与 Skill
-
-### Q56：Agent Memory 有哪些类型？
-
-**面试官想考什么：**  
-他想看你是否知道 memory 不只是聊天历史。
-
-**推荐回答：**  
-常见可分为 working memory、episodic memory、semantic memory。working 存当前任务状态，episodic 存历史事件，semantic 存长期事实和偏好。
-
-**结合你的项目：**  
-你的 MemoryService 支持 working/episodic/semantic，semantic/episodic 写 Qdrant，PG 是权威存储。
-
-### Q57：为什么不能把所有历史对话都塞进 prompt？
-
-**面试官想考什么：**  
-他想考上下文污染。
-
-**推荐回答：**  
-全塞会导致 token 膨胀、噪声增加、模型关注错误信息、隐私风险和成本上升。应该做摘要、检索和任务感知筛选。
-
-**结合你的项目：**  
-GSSC 根据 route weight、answer_mode policy 和 token budget 选择上下文，而不是全量注入。
-
-### Q58：Memory 写入时如何避免错误记忆？
-
-**面试官想考什么：**  
-他想看你是否有质量门槛。
-
-**推荐回答：**  
-需要 confidence/importance 阈值、来源记录、用户明确表达优先、低置信度过滤、冲突处理和可删除机制。
-
-**结合你的项目：**  
-_save_extracted 对 semantic/episodic 有 confidence 和 importance 阈值，extractor prompt 要求不要编造。
-
-### Q59：Memory 去重怎么做？
-
-**面试官想考什么：**  
-他想看长期记忆是否会越积越乱。
-
-**推荐回答：**  
-可以先检索相似 memory，再用文本相似度或 embedding 相似度判断。重复时更新 evidence_count、last_seen_at、importance，而不是新增。
-
-**结合你的项目：**  
-MemoryService.add_with_dedup 会 _find_similar 和 _update_existing，重复记忆会更新 evidence_count。
-
-### Q60：Memory 固化是什么意思？
-
-**面试官想考什么：**  
-他想看你是否理解短期到长期的晋升。
-
-**推荐回答：**  
-固化是把高价值、稳定、多次出现的信息从短期记忆晋升为长期记忆。例如 working 到 episodic，episodic 到 semantic。
-
-**结合你的项目：**  
-consolidate_memory 支持 working->episodic、episodic->semantic，并根据 importance、stability、evidence_count、category 判断。
-
-### Q61：什么是上下文工程？
-
-**面试官想考什么：**  
-他想看你是否知道 prompt 之外的工程。
-
-**推荐回答：**  
-上下文工程是围绕模型输入构建、选择、压缩和组织信息的工程能力，包括历史对话、记忆、检索证据、工具状态、系统约束和输出契约。
-
-**结合你的项目：**  
-GSSC 就是上下文工程实现：Gather、Select、Structure、Compress。
-
-### Q62：GSSC 的 Gather 阶段做什么？
-
-**面试官想考什么：**  
-他想看你是否能拆流程。
-
-**推荐回答：**  
-Gather 负责收集多源上下文，比如 task、profile、conversation history、memory、evidence、tool state、feed card、graph context。
-
-**结合你的项目：**  
-ContextBuilder.gather 把 payload 转为 ContextPacket，并为每个 source 赋 relevance_score。
-
-### Q63：GSSC 的 Select 阶段做什么？
-
-**面试官想考什么：**  
-他想看 token budget 管理。
-
-**推荐回答：**  
-Select 根据相关性、route 权重和 token budget 选择保留哪些上下文，低相关或超预算的丢弃。
-
-**结合你的项目：**  
-ContextBuilder.select 按 relevance_score 排序，在 budget 内选择，并记录 selected_sources/dropped_sources。
-
-### Q64：GSSC 的 Structure 阶段有什么价值？
-
-**面试官想考什么：**  
-他想看 prompt 组织能力。
-
-**推荐回答：**  
-Structure 把上下文按固定 section 组织，让模型区分任务、历史、记忆、证据、工具状态和输出要求，减少混乱。
-
-**结合你的项目：**  
-ContextBuilder.structure 输出 `[Task]`、`[Relevant Memory]`、`[Evidence]`、`[Conversation History]` 等 section。
-
-### Q65：如何做任务感知的 Memory 注入？
-
-**面试官想考什么：**  
-他想看你是否避免 memory 污染。
-
-**推荐回答：**  
-根据 answer_mode 或 route 设置 memory category policy。普通问答只注入语言/回答偏好，项目建议才注入 project_goal、tech_stack、workflow_pattern。
-
-**结合你的项目：**  
-MEMORY_CONTEXT_POLICY 针对 casual、general_qa、rag_qa、tool_action、project_advice 有不同 category allowlist。
-
-### Q66：Skill 和 Memory 的区别是什么？
-
-**面试官想考什么：**  
-他想看你是否混淆概念。
-
-**推荐回答：**  
-Memory 记录事实、偏好和事件；Skill 记录可复用工作流，包括触发条件、输入、步骤、工具计划和输出契约。
-
-**结合你的项目：**  
-Memory 存用户偏好和任务事件；Skill 模型有 trigger_text、context_recipe、tool_plan、output_schema。
-
-### Q67：Skill 复用如何触发？
-
-**面试官想考什么：**  
-他想看你是否知道复用机制。
-
-**推荐回答：**  
-可以根据 trigger phrase、query terms、上下文相似度、历史成功次数和用户显式复用意图触发。
-
-**结合你的项目：**  
-SkillService.match_skill 根据 terms overlap、trigger phrase、task_type_match、approved status 评分，score 足够高才 auto_use。
-
-### Q68：Skill 草稿什么时候生成？
-
-**面试官想考什么：**  
-他想看你是否理解 workflow mining。
-
-**推荐回答：**  
-当一次任务有明确复用信号、结构化 workflow、artifact 输出、工具链和成功完成时，可以生成 Skill 草稿，等待用户批准。
-
-**结合你的项目：**  
-skill_agent 调用 evaluate_reusability，score >= 0.70 时 create_skill_draft_from_run。
-
-### Q69：为什么当前 Skill 不应说成自动执行引擎？
-
-**面试官想考什么：**  
-他想看你是否诚实。
-
-**推荐回答：**  
-自动执行引擎需要把 Skill 编译成可执行 DAG 或子图，并按 tool_plan 执行和处理权限。当前如果只是匹配和上下文注入，就应该称为复用雏形。
-
-**结合你的项目：**  
-你的 Skill 当前是草稿生成、匹配、上下文注入和统计，还没有完整子图执行。
-
-### Q70：如何处理用户要求删除记忆？
-
-**面试官想考什么：**  
-他想考隐私和数据治理。
-
-**推荐回答：**  
-需要支持按 id、类别、时间、重要度删除或归档，同时删除向量索引中的对应点，并记录操作。
-
-**结合你的项目：**  
-MemoryService 有 forget_memory、forget_by_importance、forget_by_time、forget_by_capacity，Qdrant memory store 有 delete。
-
----
-
-## 14.6 Evaluation、Guardrail 与质量控制
-
-### Q71：Agent 为什么需要 evaluator？
-
-**面试官想考什么：**  
-他想看你是否知道最终输出要受约束。
-
-**推荐回答：**  
-Agent 中间结果可能失败、缺证据或等待审批。Evaluator 可以在最终回答前检查状态，生成 warnings 和 constraints，避免最终回答过度承诺。
-
-**结合你的项目：**  
-evaluator 检查 tool waiting approval、rag evidence missing、memory write failed 等情况。
-
-### Q72：如何防止 RAG 答案幻觉？
-
-**面试官想考什么：**  
-他想考 grounded generation。
-
-**推荐回答：**  
-需要检索证据约束、无证据时明确说明、引用来源、final prompt 约束、必要时用 evaluator 检查答案是否超出证据。
-
-**结合你的项目：**  
-final_response 指令要求不要编造文档没有的信息，evaluator 在 evidence missing 时加 constraint。
-
-### Q73：如何防止工具执行状态被夸大？
-
-**面试官想考什么：**  
-他想考工具一致性。
-
-**推荐回答：**  
-final response 必须读取 ToolCall status。如果 status 是 waiting_approval 或 failed，不能说已完成。
-
-**结合你的项目：**  
-eval_final_nodes 对 waiting_approval 加 warning，约束回答“需要审批后才能执行”。
-
-### Q74：Agent 评估可以分哪几层？
-
-**面试官想考什么：**  
-他想看评估体系。
-
-**推荐回答：**  
-可以分为 retrieval eval、tool eval、planning eval、memory eval、final answer eval、latency/cost eval、safety eval。
-
-**结合你的项目：**  
-RAG 有 hit@k eval，Tool 有 MCP stage tests，Runtime 有 graph contract tests，Memory/GSSC 可以继续补 selected context correctness eval。
-
-### Q75：LLM-as-judge 有什么风险？
-
-**面试官想考什么：**  
-他想看你是否知道评估也会有偏差。
-
-**推荐回答：**  
-LLM judge 可能不稳定、偏向长答案、受 prompt 影响、无法替代人工标注。适合辅助评估，但关键指标最好有规则或人工基准。
-
-**结合你的项目：**  
-你的 hit@5 eval 是规则型 keyword hit，不依赖 LLM judge，这对检索阶段更稳定。
-
-### Q76：如何评估 Memory 是否有效？
-
-**面试官想考什么：**  
-他想看 memory 不是只写入。
-
-**推荐回答：**  
-可以评估抽取准确率、去重率、长期偏好命中率、上下文注入相关性、冲突率、用户纠正率。
-
-**结合你的项目：**  
-当前有 extraction/dedup/consolidation 代码，后续可以补 memory eval dataset，验证不同 answer_mode 下 memory category 是否正确注入。
-
-### Q77：如何评估 Planner？
-
-**面试官想考什么：**  
-他想考 route 质量。
-
-**推荐回答：**  
-构建输入到 expected route/intent/risk 的测试集，评估 intent accuracy、route accuracy、risk classification accuracy、approval decision accuracy。
-
-**结合你的项目：**  
-planner 输出 RoutePlan，可以用测试集验证 document_qa 是否走 rag_agent，L3 工具是否 needs_approval。
-
-### Q78：如何评估 Tool 安全？
-
-**面试官想考什么：**  
-他想看安全测试。
-
-**推荐回答：**  
-覆盖低风险自动执行、缺参数拦截、L3 审批、L4 阻断、审批通过执行、审批拒绝不执行、审计记录存在。
-
-**结合你的项目：**  
-test_mcp_stage7 已覆盖部分场景，尤其 waiting_approval 和 high_risk_denied。
-
-### Q79：如何做回归测试防止 RAG 变差？
-
-**面试官想考什么：**  
-他想看持续评估。
-
-**推荐回答：**  
-固定 eval docs 和 queries，每次改 chunking/retrieval/rerank 后跑 hit@k 和 latency，对比历史报告，设置最低阈值。
-
-**结合你的项目：**  
-scripts/run_rag_hybrid_eval.py 就是这个方向，报告保存在 uploads/artifacts/rag_eval。
-
-### Q80：如何判断 final answer 是否泄露内部字段？
-
-**面试官想考什么：**  
-他想看产品化输出质量。
-
-**推荐回答：**  
-可以用规则检测 JSON、status、tool_call、evidence item、chunk 等内部字段，并在 final prompt 中明确禁止。
-
-**结合你的项目：**  
-eval_final_nodes 中有 _looks_like_internal_json 和 output rules，禁止输出 status、final_output、evidence 等内部字段。
-
----
-
-## 14.7 工程化、性能与可靠性
-
-### Q81：Agent 系统如何做持久化？
-
-**面试官想考什么：**  
-他想看系统不是内存玩具。
-
-**推荐回答：**  
-需要持久化用户、会话、run、state、events、tool calls、approvals、memory、skills、documents、chunks 和 eval records。
-
-**结合你的项目：**  
-models/orm.py 中有 AgentRun、AgentEvent、ToolCall、Approval、Memory、Skill、DocumentChunk 等。
-
-### Q82：Agent 系统如何做用户隔离？
-
-**面试官想考什么：**  
-他想考多用户安全。
-
-**推荐回答：**  
-所有数据库查询、向量索引 payload、memory、tools、documents 都要绑定 user_id。外部工具也要做用户级权限和凭证隔离。
-
-**结合你的项目：**  
-Memory、ToolCall、Approval、DocumentChunk、Qdrant payload 都带 user_id。
-
-### Q83：Agent 系统如何做错误恢复？
-
-**面试官想考什么：**  
-他想看可靠性。
-
-**推荐回答：**  
-错误恢复包括节点级错误记录、失败状态、fallback、重试、checkpoint、业务状态恢复、用户可读错误信息。
-
-**结合你的项目：**  
-RAG 有 fallback，tool 有 failed/blocked/waiting_approval 状态。审批恢复走 PostgresSaver checkpoint：interrupt() 暂停时状态持久化到 PG，Command(resume=...) 从 checkpoint 精确恢复，不重跑 graph。启动有 health check + require_durable fail-fast。审批超时自动过期（24h TTL），防止永久悬挂。completed/failed/expired run 的 checkpoint 按 TTL 自动清理。
-
-### Q84：如何降低 Agent 延迟？
-
-**面试官想考什么：**  
-他想看性能优化。
-
-**推荐回答：**  
-可以并行预取上下文、缓存 embedding、减少 rerank 候选、流式输出、拆分 fast path、减少不必要 LLM 调用、选择轻量模型。
-
-**结合你的项目：**  
-parallel_prefetch 和 parallel_read_stage 就是延迟优化，LLM router 也可按 purpose/complexity 选择模型。
-
-### Q85：如何降低 Agent 成本？
-
-**面试官想考什么：**  
-他想看成本意识。
-
-**推荐回答：**  
-减少 token、减少无必要 LLM 调用、用小模型处理分类/抽取、缓存检索和 embedding、控制上下文 budget、只在必要时跑深度研究。
-
-**结合你的项目：**  
-GSSC 有 token budget 和 compression，memory extraction 对 casual chat 可以走 regex，planner 可决定是否需要 research。
-
-### Q86：为什么要记录 LLMCall？
-
-**面试官想考什么：**  
-他想看可观测性和成本审计。
-
-**推荐回答：**  
-LLMCall 记录 provider、model、purpose、latency、tokens/chars、status、error，有助于排查质量、成本和性能问题。
-
-**结合你的项目：**  
-memory_extractor、intent_llm、final_response 等路径会 record_llm_call。
-
-### Q87：如何处理长任务？
-
-**面试官想考什么：**  
-他想看异步和用户体验。
-
-**推荐回答：**  
-长任务应异步执行，流式事件返回进度，持久化 run state，支持取消、恢复和失败反馈。
-
-**结合你的项目：**  
-AgentRun、stream_queue、AgentEvent、runtime_latency_trace 支持长任务观测，research_agent 和 approval flow 都适合长任务模型。
-
-### Q88：Agent 系统如何做权限控制？
-
-**面试官想考什么：**  
-他想看安全体系。
-
-**推荐回答：**  
-权限控制包括用户身份、资源归属、工具 allowlist、风险等级、审批、凭证隔离和审计。
-
-**结合你的项目：**  
-工具层有 PermissionGuard，资源层有 user_id filter，审批层有 ApprovalService 验证 user/run。
-
-### Q89：如何避免 prompt injection？
-
-**面试官想考什么：**  
-他想考安全攻防。
-
-**推荐回答：**  
-需要区分系统指令和外部内容，检索内容作为不可信上下文处理，工具调用前用代码权限控制，禁止文档内容覆盖系统策略，输出前做 guardrail。
-
-**结合你的项目：**  
-MCP 权限由代码控制，不会因为文档说“请执行删除”就执行。GSSC 结构化上下文也有 Role & Policies section。
-
-### Q90：如何处理敏感信息？
-
-**面试官想考什么：**  
-他想看隐私意识。
-
-**推荐回答：**  
-敏感信息要最小化存储、脱敏日志、权限隔离、加密凭证、限制工具输出、支持删除。
-
-**结合你的项目：**  
-mcp/audit.py 有 redaction helper，Memory 支持 forget，ToolCall 审计应继续强化敏感字段脱敏。
-
----
-
-## 14.8 系统设计与开放问题
-
-### Q91：如果让你从零设计一个企业 Agent 平台，你怎么设计？
-
-**面试官想考什么：**  
-他想看系统设计能力。
-
-**推荐回答：**  
-可以分层设计：API 层、Runtime 层、Planner/Router、Context/RAG/Memory、Tool Gateway、安全审批、事件观测、存储层、评估平台、管理后台。
-
-**结合你的项目：**  
-你的项目已经有这些雏形：AgentService、LangGraph Runtime、GSSC、MCP ToolExecutor、Qdrant RAG、MemoryService、SkillService、AgentEvent。
-
-### Q92：如何把你的 Agent 系统做成多租户 SaaS？
-
-**面试官想考什么：**  
-他想考扩展和隔离。
-
-**推荐回答：**  
-需要 tenant_id/user_id 隔离、数据库行级权限、向量库 payload filter、租户级工具 allowlist、凭证隔离、配额、审计和计费。
-
-**结合你的项目：**  
-当前 user_id 隔离已存在，下一步可以扩展 tenant_id 和 workspace-level permissions。
-
-### Q93：如果 Agent 调错工具，怎么排查？
-
-**面试官想考什么：**  
-他想看调试链路。
-
-**推荐回答：**  
-先看 planner intent/route，再看 tool selection 输入输出，再看 validate_tool_input，再看 PermissionGuard decision，再看 ToolCall status 和 AgentEvent。
-
-**结合你的项目：**  
-你可以沿 AgentRun -> node_results -> ToolCall -> Approval -> AgentEvent 追踪。
-
-### Q94：如果 RAG 检索效果突然下降，怎么排查？
-
-**面试官想考什么：**  
-他想看真实运维能力。
-
-**推荐回答：**  
-检查文档解析、chunk 数量、child 是否入库、Qdrant collection schema、dense/sparse 是否写入、query filter、rerank、eval report、fallback_count。
-
-**结合你的项目：**  
-run_rag_hybrid_eval 的 validate_ingestion、qdrant_hybrid tests 和 JSONL 明细可以帮助定位。
-
-### Q95：如果 Memory 注入了错误上下文，怎么排查？
-
-**面试官想考什么：**  
-他想看上下文可观测。
-
-**推荐回答：**  
-查看抽取记录、memory metadata、search result、answer_mode policy、GSSC selected_sources/dropped_sources 和 final prompt。
-
-**结合你的项目：**  
-gssc_debug 记录 selected_sources/dropped_sources/token_budget_used，memory_context 记录 backend、qdrant_hits、items。
-
-### Q96：如何让 Agent 支持人类在环？
-
-**面试官想考什么：**  
-他想看 HITL 设计。
-
-**推荐回答：**  
-HITL 可以用于高风险工具、低置信度计划、长任务确认、结果审核。实现上需要 pending state、approval record、resume token 和可恢复 runtime。
-
-**结合你的项目：**  
-L3 工具审批就是 HITL：Approval 记录、waiting_approval 状态、resume_from_approval。
-
-### Q97：如何让 Agent 输出更稳定？
-
-**面试官想考什么：**  
-他想看产品化。
-
-**推荐回答：**  
-使用结构化上下文、输出契约、低温度、few-shot、evaluator、JSON schema 或 parser、禁止内部字段、错误状态约束。
-
-**结合你的项目：**  
-GSSC 提供结构化上下文，final_response 有 Output Rules，evaluator 提供 constraints。
-
-### Q98：如何处理 Agent 的权限升级问题？
-
-**面试官想考什么：**  
-他想考安全升级路径。
-
-**推荐回答：**  
-权限升级必须显式、可审计、最小权限原则。比如从只读到写入必须审批，从 L3 到 L4 不允许自动升级。
-
-**结合你的项目：**  
-L3 需要审批，L4 blocked，tool spec 的 safety_level 固定在 registry/DB，不由模型随意改。
-
-### Q99：你的项目下一步最应该补什么？
-
-**面试官想考什么：**  
-他想看你是否知道不足。
-
-**推荐回答：**  
-可以补完整 JSON Schema validator、外部 MCP server trust policy、Memory eval、Skill 可执行子图、线上 query log RAG eval。
-
-**结合你的项目：**  
-Checkpoint 已从"待补"升级为"已完成"（PostgresSaver 生产闭环）。当前真正需要升级的是：标准 JSON Schema 校验（当前只做 required/format）、Skill 从"上下文注入"升级为"可执行子图"、RAG eval 从 synthetic benchmark 升级为线上真实 query log。
-
-### Q100：如果只能保留你项目里最有价值的三个设计，你选什么？
-
-**面试官想考什么：**  
-他想看你抓重点。
-
-**推荐回答：**  
-我会选：LangGraph 节点化 Runtime、MCP L0-L4 工具治理、Parent-Child + Qdrant Hybrid RAG。因为它们分别解决执行可控、工具安全和知识检索这三个 Agent 平台最核心问题。
-
-**结合你的项目：**  
-最后可以补一句：Memory/GSSC/Skill 是上层增强能力，但 Runtime、MCP、RAG 是平台底座。
-
----
-
-## 14.9 这 100 题怎么复习
-
-不要从 Q1 背到 Q100。建议这样复习：
-
-1. 先背四段 30 秒模块讲法。
-2. 再按模块看问题：Runtime、MCP、RAG、Memory。
-3. 每道题都练习把答案落回你的项目文件和工作流。
-4. 遇到当前项目没有完整实现的能力，主动说清楚边界。
-
-你的面试核心姿态应该是：
-
-> 我不是只知道概念，我知道它在工程里怎么落地、怎么失败、怎么观测、怎么补下一版。
+> 我不是只会调模型 API，而是能把 Agent 从 demo 做成可控、可恢复、可评估、可治理的工程系统。
