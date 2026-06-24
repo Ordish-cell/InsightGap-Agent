@@ -139,9 +139,9 @@ class TestRedisBackendReadiness:
         """RedisSaver constructor succeeds with real Redis (backend=redis)."""
         from src.web_app.agent.runtime.checkpointers import build_checkpointer
         REDIS_URL = os.environ.get(
-            "REDIS_URL", "redis://:123456@192.168.170.100:6379/0"
+            "REDIS_URL", "redis://:your_password@redis_host:6379/0"
         )
-        REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "123456")
+        REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", "your_password")
 
         try:
             saver = build_checkpointer(

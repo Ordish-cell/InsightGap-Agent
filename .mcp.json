@@ -8,7 +8,7 @@
         "--transport",
         "stdio",
         "--dsn",
-        "postgres://postgres:123456@localhost:5432/agent_os?sslmode=disable"
+        "postgres://user:password@localhost:5432/db_name?sslmode=disable"
       ]
     }
   }

@@ -66,4 +66,7 @@ node_modules/
 tmp/
 temp/
 
+# Experiment results
+tests/expt_results/
+
 .langgraph_api
