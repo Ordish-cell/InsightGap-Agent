@@ -2,6 +2,8 @@ import inspect
 import sys
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -13,6 +15,7 @@ from src.web_app.agent.runtime.dispatch import (
     next_route_node,
     map_route_to_node,
 )
+from src.web_app.agent.runtime import graph as runtime_graph
 from src.web_app.agent.runtime.graph import AgentRuntime
 from src.web_app.agent.runtime.graph_builder import build_agent_runtime_graph
 from src.web_app.agent.runtime.graph_registry import (
@@ -51,17 +54,21 @@ def test_runtime_node_registry_contains_graph_callables():
     assert callable(registry["skill_matcher"])
 
 
-def test_graph_builder_builds_compiled_graph_and_runtime_uses_facade_wrappers():
+@pytest.mark.asyncio
+async def test_graph_builder_builds_compiled_graph_and_runtime_uses_facade_wrappers(monkeypatch):
+    monkeypatch.setattr(runtime_graph.settings, "agent_langgraph_checkpointer_enabled", False)
     runtime = _runtime()
     graph = build_agent_runtime_graph(
         runtime.nodes,
         after_permission=runtime._after_permission,
         dispatch_next_route_node=runtime._dispatch_next_route_node,
+        dispatch_after_evaluator=runtime._dispatch_after_evaluator,
     )
 
     assert graph is not None
-    assert callable(runtime._build_langgraph().ainvoke)
+    assert callable((await runtime._build_langgraph()).ainvoke)
     assert list(inspect.signature(AgentRuntime._dispatch_next_route_node).parameters) == ["self", "state"]
+    assert list(inspect.signature(AgentRuntime._dispatch_after_evaluator).parameters) == ["self", "state"]
     assert list(inspect.signature(AgentRuntime._after_permission).parameters) == ["self", "state"]
 
 
@@ -73,6 +80,8 @@ def test_graph_builder_source_keeps_p6a_wiring():
     assert 'workflow.add_edge("parallel_read_stage", "supervisor_observer")' in text
     assert 'workflow.add_edge("supervisor_observer", "llm_supervisor_route")' in text
     assert 'workflow.add_conditional_edges(\n        "llm_supervisor_route"' in text
+    assert 'workflow.add_conditional_edges(\n        "evaluator"' in text
+    assert 'workflow.add_edge("evaluator", "final_response")' not in text
     assert 'workflow.add_edge("parallel_prefetch", "context_builder")' not in text
 
 

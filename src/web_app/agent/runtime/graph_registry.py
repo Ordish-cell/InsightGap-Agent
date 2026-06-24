@@ -168,7 +168,18 @@ RUNTIME_NODE_SPECS: tuple[RuntimeNodeSpec, ...] = (
     RuntimeNodeSpec(
         "evaluator", "evaluator", "eval_final", True,
         reads=("agent_results", "rag_result", "tool_result", "memory_result"),
-        writes=("evaluation_result", "final_response_constraints", "final_warnings"),
+        writes=(
+            "evaluation_result",
+            "final_response_constraints",
+            "final_warnings",
+            "evaluation",
+            "evaluator_recovery_decision",
+            "evaluator_recovery_attempts",
+            "evaluator_recovery_history",
+            "evaluator_recovery_active",
+            "evaluator_recovery_target",
+            "evaluator_recovery_exhausted",
+        ),
         description="Evaluate formal agent results and produce final response constraints.",
     ),
     RuntimeNodeSpec(

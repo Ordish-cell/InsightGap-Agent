@@ -23,7 +23,16 @@ def get_tool(tool_name: str, db: Session = Depends(get_db)):
 
 @router.post("/tool-calls")
 def call_tool(payload: ToolCallRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    return ok(mcp_service.call_tool(db, user_id, payload.tool_name, payload.input, agent_run_id=payload.agent_run_id, dry_run=payload.dry_run))
+    return ok(mcp_service.call_tool(
+        db,
+        user_id,
+        payload.tool_name,
+        payload.input,
+        agent_run_id=payload.agent_run_id,
+        dry_run=payload.dry_run,
+        idempotency_key=payload.idempotency_key,
+        approval_mode="standalone",
+    ))
 
 
 @router.get("/tool-calls")

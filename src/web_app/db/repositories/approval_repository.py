@@ -15,3 +15,6 @@ class ApprovalRepository(BaseRepository[Approval]):
 
     def list_by_run(self, run_id: int) -> list[Approval]:
         return list(self.db.execute(select(Approval).where(Approval.run_id == run_id)).scalars())
+
+    def get_by_idempotency_key(self, idempotency_key: str) -> Approval | None:
+        return self.db.execute(select(Approval).where(Approval.idempotency_key == idempotency_key)).scalar_one_or_none()

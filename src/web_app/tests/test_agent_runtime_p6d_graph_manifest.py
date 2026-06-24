@@ -64,7 +64,9 @@ def test_manifest_edges_match_current_graph_wiring():
     assert ("llm_supervisor_route", "route_dispatch") in edge_pairs
     assert ("route_dispatch", "rag_agent") in edge_pairs
     assert ("route_dispatch", "evaluator") in edge_pairs
-    assert ("evaluator", "final_response") in edge_pairs
+    assert ("evaluator", "recovery_dispatch") in edge_pairs
+    assert ("recovery_dispatch", "final_response") in edge_pairs
+    assert ("recovery_dispatch", "rag_agent") in edge_pairs
     assert "replanner" not in {edge["to"] for edge in manifest["edges"]}
 
 
@@ -79,6 +81,7 @@ def test_mermaid_render_includes_key_runtime_sections():
         "supervisor_observer",
         "llm_supervisor_route",
         "route dispatch",
+        "recovery dispatch",
         "replanner dispatch observer",
         "rag_agent --> route_dispatch",
         "END",
@@ -100,6 +103,16 @@ def test_manifest_contains_replanner_capabilities_without_adding_graph_node():
     assert "replanner" not in manifest["graph_node_names"]
     assert manifest["route_destinations"] == list(ROUTE_DESTINATION_NODE_NAMES)
     assert manifest["fallback_sequence"] == list(FALLBACK_NODE_NAMES)
+
+
+def test_manifest_contains_evaluator_recovery_capabilities():
+    manifest = build_runtime_graph_manifest()
+    capabilities = manifest["evaluator_recovery_capabilities"]
+
+    assert capabilities["evaluator_recovery_loop"] is True
+    assert capabilities["direct_agent_retry"] is True
+    assert capabilities["max_attempts_per_agent"] == 1
+    assert capabilities["max_total_attempts"] == 6
 
 
 def test_manifest_build_is_static_and_does_not_import_runtime_nodes():

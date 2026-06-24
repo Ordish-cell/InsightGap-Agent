@@ -5,6 +5,8 @@ import json
 from src.web_app.agent.runtime.events import queue_stream_event
 from src.web_app.agent.runtime.node_groups.base import *
 from src.web_app.agent.runtime.state_delta import record_agent_node_result
+from src.web_app.db.repositories.mcp_repository import ToolCallRepository
+from src.web_app.mcp.tool_executor import build_tool_idempotency_key, tool_executor
 
 
 def _tool_node_result_updates(state: AgentRuntimeState) -> dict[str, Any]:
@@ -657,9 +659,17 @@ class AgentNodesMixin:
                 stream_queue=getattr(self, "_stream_queue", None),
             )
 
-            result = mcp_service.call_tool(self.db, state["user_id"], tool_name, tool_input,
-                                           agent_run_id=state["run_id"],
-                                           dry_run=bool(self.payload.get("dry_run", False)))
+            idempotency_key = build_tool_idempotency_key(state["run_id"], state["user_id"], tool_name, tool_input)
+            result = mcp_service.call_tool(
+                self.db,
+                state["user_id"],
+                tool_name,
+                tool_input,
+                agent_run_id=state["run_id"],
+                dry_run=bool(self.payload.get("dry_run", False)),
+                idempotency_key=idempotency_key,
+                approval_mode="agent_runtime",
+            )
             state["tool_call"] = result
             state["tool_result"] = result
 
@@ -794,12 +804,20 @@ class AgentNodesMixin:
         state["pending_tool_call_id"] = tool_call_id
         state["route_plan_snapshot"] = dict(route_plan)
         state["resume_token"] = f"approval:{approval_id}"
+        db_approval_payload = {}
+        if approval_id:
+            try:
+                approval_obj = ApprovalRepository(self.db).get_by_id(int(approval_id))
+                db_approval_payload = dict(approval_obj.payload or {}) if approval_obj else {}
+            except Exception:
+                db_approval_payload = {}
         state["approval_payload"] = {
             "approval_id": approval_id,
             "tool_name": tool_name,
-            "risk_level": route_plan.get("risk_level", "L3"),
+            "risk_level": db_approval_payload.get("risk_level") or route_plan.get("risk_level", "L3"),
             "tool_args": safe_tool_args,
-            "preview": result.get("output", {}),
+            "preview": db_approval_payload.get("preview") or result.get("output", {}),
+            "safety_notes": db_approval_payload.get("safety_notes", []),
             "run_id": state["run_id"],
             "user_id": state["user_id"],
             "title": f"需要你确认：{tool_name}",
@@ -877,8 +895,49 @@ class AgentNodesMixin:
         )
 
         if resume_data.get("action") == "approved":
+            tool_args = state.get("pending_tool_args") or {}
+            client_tool_call_id = str(tool_call_id or _tool_event_id(state, tool_name))
+            _queue_tool_event(
+                state,
+                "tool_call_started",
+                tool_call_id=client_tool_call_id,
+                tool_name=tool_name,
+                args_preview=_sanitize_tool_args(tool_name, tool_args),
+                status="running",
+                tool_call_record_id=tool_call_id,
+                stream_queue=getattr(self, "_stream_queue", None),
+            )
+            try:
+                executed_result = tool_executor.execute_approved_tool_once(
+                    self.db,
+                    state["user_id"],
+                    int(tool_call_id),
+                    tool_name,
+                    tool_args,
+                    agent_run_id=state.get("run_id"),
+                )
+            except Exception as exc:
+                executed_result = {
+                    "success": False,
+                    "tool_name": tool_name,
+                    "error_code": type(exc).__name__,
+                    "message": str(exc),
+                }
+            success = executed_result.get("success") is True
+            _queue_tool_event(
+                state,
+                "tool_call_completed" if success else "tool_call_failed",
+                tool_call_id=client_tool_call_id,
+                tool_name=tool_name,
+                output_preview=_tool_output_preview(executed_result),
+                status="completed" if success else "failed",
+                error="" if success else str(executed_result.get("message") or executed_result.get("error") or "tool_execution_failed"),
+                tool_call_record_id=tool_call_id,
+                extra_payload=_tool_event_extra(tool_name, executed_result),
+                stream_queue=getattr(self, "_stream_queue", None),
+            )
             return self._handle_tool_resume_approved(
-                state, resume_data.get("tool_result") or {},
+                state, executed_result,
                 suffix="interrupt",
             )
         elif resume_data.get("action") == "rejected":
@@ -915,18 +974,28 @@ class AgentNodesMixin:
         suffix: str = "",
     ) -> AgentRuntimeState:
         """Accept a pre-executed tool result (approved resume)."""
+        success = tool_result.get("success") is True
+        pending_tool_call_id = state.get("pending_tool_call_id")
         state["tool_result"] = tool_result
         state["tool_call"] = {
             **state.get("tool_call", {}),
-            "status": "completed", "error": "",
+            "status": "completed" if success else "failed",
+            "error": "" if success else str(tool_result.get("message") or tool_result.get("error") or "tool_execution_failed"),
         }
+        if pending_tool_call_id:
+            resolved = list(state.get("resolved_tool_call_ids") or [])
+            if pending_tool_call_id not in resolved:
+                resolved.append(pending_tool_call_id)
+            state["resolved_tool_call_ids"] = resolved
         self._clear_pending_state(state)
         state["status"] = "running"  # clear waiting_approval
         append_agent_result(state, AgentResult(
             task_id=task_id_for_agent(state, "tool_agent"),
-            agent="tool_agent", status="ok", confidence=0.9,
-            summary=f"Tool action completed after approval{f' ({suffix})' if suffix else ''}.",
+            agent="tool_agent", status="ok" if success else "failed", confidence=0.9 if success else 0.0,
+            summary=f"Tool action completed after approval{f' ({suffix})' if suffix else ''}." if success else f"Tool action failed after approval{f' ({suffix})' if suffix else ''}.",
             tool_calls=[state["tool_call"]] if state.get("tool_call") else [],
+            errors=[] if success else [str(tool_result.get("message") or tool_result.get("error") or "tool_execution_failed")],
+            warnings=[] if success else ["tool_failed"],
         ))
         emit_visible_thought(self.db, state, "tool_agent", stream_queue=self._stream_queue)
         mark_completed(state, "tool_agent")
@@ -945,6 +1014,20 @@ class AgentNodesMixin:
         suffix: str = "",
     ) -> AgentRuntimeState:
         """Record a rejected tool result without executing anything."""
+        pending_tool_call_id = state.get("pending_tool_call_id")
+        pending_approval_id = state.get("pending_approval_id")
+        if pending_tool_call_id:
+            try:
+                ToolCallRepository(self.db).update_status(int(pending_tool_call_id), "rejected", error_message=reason)
+            except Exception:
+                logger.exception("failed to mark rejected tool_call_id=%s", pending_tool_call_id)
+        if pending_approval_id:
+            try:
+                approval = ApprovalRepository(self.db).get_by_id(int(pending_approval_id))
+                if approval and approval.status == "pending":
+                    ApprovalRepository(self.db).update(approval, status="rejected")
+            except Exception:
+                logger.exception("failed to mark rejected approval_id=%s", pending_approval_id)
         state["tool_call"] = {**state.get("tool_call", {}), "status": "rejected"}
         state["tool_result"] = {"status": "rejected", "message": reason}
         self._clear_pending_state(state)
@@ -1371,6 +1454,3 @@ class AgentNodesMixin:
     def _draft_title(self, user_input: str) -> str:
         title = " ".join(str(user_input).strip().split())[:40]
         return f"Reusable Agent workflow: {title}" if title else "Reusable Agent workflow"
-
-
-

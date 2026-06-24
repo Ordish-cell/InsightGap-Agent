@@ -48,6 +48,7 @@ class ToolCallRequest(BaseModel):
     input: dict[str, Any] = Field(default_factory=dict)
     agent_run_id: int | None = None
     dry_run: bool = False
+    idempotency_key: str | None = None
 
 
 class ToolCallRead(BaseModel):

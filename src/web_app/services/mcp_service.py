@@ -20,8 +20,27 @@ class MCPService:
         tool = registry.get_tool(db, tool_name)
         return tool.model_dump() if tool else None
 
-    def call_tool(self, db: Session, user_id: int, tool_name: str, input_data: dict[str, Any], agent_run_id: int | None = None, dry_run: bool = False) -> dict[str, Any]:
-        return tool_executor.call_tool(db, user_id, tool_name, input_data, agent_run_id=agent_run_id, dry_run=dry_run).model_dump()
+    def call_tool(
+        self,
+        db: Session,
+        user_id: int,
+        tool_name: str,
+        input_data: dict[str, Any],
+        agent_run_id: int | None = None,
+        dry_run: bool = False,
+        idempotency_key: str | None = None,
+        approval_mode: str = "standalone",
+    ) -> dict[str, Any]:
+        return tool_executor.call_tool(
+            db,
+            user_id,
+            tool_name,
+            input_data,
+            agent_run_id=agent_run_id,
+            dry_run=dry_run,
+            idempotency_key=idempotency_key,
+            approval_mode=approval_mode,
+        ).model_dump()
 
     def list_tool_calls(self, db: Session, user_id: int, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         return [tool_call_to_read(item).model_dump() for item in ToolCallRepository(db).list_by_user(user_id, limit, offset)]

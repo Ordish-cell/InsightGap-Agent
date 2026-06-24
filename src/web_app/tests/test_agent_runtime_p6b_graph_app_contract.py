@@ -2,6 +2,8 @@ import logging
 import sys
 from pathlib import Path
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -36,8 +38,6 @@ def test_langgraph_invoke_config_matches_legacy_inline_shape():
     assert build_langgraph_invoke_config(state) == {
         "configurable": {
             "thread_id": "thread-abc",
-            "user_id": 7,
-            "run_id": 11,
         }
     }
 
@@ -48,9 +48,7 @@ def test_langgraph_invoke_config_keeps_thread_fallback_and_does_not_mutate_state
 
     config = build_langgraph_invoke_config(state)
 
-    assert config["configurable"]["thread_id"] == "user:7:run:11"
-    assert config["configurable"]["user_id"] == 7
-    assert config["configurable"]["run_id"] == 11
+    assert config["configurable"]["thread_id"] == "run:11"
     assert state == before
 
 
@@ -105,6 +103,7 @@ def test_graph_builder_default_does_not_pass_checkpointer(monkeypatch):
         RuntimeNodes(make_test_session(), {}),
         after_permission=lambda state: "continue",
         dispatch_next_route_node=lambda state: "final_response",
+        dispatch_after_evaluator=lambda state: "final_response",
     )
 
     assert result == "compiled"
@@ -142,6 +141,7 @@ def test_graph_builder_passes_checkpointer_only_when_supplied(monkeypatch):
         RuntimeNodes(make_test_session(), {}),
         after_permission=lambda state: "continue",
         dispatch_next_route_node=lambda state: "final_response",
+        dispatch_after_evaluator=lambda state: "final_response",
         checkpointer=checkpointer,
     )
 
@@ -149,55 +149,59 @@ def test_graph_builder_passes_checkpointer_only_when_supplied(monkeypatch):
     assert captured["compile_kwargs"] == {"checkpointer": checkpointer}
 
 
-def test_agent_runtime_default_does_not_create_checkpointer(monkeypatch):
+@pytest.mark.asyncio
+async def test_agent_runtime_default_does_not_create_checkpointer(monkeypatch):
     monkeypatch.setattr(runtime_graph.settings, "agent_langgraph_checkpointer_enabled", False)
-    monkeypatch.setattr(runtime_graph, "build_checkpointer", lambda redis_url=None: (_ for _ in ()).throw(AssertionError("should not create checkpointer")))
+    monkeypatch.setattr(runtime_graph, "build_checkpointer", lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not create checkpointer")))
 
-    graph = _runtime()._build_langgraph()
+    graph = await _runtime()._build_langgraph()
 
     assert graph is not None
 
 
-def test_agent_runtime_creates_checkpointer_when_enabled(monkeypatch):
+@pytest.mark.asyncio
+async def test_agent_runtime_creates_checkpointer_when_enabled(monkeypatch):
     captured = {}
     checkpointer = object()
 
     monkeypatch.setattr(runtime_graph.settings, "agent_langgraph_checkpointer_enabled", True)
+    monkeypatch.setattr(runtime_graph.settings, "agent_checkpointer_backend", "redis")
     monkeypatch.setattr(runtime_graph.settings, "redis_url", "redis://example/0")
 
-    def fake_checkpointer(redis_url=None):
-        captured["redis_url"] = redis_url
+    def fake_checkpointer(**kwargs):
+        captured["checkpointer_kwargs"] = kwargs
         return checkpointer
 
     monkeypatch.setattr(runtime_graph, "build_checkpointer", fake_checkpointer)
 
-    def fake_builder(nodes, *, after_permission, dispatch_next_route_node, checkpointer=None):
+    def fake_builder(nodes, *, after_permission, dispatch_next_route_node, dispatch_after_evaluator, checkpointer=None):
         captured["checkpointer"] = checkpointer
         return "compiled"
 
     monkeypatch.setattr(runtime_graph, "build_agent_runtime_graph", fake_builder)
 
-    assert _runtime()._build_langgraph() == "compiled"
-    assert captured["redis_url"] == "redis://example/0"
+    assert await _runtime()._build_langgraph() == "compiled"
+    assert captured["checkpointer_kwargs"]["redis_url"] == "redis://example/0"
     assert captured["checkpointer"] is checkpointer
 
 
 def test_checkpointer_fallback_logs_warning_for_missing_or_unavailable_redis(caplog):
     caplog.set_level(logging.WARNING, logger="src.web_app.agent.runtime.checkpointers")
 
-    missing = build_checkpointer("")
-    unavailable = build_checkpointer("redis://127.0.0.1:0/0")
+    missing = build_checkpointer(backend="redis", redis_url="")
+    unavailable = build_checkpointer(backend="redis", redis_url="redis://127.0.0.1:0/0")
 
     assert missing is not None
     assert unavailable is not None
     messages = [record.getMessage() for record in caplog.records]
-    assert any("Redis checkpointer URL is empty" in message for message in messages)
-    assert any("Redis checkpointer unavailable" in message for message in messages)
+    assert any("redis_url is empty" in message for message in messages)
+    assert any("RedisSaver unavailable" in message for message in messages)
 
 
 def test_agent_runtime_wrappers_remain_available():
     runtime = _runtime()
 
     assert callable(runtime._dispatch_next_route_node)
+    assert callable(runtime._dispatch_after_evaluator)
     assert callable(runtime._after_permission)
     assert callable(runtime._map_route_to_node)

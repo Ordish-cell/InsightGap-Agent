@@ -19,6 +19,7 @@ from src.web_app.agent.runtime.checkpointers import build_checkpointer
 from src.web_app.agent.runtime.dispatch import (
     END_SENTINEL as _END_SENTINEL,
     after_permission,
+    dispatch_after_evaluator,
     dispatch_next_route_node,
     map_route_to_node,
     record_supervisor_dispatch_audit,
@@ -167,6 +168,7 @@ class AgentRuntime:
             self.nodes,
             after_permission=self._after_permission,
             dispatch_next_route_node=self._dispatch_next_route_node,
+            dispatch_after_evaluator=self._dispatch_after_evaluator,
             checkpointer=checkpointer,
         )
 
@@ -187,6 +189,9 @@ class AgentRuntime:
         Falls back to 'final_response' when all route nodes are completed.
         """
         return dispatch_next_route_node(state)
+
+    def _dispatch_after_evaluator(self, state: AgentRuntimeState) -> str:
+        return dispatch_after_evaluator(state)
 
     def _record_supervisor_dispatch_audit(self, state: AgentRuntimeState, legacy_next_node: str) -> str:
         return record_supervisor_dispatch_audit(state, legacy_next_node)

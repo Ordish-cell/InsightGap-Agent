@@ -35,6 +35,9 @@ class ToolCallRepository(BaseRepository[ToolCall]):
         stmt = select(ToolCall).where(ToolCall.user_id == user_id, ToolCall.run_id == run_id).order_by(ToolCall.created_at.desc())
         return list(self.db.execute(stmt).scalars())
 
+    def get_by_idempotency_key(self, idempotency_key: str) -> ToolCall | None:
+        return self.db.execute(select(ToolCall).where(ToolCall.idempotency_key == idempotency_key)).scalar_one_or_none()
+
     def update_status(self, tool_call_id: int, status: str, output: dict | None = None, error_message: str | None = None) -> ToolCall:
         obj = self.get_by_id(tool_call_id)
         if not obj:

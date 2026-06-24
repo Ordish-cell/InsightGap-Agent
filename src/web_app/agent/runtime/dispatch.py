@@ -12,6 +12,10 @@ from src.web_app.agent.runtime.replanner import (
     build_replanner_shadow_report,
     update_replanner_shadow_metrics,
 )
+from src.web_app.agent.runtime.recovery import (
+    dispatch_after_evaluator as recovery_dispatch_after_evaluator,
+    should_return_to_evaluator_after_recovery,
+)
 from src.web_app.agent.runtime.supervisor import (
     audit_supervisor_dispatch,
     build_supervisor_control_decision,
@@ -54,6 +58,9 @@ def next_route_node(state: AgentRuntimeState) -> str:
     tool_agent — this dispatcher no longer routes to END for
     waiting_approval.
     """
+    if state.get("status") == "waiting_approval":
+        return END_SENTINEL
+
     route_plan = state.get("route_plan") or {}
     route_list = list(route_plan.get("route", []))
     completed = list(state.get("completed_nodes", []))
@@ -103,4 +110,10 @@ def record_supervisor_dispatch_audit(state: AgentRuntimeState, legacy_next_node:
 
 def dispatch_next_route_node(state: AgentRuntimeState) -> str:
     """Return the next graph node while preserving supervisor observation side effects."""
+    if should_return_to_evaluator_after_recovery(state):
+        return record_supervisor_dispatch_audit(state, "evaluator")
     return record_supervisor_dispatch_audit(state, next_route_node(state))
+
+
+def dispatch_after_evaluator(state: AgentRuntimeState) -> str:
+    return recovery_dispatch_after_evaluator(state)

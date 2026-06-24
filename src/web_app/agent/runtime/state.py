@@ -82,6 +82,12 @@ class AgentRuntimeState(TypedDict, total=False):
     replanner_candidate_warnings: list[str]
     replanner_control_decision: dict[str, Any]
     replanner_control_warnings: list[str]
+    evaluator_recovery_decision: dict[str, Any]
+    evaluator_recovery_attempts: dict[str, int]
+    evaluator_recovery_history: list[dict[str, Any]]
+    evaluator_recovery_active: bool
+    evaluator_recovery_target: str | None
+    evaluator_recovery_exhausted: bool
     llm_supervisor_trace: list[dict[str, Any]]
     llm_supervisor_decision: dict[str, Any] | None
     llm_supervisor_raw_response: Any | None

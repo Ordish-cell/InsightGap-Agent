@@ -32,7 +32,14 @@ MAIN_CHAIN_EDGES: tuple[dict[str, str], ...] = (
     {"from": "route_dispatch", "to": "skill_agent", "condition": "skill_agent"},
     {"from": "route_dispatch", "to": "evaluator", "condition": "evaluator"},
     {"from": "route_dispatch", "to": "final_response", "condition": "final_response"},
-    {"from": "evaluator", "to": "final_response"},
+    {"from": "evaluator", "to": "recovery_dispatch", "condition": "dispatch_after_evaluator"},
+    {"from": "recovery_dispatch", "to": "research_agent", "condition": "research_agent"},
+    {"from": "recovery_dispatch", "to": "rag_agent", "condition": "rag_agent"},
+    {"from": "recovery_dispatch", "to": "artifact_agent", "condition": "artifact_agent"},
+    {"from": "recovery_dispatch", "to": "tool_agent", "condition": "tool_agent"},
+    {"from": "recovery_dispatch", "to": "memory_agent", "condition": "memory_agent"},
+    {"from": "recovery_dispatch", "to": "skill_agent", "condition": "skill_agent"},
+    {"from": "recovery_dispatch", "to": "final_response", "condition": "final_response"},
     {"from": "final_response", "to": END_SENTINEL},
 )
 
@@ -62,6 +69,12 @@ def build_runtime_graph_manifest() -> dict[str, Any]:
             "dispatch_observer": True,
             "graph_node": False,
         },
+        "evaluator_recovery_capabilities": {
+            "evaluator_recovery_loop": True,
+            "direct_agent_retry": True,
+            "max_attempts_per_agent": 1,
+            "max_total_attempts": 6,
+        },
     }
 
 
@@ -90,8 +103,15 @@ def render_runtime_graph_mermaid() -> str:
         '    memory_agent --> route_dispatch',
         '    skill_agent --> route_dispatch',
         '    route_dispatch --> evaluator["evaluator"]',
-        '    evaluator --> final_response',
         '    route_dispatch -->|waiting approval| END["END"]',
+        '    evaluator --> recovery_dispatch{"recovery dispatch"}',
+        '    recovery_dispatch --> rag_agent',
+        '    recovery_dispatch --> tool_agent',
+        '    recovery_dispatch --> artifact_agent',
+        '    recovery_dispatch --> memory_agent',
+        '    recovery_dispatch --> skill_agent',
+        '    recovery_dispatch --> research_agent',
+        '    recovery_dispatch --> final_response',
         '    final_response --> END',
     ])
 

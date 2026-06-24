@@ -35,6 +35,7 @@ def approval_to_dict(item) -> dict:
         "description": item.description,
         "payload": payload,
         "status": item.status,
+        "idempotency_key": item.idempotency_key,
         "risk_level": payload.get("risk_level", ""),
         "tool_name": payload.get("tool_name", ""),
         "tool_args": payload.get("tool_args", {}),
@@ -70,6 +71,42 @@ def update_approval_status(
         raise ValueError("Approval not found")
     if item.status != "pending":
         raise ValueError(f"Approval is already {item.status}")
+
+    payload = dict(item.payload or {})
+    if not item.run_id:
+        now = datetime.now(UTC).replace(tzinfo=None)
+        payload["decided_at"] = now.isoformat()
+        payload["decided_by"] = user_id
+        payload["executed"] = False
+        tool_result: dict[str, Any] | None = None
+        tool_call_id = payload.get("tool_call_id")
+        tool_name = str(payload.get("tool_name") or "")
+        if status == "approved" and tool_call_id and tool_name:
+            from src.web_app.db.repositories.mcp_repository import ToolCallRepository
+            from src.web_app.mcp.tool_executor import tool_executor
+
+            tool_call = ToolCallRepository(db).get_by_user(user_id, int(tool_call_id))
+            if not tool_call:
+                raise ValueError("APPROVAL_CONTEXT_GONE: ToolCall not found.")
+            tool_result = tool_executor.execute_approved_tool_once(
+                db,
+                user_id,
+                int(tool_call_id),
+                tool_name,
+                tool_call.input or payload.get("tool_args", {}),
+                agent_run_id=None,
+            )
+            payload["executed"] = tool_result.get("success") is True
+        elif status == "rejected" and tool_call_id:
+            from src.web_app.db.repositories.mcp_repository import ToolCallRepository
+
+            ToolCallRepository(db).update_status(int(tool_call_id), "rejected", error_message="User rejected the approval")
+
+        repo.update(item, status=status, payload=payload)
+        result = approval_to_dict(item)
+        if tool_result is not None:
+            result["tool_result"] = tool_result
+        return result
 
     # ── Validate context still exists ──────────────────────────
     from src.web_app.db.repositories.agent_repository import (

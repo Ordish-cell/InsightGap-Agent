@@ -9,6 +9,10 @@ from src.web_app.agent.runtime.replanner import (
     build_replanner_shadow_report,
     update_replanner_shadow_metrics,
 )
+from src.web_app.agent.runtime.recovery import (
+    apply_evaluator_recovery_decision,
+    build_evaluator_recovery_decision,
+)
 from src.web_app.agent.runtime.schemas import StateDelta
 from src.web_app.agent.runtime.state_delta import apply_state_delta, record_agent_node_result, record_node_result
 
@@ -256,12 +260,20 @@ class EvalFinalNodesMixin:
         evaluation["warnings"] = warnings
         evaluation["constraints"] = constraints
         evaluation["score"] = evaluation_result.score
+        recovery_decision = build_evaluator_recovery_decision(state, warnings)
+        apply_evaluator_recovery_decision(state, recovery_decision)
         delta = StateDelta(
             updates={
                 "evaluation_result": evaluation_result.model_dump(),
                 "final_response_constraints": constraints,
                 "final_warnings": warnings,
                 "evaluation": evaluation,
+                "evaluator_recovery_decision": recovery_decision,
+                "evaluator_recovery_attempts": state.get("evaluator_recovery_attempts", {}),
+                "evaluator_recovery_history": state.get("evaluator_recovery_history", []),
+                "evaluator_recovery_active": state.get("evaluator_recovery_active", False),
+                "evaluator_recovery_target": state.get("evaluator_recovery_target"),
+                "evaluator_recovery_exhausted": state.get("evaluator_recovery_exhausted", False),
             },
             warnings=warnings,
             metadata={"source": "evaluator"},
@@ -430,6 +442,10 @@ class EvalFinalNodesMixin:
             "replanner_shadow_metrics": state.get("replanner_shadow_metrics", {}),
             "replanner_control_decision": state.get("replanner_control_decision", {}),
             "replanner_control_warnings": state.get("replanner_control_warnings", []),
+            "evaluator_recovery_decision": state.get("evaluator_recovery_decision", {}),
+            "recovery_attempts": state.get("evaluator_recovery_attempts", {}),
+            "recovery_history": state.get("evaluator_recovery_history", []),
+            "recovery_exhausted": state.get("evaluator_recovery_exhausted", False),
             "memory_context": state.get("memory_context", {}),
             "memory_write_decision": state.get("memory_write_decision", {}),
             "conversation_recall_context": state.get("conversation_recall_context", {}),

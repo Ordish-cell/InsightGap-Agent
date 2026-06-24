@@ -1,8 +1,10 @@
 from src.web_app.core.constants import L3_EXTERNAL_WRITE, L4_HIGH_RISK
 from src.web_app.db.repositories.artifact_repository import ArtifactRepository
+from src.web_app.db.repositories.approval_repository import ApprovalRepository
 from src.web_app.db.repositories.mcp_repository import MCPToolRepository, ToolCallRepository
 from src.web_app.models.orm import User
 from src.web_app.services import agent_service
+from src.web_app.services.approval_service import update_approval_status
 from src.web_app.services.artifact_service import artifact_service
 from src.web_app.services.mcp_service import mcp_service
 from src.web_app.tests.db_test_utils import make_test_session
@@ -96,6 +98,51 @@ def test_mcp_l3_requires_approval_and_l4_is_blocked():
     assert approval["approval_id"]
     assert blocked["status"] == "blocked"
     assert blocked["error"] == "high_risk_denied"
+
+
+def test_tool_args_hash_is_canonical():
+    from src.web_app.mcp.tool_executor import hash_tool_args
+
+    left = {"b": 2, "a": {"z": 1, "y": [3, 2]}}
+    right = {"a": {"y": [3, 2], "z": 1}, "b": 2}
+
+    assert hash_tool_args(left) == hash_tool_args(right)
+
+
+def test_l3_prepare_is_idempotent_with_key():
+    db = make_test_session()
+    user = _user(db, "mcp-idempotent@example.com")
+    payload = {"to": "x@example.com", "subject": "Hi", "body": "Body"}
+
+    first = mcp_service.call_tool(db, user.id, "email.send", payload, idempotency_key="idem-email-1")
+    second = mcp_service.call_tool(db, user.id, "email.send", payload, idempotency_key="idem-email-1")
+
+    assert first["status"] == "waiting_approval"
+    assert second["status"] == "waiting_approval"
+    assert second["id"] == first["id"]
+    assert second["approval_id"] == first["approval_id"]
+    assert len(ToolCallRepository(db).list_by_user(user.id)) == 1
+    assert len(ApprovalRepository(db).list_by_user(user.id)) == 1
+
+
+def test_standalone_l3_approve_executes_tool_once():
+    db = make_test_session()
+    user = _user(db, "mcp-approve-once@example.com")
+    payload = {"to": "x@example.com", "subject": "Hi", "body": "Body"}
+
+    prepared = mcp_service.call_tool(db, user.id, "email.send", payload, idempotency_key="idem-email-approve")
+    approved = update_approval_status(db, user.id, prepared["approval_id"], "approved")
+
+    assert approved["status"] == "approved"
+    assert approved["tool_result"]["success"] is True
+    call = ToolCallRepository(db).get_by_user(user.id, prepared["id"])
+    assert call.status == "completed"
+
+    from src.web_app.mcp.tool_executor import tool_executor
+
+    second = tool_executor.execute_approved_tool_once(db, user.id, prepared["id"], "email.send", payload)
+    assert second["success"] is True
+    assert len(ToolCallRepository(db).list_by_user(user.id)) == 1
 
 
 def test_email_and_browser_tools_are_drafts_only():

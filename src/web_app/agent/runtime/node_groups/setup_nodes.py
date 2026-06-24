@@ -147,16 +147,6 @@ class SetupNodesMixin:
                 "reason": route_plan.get("reason"),
                 "user_input": user_input,
             }
-            # Create approval record
-            approval = ApprovalRepository(self.db).create(
-                user_id=state["user_id"],
-                run_id=state["run_id"],
-                approval_type="agent_runtime",
-                title=f"Approval required: {route_plan.get('risk_level')}",
-                description=user_input,
-                payload=state["approval_payload"],
-            )
-            state["approval_payload"]["approval_id"] = approval.id
 
         mark_completed(state, "planner")
         append_status_step(
@@ -220,5 +210,4 @@ class SetupNodesMixin:
             data["reason_summary"] = f"{data.get('reason_summary', '')}；规则风险兜底提升为 {rule_risk}".strip("；")
             data["reasoning_summary"] = data["reason_summary"]
         return data
-
 

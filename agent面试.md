@@ -87,12 +87,20 @@ flowchart TD
     DSP --> RES["research_agent"]
     DSP --> ART["artifact_agent"]
 
-    RAG --> EVAL["evaluator"]
-    TOOL --> EVAL
-    MEM --> EVAL
-    SK --> EVAL
-    RES --> EVAL
-    ART --> EVAL
+    RAG --> GATE{"post_agent_gate"}
+    TOOL --> GATE
+    MEM --> GATE
+    SK --> GATE
+    RES --> GATE
+    ART --> GATE
+    GATE -->|retry current agent| RAG
+    GATE -->|retry current agent| TOOL
+    GATE -->|retry current agent| MEM
+    GATE -->|retry current agent| SK
+    GATE -->|retry current agent| RES
+    GATE -->|retry current agent| ART
+    GATE -->|pass| DSP
+    DSP --> EVAL["evaluator"]
     EVAL --> FINAL["final_response"]
     FINAL --> AS
     AS --> OUT["SSE 流式事件 + 最终回答"]
@@ -117,7 +125,7 @@ flowchart TD
 | 8 | parallel read 阶段加载上下文 | memory、history、RAG evidence、feed、segments |
 | 9 | GSSC 选择并组织上下文 | `gssc_context`、`gssc_debug` |
 | 10 | dispatcher 路由到能力节点 | rag/tool/memory/skill/research/artifact |
-| 11 | evaluator 检查结果，final_response 生成回答 | `final_payload` |
+| 11 | 每个 agent 执行后进入 post_agent_gate，通过才继续下一个节点；最后 evaluator 做全局检查并由 final_response 生成回答 | `post_agent_gate_decision`、`evaluation_result`、`final_payload` |
 | 12 | 服务层持久化结果并流式返回 | `answer_delta`、`run_completed` |
 
 ### 2.3 AgentRuntimeState 是模块交互的“总线”
@@ -132,8 +140,10 @@ flowchart LR
     D["tool_agent"] -->|写入 tool_call / approval_payload| S
     E["memory_agent"] -->|写入 memory_updates| S
     F["skill_agent"] -->|写入 skill_drafts| S
-    S --> G["evaluator"]
-    G --> H["final_response"]
+    S --> G["post_agent_gate"]
+    G -->|retry current agent| S
+    G -->|pass| H["evaluator"]
+    H --> I["final_response"]
 ```
 
 面试解释：
@@ -303,11 +313,12 @@ Agent 阶段负责真正执行能力节点：
 
 Agent 节点不一定只执行一个。RoutePlan 可以让多个 agent 串起来。例如一个研究任务可能先 research，再 artifact，再 skill。
 
-### 第四层：Eval / Final 阶段
+### 第四层：Gate / Eval / Final 阶段
 
-最后进入：
+Agent 执行后先进入 gate，全部关键节点通过后再进入最终检查：
 
-- `evaluator`：检查 agent 结果和约束。
+- `post_agent_gate`：检查刚执行完的 agent 是否满足继续条件，不通过就重试当前 agent 或终止/降级，避免错误传播到后续节点。
+- `evaluator`：在所有关键节点通过后做全局一致性、完整性和最终约束检查。
 - `final_response`：把结构化结果转成用户能读的自然语言回答。
 
 你可以这样讲：
@@ -334,6 +345,9 @@ parallel_read_stage 后:
 agent 节点后:
   rag_result / tool_result / memory_result / skill_result / agent_results
 
+post_agent_gate 后:
+  post_agent_gate_decision / gate_retry_attempts / gate_history
+
 evaluator 后:
   evaluation_result / final_response_constraints / final_warnings
 
@@ -356,15 +370,16 @@ Runtime 不是保证每个节点永远成功，而是要保证失败可观测、
 | 失败点 | 可能原因 | 当前处理思路 |
 |---|---|---|
 | planner 失败 | LLM 输出格式异常、意图不明确 | fallback route / 默认 chat |
-| RAG 失败 | Qdrant 不可用、文档未入库 | fallback BM25 或返回文档状态 |
-| tool 失败 | 参数缺失、审批拒绝、provider 异常 | ToolCall 记录失败，final_response 明确说明 |
-| memory 失败 | LLM 抽取失败、Qdrant 写入失败 | regex fallback 或 PG 成功、Qdrant best-effort |
+| RAG 失败 | Qdrant 不可用、文档未入库、evidence 为空 | fallback BM25；`post_agent_gate` 立即拦截并重试 `rag_agent`，仍失败则终止依赖链或降级 |
+| tool 失败 | 参数缺失、审批拒绝、provider 异常 | ToolCall 记录失败；可恢复失败由 `post_agent_gate` 重试当前 tool/tool_agent，审批/拒绝/L4 不自动重试 |
+| artifact 失败 | 文件未生成、artifact_result 异常 | `post_agent_gate` 立即重试 `artifact_agent`，仍失败则 final_response 明确说明未生成 |
+| memory 失败 | LLM 抽取失败、Qdrant 写入失败 | regex fallback 或 PG 成功、Qdrant best-effort；写入失败由 `post_agent_gate` 重试 `memory_agent` |
 | final_response 失败 | LLM 异常 | 服务层 fallback 用户可读回答 |
 | checkpoint 失败 | PostgresSaver 不可用 | 生产 fail-fast，不静默降级 |
 
 面试可以这样讲：
 
-> 我没有假设 Agent 每步都会成功。Runtime 的设计是：失败要写入 state 和事件，能降级的降级，不能降级的明确失败；对于高风险审批恢复这种能力，生产环境要求 durable checkpointer，不允许静默降级到内存。
+> 我没有假设 Agent 每步都会成功。Runtime 的设计是：失败要写入 state 和事件，每个 agent 执行后先经过 post_agent_gate，gate 判断当前节点是否满足继续条件；像 RAG 没证据、tool provider 失败、artifact 没生成这类问题会在进入下一个依赖节点前被拦截并重试。审批等待、用户拒绝和 L4 高风险不会自动重跑，超过重试预算后才进入 final_response 做诚实降级。最后 evaluator 负责全局一致性和最终约束检查。对于高风险审批恢复这种能力，生产环境要求 durable checkpointer，不允许静默降级到内存。
 
 ## 4. Runtime 要解决什么问题
 
@@ -402,12 +417,20 @@ flowchart TD
     D --> FR
     D --> END(["END"])
 
-    RA --> D
-    RG --> D
-    AA --> D
-    TA --> D
-    MA --> D
-    SA --> D
+    RA --> G{"post_agent_gate"}
+    RG --> G
+    AA --> G
+    TA --> G
+    MA --> G
+    SA --> G
+    G -->|pass| D
+    G -->|retry current agent| RA
+    G -->|retry current agent| RG
+    G -->|retry current agent| AA
+    G -->|retry current agent| TA
+    G -->|retry current agent| MA
+    G -->|retry current agent| SA
+    G -->|terminal downgrade| FR
     EV --> FR
     FR --> END
 ```
@@ -418,6 +441,7 @@ flowchart TD
 - `src/web_app/agent/runtime/graph_registry.py`
 - `src/web_app/agent/runtime/dispatch.py`
 - `src/web_app/agent/runtime/graph.py`
+- `src/web_app/agent/runtime/post_agent_gate.py`
 
 ## 6. Runtime 的节点分层
 
@@ -436,7 +460,8 @@ flowchart TD
 | Agent | `skill_agent` | 生成 Skill 草稿 |
 | Agent | `research_agent` | 研究任务 |
 | Agent | `artifact_agent` | 生成 artifact |
-| Final | `evaluator` | 结果约束和一致性检查 |
+| Gate | `post_agent_gate` | agent 后置质量门，决定通过、重试当前 agent 或终止降级 |
+| Final | `evaluator` | 全局结果约束和一致性检查 |
 | Final | `final_response` | 聚合最终回答 |
 
 ## 7. RoutePlan 是 Runtime 的核心控制对象
@@ -472,6 +497,8 @@ flowchart TD
     "answer_mode": "tool_action"
 }
 ```
+
+这里的 `final_response` 是正常收尾路径；实际执行时每个 agent 后都会先过 `post_agent_gate`。gate 通过才继续 route 里的下一个节点；如果当前 agent 输出不达标，就重试当前 agent，或者在审批拒绝、L4、高风险/预算耗尽时终止依赖链并进入降级回答。最后 evaluator 只做全局一致性和最终约束检查。
 
 ## 8. LLM Supervisor 为什么存在
 
@@ -516,10 +543,9 @@ sequenceDiagram
     CP->>DB: 写 checkpoints / blobs / writes
     AS-->>User: SSE approval_required + run_paused
     User->>AS: approve
-    AS->>AS: 图外执行 approved tool
-    AS->>G: Command(resume={tool_result})
+    AS->>G: Command(resume={action: approved})
     G->>CP: 读取 checkpoint
-    G->>TA: 从 interrupt 点继续
+    G->>TA: 从 interrupt 点继续并执行 approved tool
     G-->>AS: final state
     AS-->>User: final answer
 ```
@@ -588,7 +614,7 @@ flowchart LR
 
 这张图可以这么讲：
 
-> tool_agent 只负责把当前任务转成候选工具调用，真正的执行权在 ToolExecutor。ToolExecutor 会回查 registry，确认工具存在、参数满足基本约束、风险等级允许，然后根据 L0-L4 决定直接执行、审批等待或阻断。这样 Runtime 和工具实现解耦，安全策略也不会散落在每个工具函数里。
+> tool_agent 只负责把当前任务转成候选工具调用，真正的执行权在 ToolExecutor。ToolExecutor 会回查 registry，确认工具存在、参数满足 input_schema 的 JSON Schema 约束、风险等级允许，然后根据 L0-L4 决定直接执行、审批等待或阻断。这样 Runtime 和工具实现解耦，安全策略也不会散落在每个工具函数里。
 
 这也是为什么 MCP 是你项目里很适合面试展开的模块。它不是“为了用 MCP 而 MCP”，而是在解决 Agent 产品化最现实的问题：**模型可以很聪明，但模型不能被默认信任。**
 
@@ -608,7 +634,7 @@ flowchart LR
 ToolSpec
   - name: 工具名
   - description: 给模型/系统看的能力说明
-  - parameters: 参数定义、required 字段、基础格式
+  - input_schema: JSON Schema 参数契约
   - permission_level: L0/L1/L2/L3/L4
   - provider: 具体执行方
   - metadata: 工具分类、审计信息、展示信息
@@ -618,11 +644,11 @@ ToolSpec
 
 > 我没有让 agent 节点直接 import 某个工具函数执行，而是通过 registry 统一拿 tool spec。这样工具能力、权限边界和执行入口是数据化的，后面做 UI 展示、人工审批、工具审计、权限收敛和灰度开关都会更容易。
 
-注意措辞：当前代码里的参数校验更接近 required 字段和基础格式校验，不要说成“完整 JSON Schema 全量校验引擎”。更稳的说法是：
+注意措辞：现在可以说工具输入已经按 JSON Schema 做统一校验，但不要把它夸成完整 MCP 生态或外部工具信任体系。更稳的说法是：
 
-> 当前实现做了工具参数 required/format 层面的结构校验，并把工具输入校验放在统一执行路径里；如果后续增强，可以继续补完整 JSON Schema validator、参数级策略和更细粒度的数据权限。
+> 当前实现把 Tool spec 的 input_schema 作为工具参数契约，在 ToolRouter 做工具名规范化和 JSON Schema 校验；缺 required 字段时由 tool_agent 追问用户。ToolExecutor 在执行或创建审批前会再次校验，防止直接 API 调用绕过 Runtime。校验覆盖 required、类型、枚举、范围、数组/对象结构、additionalProperties 和常见 format。
 
-这样讲既真实，又体现你知道下一步怎么演进。
+这样讲既真实，又体现边界：它解决的是工具输入参数合法性，不等于外部 MCP server trust policy、参数级数据权限和全部安全治理都已经完成。
 
 ## 10.8 风险等级为什么要分 L0-L4
 
@@ -661,7 +687,7 @@ Agent 工具风险不是二元的，不是“能调”和“不能调”。不�
 
 你的项目应该这样讲：
 
-> L3 工具调用到达 ToolExecutor 后，不会直接执行。系统会创建 ToolCall 和 Approval 记录，把当前 Runtime 通过 LangGraph interrupt 暂停，并依赖 PostgresSaver 保存 checkpoint。前端收到 approval_required 事件后展示工具名、参数和风险说明。用户 approve 后，服务层执行被批准的工具，然后用 Command(resume) 把结果塞回原来的 graph，让 run 从暂停点继续。
+> L3 工具调用到达 ToolExecutor 后，不会直接执行。系统会用幂等 key 创建或复用 ToolCall 和 Approval 记录，把当前 Runtime 通过 LangGraph interrupt 暂停，并依赖 PostgresSaver 保存 checkpoint。前端收到 approval_required 事件后展示工具名、参数和风险说明。用户 approve 后，服务层只用 Command(resume={action: approved}) 恢复 graph；tool_agent 会从 interrupt 点继续，并在 interrupt 返回之后调用 execute_approved_tool_once 执行真实 provider。
 
 这个链路很重要，因为它把三个系统串起来了：
 
@@ -717,12 +743,12 @@ Agent 工具风险不是二元的，不是“能调”和“不能调”。不�
 3. **风险 L4**：直接阻断，写审计，不进入执行。
 4. **风险 L3**：进入 waiting_approval，不直接执行。
 5. **用户拒绝审批**：ToolCall/Approval 标记 rejected，Runtime resume 后告诉用户未执行，并可给替代方案。
-6. **provider 执行失败**：记录 error，final_response 做降级说明。
+6. **provider 执行失败**：记录 error，`post_agent_gate` 可在预算内重试当前 tool/tool_agent；如果是审批拒绝、等待审批、L4 或重试耗尽，再由 final_response 做降级说明。
 7. **checkpoint 恢复失败**：服务层返回恢复失败，保留审批记录和错误信息方便排查。
 
 你可以总结成一句：
 
-> MCP 的失败不是异常散落，而是尽量结构化进入状态和审计记录，让 Runtime 可以降级回答，而不是让用户看到一串后端 traceback。
+> MCP 的失败不是异常散落，而是尽量结构化进入状态和审计记录。可恢复的 provider 失败会先被 post_agent_gate 拦截并重试当前工具节点；审批拒绝、高风险阻断或重试耗尽时，Runtime 再降级回答，而不是让用户看到一串后端 traceback。
 
 ## 10.13 MCP 模块的面试亮点和诚实边界
 
@@ -739,9 +765,9 @@ Agent 工具风险不是二元的，不是“能调”和“不能调”。不�
 **不要夸大：**
 
 - 不要说“完整 MCP 生态平台”，更稳是“围绕 MCP 工具调用做了一层治理能力”。
-- 不要说“完整 JSON Schema validator”，更稳是“required/format 等基础参数校验，预留完整 schema 扩展”。
+- JSON Schema 可以说已经用于工具输入校验，但不要说“完整 MCP 生态平台”或“所有外部工具都天然可信”；更稳是“input_schema 作为参数契约，执行前双层校验，外部 server trust policy 和更细粒度数据权限仍可继续增强”。
 - 不要说“所有危险操作都绝对安全”，更稳是“按风险等级降低误操作概率，并保留审计和人工审批”。
-- 不要说“工具调用可以完全自动修复”，更稳是“失败会结构化返回，由 Runtime/final_response 降级处理或追问用户”。
+- 不要说“工具调用可以完全自动修复”，更稳是“失败会结构化返回；可恢复失败由 post_agent_gate 按预算重试当前工具节点，审批拒绝、高风险或重试耗尽后再由 final_response 降级说明或追问用户”。
 
 ## 11. MCP 模块要解决什么问题
 
@@ -813,7 +839,7 @@ erDiagram
 
 解释：
 
-> ToolCall 是工具调用事实记录，Approval 是人工审批记录。L3 工具会先创建 ToolCall 和 Approval，但不执行真实 provider。用户批准后，AgentService 根据 ToolCall 执行工具，并把结果通过 Command(resume) 交回 LangGraph。
+> ToolCall 是工具调用事实记录，Approval 是人工审批记录。L3 工具会先用幂等 key 创建或复用 ToolCall 和 Approval，但不执行真实 provider。用户批准后，AgentService 只负责把 approved decision 通过 Command(resume) 交回 LangGraph；真实工具由 tool_agent 在 interrupt 返回之后执行，并通过 execute_approved_tool_once 防止重复执行。
 
 ## 15. MCP 与 Runtime 的交互
 
@@ -838,11 +864,11 @@ sequenceDiagram
 
 ## 16. MCP 模块面试话术
 
-> 我把 MCP 工具调用做成了一个治理链路。工具不是让 LLM 直接执行，而是先注册成 spec，包括 input_schema、output_schema、permission_level 和 approval_required。tool_agent 选择工具后先经过 ToolRouter 做工具名规范化和参数校验，再进入 ToolExecutor 做风险判断。L3 外部写入会创建 ToolCall 和 Approval，并通过 LangGraph interrupt 暂停；L4 高危操作直接 blocked。这样工具调用有前置约束、人工审批和审计记录。
+> 我把 MCP 工具调用做成了一个治理链路。工具不是让 LLM 直接执行，而是先注册成 spec，包括 input_schema、output_schema、permission_level 和 approval_required。tool_agent 选择工具后先经过 ToolRouter 做工具名规范化和 JSON Schema 参数校验，再进入 ToolExecutor 做执行前兜底校验和风险判断。L3 外部写入会创建 ToolCall 和 Approval，并通过 LangGraph interrupt 暂停；L4 高危操作直接 blocked。这样工具调用有前置约束、人工审批和审计记录。
 
 边界要讲清：
 
-> 当前参数校验主要覆盖 required 字段和部分格式，不能夸成完整 JSON Schema validator。后续可以接入 jsonschema 或 Pydantic 做更严格校验。
+> 参数校验现在以 Tool spec 的 input_schema 为准，覆盖 required、类型、枚举、范围、数组/对象结构、additionalProperties 和常见 format。边界是：这是工具输入 JSON Schema 校验，不等于完整 MCP 生态、外部工具 trust policy 或更细粒度数据权限全部完成。
 
 ---
 
@@ -1097,14 +1123,14 @@ RAG 优化最怕“感觉变好了”。你的项目里有 synthetic eval runner
 
 1. **Qdrant 不可用**：走 fallback backend 或返回检索失败信息。
 2. **dense/sparse 某一路失败**：优先使用另一条路径或 fallback。
-3. **top-k 分数太低**：final_response 明确说明“未找到足够证据”，不要编。
+3. **top-k 分数太低 / evidence 为空**：`post_agent_gate` 会在进入后续 artifact/research synthesis 前先重试 `rag_agent`；如果仍没有证据，final_response 明确说明“未找到足够证据”，不要编。
 4. **命中 child 但 parent 缺失**：返回 child text，同时标记上下文不完整。
 5. **用户问题超出文档范围**：回答边界，提示需要更多资料。
-6. **多文档证据冲突**：把冲突交给 final_response/evaluator，让回答说明不同来源。
+6. **多文档证据冲突**：把冲突交给 evaluator/final_response，让回答说明不同来源。
 
 工程话术：
 
-> RAG 的底线是宁可说证据不足，也不要把低置信证据包装成确定答案。检索失败应该进入可解释降级，而不是让模型自由发挥。
+> RAG 的底线是宁可说证据不足，也不要把低置信证据包装成确定答案。检索失败或 evidence 为空时，Runtime 会先通过 post_agent_gate 重新进入 rag_agent，避免错误证据继续传给 artifact 或后续节点；如果仍失败，再进入可解释降级，而不是让模型自由发挥。
 
 ## 16.15 RAG 模块的面试亮点和诚实边界
 
@@ -1876,8 +1902,8 @@ sequenceDiagram
     RT->>CP: interrupt + checkpoint
     RT-->>U: approval_required
     U->>AS: approve
-    AS->>T: execute_approved_tool
-    AS->>RT: Command(resume)
+    AS->>RT: Command(resume={action: approved})
+    RT->>T: interrupt 返回 approved，tool_agent 执行 execute_approved_tool_once
     RT-->>U: 告知执行结果
 ```
 
@@ -1972,7 +1998,7 @@ Runtime 管执行流程，MCP 管工具安全，RAG 管文档证据，Memory/GSS
 
 ### Q6：这个项目现在最不能夸大的地方是什么？
 
-Skill 还不是自动执行 DAG；GSSC 是启发式选择器，不是学习型 optimizer；参数校验不是完整 JSON Schema；Conversation Segment 普通 completed path 的自动创建触发点还需要补齐。
+Skill 还不是自动执行 DAG；GSSC 是启发式选择器，不是学习型 optimizer；工具输入校验已经走 JSON Schema，但外部 MCP server trust policy 和更细粒度数据权限还需要继续增强；Conversation Segment 普通 completed path 的自动创建触发点还需要补齐。
 
 ### Q7：项目的数据主线是什么？
 
@@ -2034,11 +2060,11 @@ parallel_prefetch 偏低风险预取，比如 memory、RAG、skill、graph conte
 
 ### Q21：为什么需要 evaluator？
 
-evaluator 在 final_response 前检查 agent results、rag/tool/memory 输出和约束，生成 final_response_constraints 和 warnings，避免 final_response 完全裸奔。
+evaluator 现在主要做最后的全局验收：检查 agent results、rag/tool/memory/artifact 输出、跨节点一致性和 final_response 约束，生成 final_response_constraints 和 warnings。局部纠错不放到最后才做，而是由 post_agent_gate 在每个 agent 后立刻判断，避免第一步错了还继续执行第二步、第三步。
 
 ### Q22：如果某个 agent 节点失败怎么办？
 
-节点会把错误写入 state 或 AgentResult，Runtime 后续由 evaluator/final_response 处理降级回答；服务层也会捕获异常，把 run 标记 failed 并写回错误信息。
+节点会把错误写入 state 或 AgentResult，随后进入 post_agent_gate。gate 读取当前 agent 的结构化结果、错误和依赖关系：可恢复就重试当前 agent，通过才继续 route 里的下一个节点；不可恢复、审批等待、用户拒绝、L4 高风险或重试耗尽时，不再继续后续依赖节点，而是进入终止/降级路径。最后 evaluator 只做全局检查；服务层也会捕获异常，把 run 标记 failed 并写回错误信息。
 
 ### Q23：Runtime 怎么支持流式返回？
 
@@ -2068,7 +2094,7 @@ PostgresSaver 是持久化后端，适合跨进程恢复。内存 saver 服务�
 
 ### Q29：审批流程具体怎么走？
 
-tool_agent 判断 L3 后创建 ToolCall/Approval，然后 interrupt。用户 approve 后，AgentService 先执行 approved tool，再 Command(resume) 把 tool_result 传回 graph。
+tool_agent 判断 L3 后用 deterministic idempotency_key 创建或复用 ToolCall/Approval，然后 interrupt。用户 approve 后，AgentService 不再图外执行工具，只发送 Command(resume={action: approved})；graph 从 interrupt 点继续，tool_agent 在 interrupt 返回之后调用 execute_approved_tool_once 执行真实 provider。
 
 ### Q30：拒绝审批怎么办？
 
@@ -2076,11 +2102,11 @@ tool_agent 判断 L3 后创建 ToolCall/Approval，然后 interrupt。用户 app
 
 ### Q31：审批前工具会不会已经执行？
 
-不会。L3 分支只创建审批记录和 pending 状态，然后 interrupt；真实 provider 在用户批准后由服务层执行。
+不会。L3 分支只幂等创建审批记录和 pending ToolCall，然后 interrupt；真实 provider 只会在用户批准、Command(resume) 回到 interrupt 调用点之后，由 tool_agent 执行。
 
-### Q32：为什么服务层执行 approved tool，而不是 graph 内执行？
+### Q32：为什么 approved tool 放回 graph 内执行？
 
-审批发生在 graph 暂停之后，服务层处理用户动作更自然；执行结果再 resume 给 graph，避免 graph 在等待期间占用执行上下文。
+因为 LangGraph 官方建议是：调用 interrupt() 的节点 resume 时会从 interrupt 点继续，interrupt 前的副作用必须幂等，真实不可重复副作用应该放在 interrupt 返回之后。服务层只处理用户审批动作和 Command(resume)，真实 provider 执行回到 tool_agent 内完成，这样审批、checkpoint、ToolCall 审计和执行状态都落在同一条 graph 恢复链路里。
 
 ### Q33：如何防止悬挂审批永久占资源？
 
@@ -2134,7 +2160,7 @@ checkpoint 是 LangGraph 恢复执行用；AgentRun graph_state 是业务侧保�
 
 ### Q45：参数校验有多完整？
 
-当前主要是 required 字段和部分格式校验，比如 email 格式。不能说是完整 JSON Schema validator。
+参数校验现在以工具注册表里的 input_schema 为准，走 JSON Schema 校验，覆盖 required、类型、枚举、范围、数组/对象结构、additionalProperties 和常见 format。tool_agent 会在缺 required 字段时追问用户；ToolExecutor 在执行或创建审批前还会兜底校验，避免直接 API 调用绕过 Runtime。
 
 ### Q46：L3 和 L4 区别是什么？
 
@@ -2150,7 +2176,7 @@ L3 是外部写入或需要用户确认的操作，进入人工审批；L4 是�
 
 ### Q49：工具执行结果怎么进入最终回答？
 
-tool_agent 把 tool_result 写入 state，evaluator 检查后 final_response 聚合成用户可读回答。
+tool_agent 把 tool_result 写入 state，post_agent_gate 先检查工具状态：成功才继续后续节点；provider 失败这类可恢复问题会按预算重试当前 tool/tool_agent；审批等待、用户拒绝或 L4 阻断不会自动重跑，最终由 final_response 给用户可读说明。
 
 ### Q50：ToolCall 记录有什么价值？
 
@@ -2174,7 +2200,7 @@ LLM 可以参与意图识别，但最终风险策略必须由代码控制。安�
 
 ### Q55：MCP 模块的下一步是什么？
 
-补完整 JSON Schema validator、外部 MCP server trust policy、工具 dry-run preview 和更细粒度权限策略。
+继续补外部 MCP server trust policy、工具 dry-run preview、参数级数据权限和更细粒度权限策略。
 
 ## E. RAG 检索
 
@@ -2340,7 +2366,7 @@ Skill 可以看成 workflow memory。Memory 记事实和偏好，Skill 记可复
 
 ### Q95：如何排查 final answer 和 evidence 不一致？
 
-看 rag_result/evidence、gssc_context、evaluator constraints 和 final_response prompt。必要时让 final_response 引用 evidence id。
+看 rag_result/evidence、gssc_context、post_agent_gate_decision、evaluator constraints 和 final_response prompt。必要时让 final_response 引用 evidence id。
 
 ### Q96：如何保证多用户隔离？
 
@@ -2356,7 +2382,7 @@ Skill 可以看成 workflow memory。Memory 记事实和偏好，Skill 记可复
 
 ### Q99：下一步最应该补什么？
 
-我会补普通 completed path 的 segment creation trigger、完整 JSON Schema 校验、Skill 可执行子图、线上 query log RAG eval 和 memory eval。
+我会补普通 completed path 的 segment creation trigger、外部 MCP server trust policy、Skill 可执行子图、线上 query log RAG eval 和 memory eval。
 
 ### Q100：如果只能保留三个设计，你保留什么？
 

@@ -692,7 +692,10 @@ async def run_agent_async(db: Session, user_id: int, payload: dict[str, Any], st
         state["langgraphstatus"] = langgraphstatus
         steps = list(langgraphstatus.get("steps") or [])
 
-        is_waiting = state.get("approval_required") or state.get("status") == "waiting_approval"
+        is_waiting = (
+            state.get("status") == "waiting_approval"
+            or bool(state.get("pending_approval_id") or state.get("pending_tool_call_id"))
+        )
         is_failed = state.get("status") == "failed"
         run_status = state.get("status", "completed")
         _emit_runtime_latency_trace_event(db, stream_queue, run.id, thread_id, user_id, state)
@@ -1087,140 +1090,10 @@ async def resume_run_after_approval(
             "source": "visible_thought",
         }, run_id=run_id, thread_id=thread_id)
 
-        # ── Execute the approved tool ────────────────────────────
-        tool_succeeded = False
-        if pending_tool_call_id and pending_tool_name:
-            # Guard: don't execute the same tool twice
-            resolved_ids = list(graph_state.get("resolved_tool_call_ids") or [])
-            if pending_tool_call_id in resolved_ids:
-                _log.warning("resume: tool already resolved tcid=%s run=%s", pending_tool_call_id, run_id)
-                tool_succeeded = True  # already resolved
-            else:
-                from src.web_app.db.repositories.mcp_repository import ToolCallRepository
-                tool_call_record = ToolCallRepository(db).get_by_id(pending_tool_call_id)
-                real_tool_args = tool_call_record.input if tool_call_record else pending_tool_args
-
-                _queue_stream_event(stream_queue, "tool_call_started", {
-                    "tool_call_id": client_tool_call_id,
-                    "toolCallId": client_tool_call_id,
-                    "tool_name": pending_tool_name,
-                    "toolName": pending_tool_name,
-                    "tool_args": _sanitize_tool_args_for_frontend(pending_tool_name, real_tool_args),
-                    "args_preview": _sanitize_tool_args_for_frontend(pending_tool_name, real_tool_args),
-                    "argsPreview": _sanitize_tool_args_for_frontend(pending_tool_name, real_tool_args),
-                    "status": "running",
-                }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
-
-                try:
-                    from src.web_app.mcp.tool_executor import tool_executor
-                    tool_result_raw = tool_executor.execute_approved_tool(
-                        db, user_id, pending_tool_call_id,
-                        pending_tool_name, real_tool_args,
-                        agent_run_id=run_id,
-                    )
-
-                    # Normalize to flat dict with success at top level
-                    if not isinstance(tool_result_raw, dict):
-                        tool_result = {
-                            "success": False, "tool_name": pending_tool_name,
-                            "error_code": "EMPTY_TOOL_RESULT",
-                            "message": "工具没有返回结果，无法确认执行成功。",
-                        }
-                    else:
-                        tool_result = dict(tool_result_raw)
-                        if "success" not in tool_result and "output" in tool_result:
-                            inner = tool_result.get("output") or {}
-                            if isinstance(inner, dict):
-                                tool_result = {**inner, "tool_name": pending_tool_name}
-
-                    graph_state["tool_result"] = tool_result
-                    tool_success = tool_result.get("success") is True
-
-                    logger.debug(
-                        "[APPROVAL_RESUME_DEBUG] after_tool_execution run_id=%s "
-                        "tool_name=%s tool_success=%s provider=%s error_code=%s "
-                        "to=%s subject=%s body_preview=%s",
-                        run_id,
-                        pending_tool_name,
-                        tool_success,
-                        tool_result.get("provider"),
-                        tool_result.get("error_code"),
-                        tool_result.get("to"),
-                        tool_result.get("subject"),
-                        (tool_result.get("body_preview") or tool_result.get("body") or "")[:80],
-                    )
-
-                    if tool_success:
-                        graph_state["tool_call"] = {**graph_state.get("tool_call", {}), "status": "completed", "error": ""}
-                        _queue_stream_event(stream_queue, "tool_call_completed", {
-                            "tool_call_id": client_tool_call_id,
-                            "toolCallId": client_tool_call_id,
-                            "tool_name": pending_tool_name,
-                            "toolName": pending_tool_name,
-                            "status": "completed",
-                            "output_preview": _tool_output_preview_for_frontend(tool_result),
-                            "outputPreview": _tool_output_preview_for_frontend(tool_result),
-                            "tool_call_record_id": pending_tool_call_id,
-                        }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
-                        _log.info("resume: tool success tool=%s run=%s", pending_tool_name, run_id)
-
-                        resolved_ids.append(pending_tool_call_id)
-                        graph_state["resolved_tool_call_ids"] = resolved_ids
-                        graph_state["_tool_error"] = None
-                        graph_state["_resume_context"] = f"approved:{pending_approval_id}"
-                        tool_succeeded = True
-
-                        _queue_stream_event(stream_queue, "visible_thought_delta", {
-                            "text": "工具执行完成，正在整理结果…",
-                            "status": "streaming", "id": "thought-tool-done", "source": "visible_thought",
-                        }, run_id=run_id, thread_id=thread_id)
-                    else:
-                        graph_state["tool_call"] = {**graph_state.get("tool_call", {}), "status": "failed"}
-                        err_msg = tool_result.get("message") or tool_result.get("error") or "工具执行失败"
-                        graph_state["_tool_error"] = err_msg
-                        graph_state["_resume_context"] = f"failed:{pending_approval_id}"
-                        _queue_stream_event(stream_queue, "tool_call_failed", {
-                            "tool_call_id": client_tool_call_id,
-                            "toolCallId": client_tool_call_id,
-                            "tool_name": pending_tool_name,
-                            "toolName": pending_tool_name,
-                            "status": "failed",
-                            "error": str(err_msg)[:700],
-                            "output_preview": _tool_output_preview_for_frontend(tool_result),
-                            "outputPreview": _tool_output_preview_for_frontend(tool_result),
-                            "tool_call_record_id": pending_tool_call_id,
-                        }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
-                        _log.warning("resume: tool failed tool=%s err=%s run=%s", pending_tool_name, err_msg, run_id)
-
-                        _queue_stream_event(stream_queue, "visible_thought_delta", {
-                            "text": "工具执行失败，我会说明原因。",
-                            "status": "streaming", "id": "thought-tool-failed", "source": "visible_thought",
-                        }, run_id=run_id, thread_id=thread_id)
-
-                except Exception as exc:
-                    _log.exception("resume: tool threw tool=%s run=%s", pending_tool_name, run_id)
-                    graph_state["tool_call"] = {**graph_state.get("tool_call", {}), "status": "failed"}
-                    err_msg = str(exc)
-                    graph_state["tool_result"] = {"success": False, "tool_name": pending_tool_name, "error_code": type(exc).__name__, "message": err_msg}
-                    graph_state["_tool_error"] = err_msg
-                    graph_state["_resume_context"] = f"failed:{pending_approval_id}"
-                    _queue_stream_event(stream_queue, "tool_call_failed", {
-                        "tool_call_id": client_tool_call_id,
-                        "toolCallId": client_tool_call_id,
-                        "tool_name": pending_tool_name,
-                        "toolName": pending_tool_name,
-                        "status": "failed",
-                        "error": str(err_msg)[:700],
-                        "output_preview": _tool_output_preview_for_frontend(graph_state.get("tool_result") or {}),
-                        "outputPreview": _tool_output_preview_for_frontend(graph_state.get("tool_result") or {}),
-                        "tool_call_record_id": pending_tool_call_id,
-                    }, run_id=run_id, thread_id=thread_id, node_name="tool_agent")
-                    _queue_stream_event(stream_queue, "visible_thought_delta", {
-                        "text": "工具执行失败，我会说明原因。",
-                        "status": "streaming", "id": "thought-tool-failed", "source": "visible_thought",
-                    }, run_id=run_id, thread_id=thread_id)
-        else:
-            _log.warning("resume: no pending tool found approval_id=%s run=%s", pending_approval_id, run_id)
+        # Tool execution happens inside resumed tool_agent after interrupt() returns.
+        graph_state["status"] = "resuming"
+        graph_state["_resume_context"] = f"approved:{pending_approval_id}"
+        tool_succeeded = True
     else:
         # ── Rejected ─────────────────────────────────────────────
         _queue_stream_event(stream_queue, "approval_rejected", {

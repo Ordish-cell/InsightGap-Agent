@@ -335,6 +335,7 @@ class MCPTool(Base, TimestampMixin):
 
 class ToolCall(Base):
     __tablename__ = "tool_calls"
+    __table_args__ = (Index("ix_tool_calls_idempotency_key", "idempotency_key", unique=True),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id"), nullable=True)
@@ -346,11 +347,13 @@ class ToolCall(Base):
     permission_level: Mapped[str] = mapped_column(String(32), default="L0_READ_ONLY", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="created", nullable=False)
     error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
 
 class Approval(Base, TimestampMixin):
     __tablename__ = "approvals"
+    __table_args__ = (Index("ix_approvals_idempotency_key", "idempotency_key", unique=True),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
@@ -360,6 +363,7 @@ class Approval(Base, TimestampMixin):
     description: Mapped[str] = mapped_column(Text, default="", nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 class Artifact(Base):

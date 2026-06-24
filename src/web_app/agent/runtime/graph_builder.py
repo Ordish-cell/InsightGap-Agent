@@ -20,6 +20,7 @@ def build_agent_runtime_graph(
     *,
     after_permission: Callable[[AgentRuntimeState], str],
     dispatch_next_route_node: Callable[[AgentRuntimeState], str],
+    dispatch_after_evaluator: Callable[[AgentRuntimeState], str],
     checkpointer: Any | None = None,
 ) -> Any | None:
     try:
@@ -64,7 +65,11 @@ def build_agent_runtime_graph(
             route_dests,
         )
 
-    workflow.add_edge("evaluator", "final_response")
+    workflow.add_conditional_edges(
+        "evaluator",
+        dispatch_after_evaluator,
+        route_dests,
+    )
     workflow.add_edge("final_response", END)
 
     if checkpointer is None:
