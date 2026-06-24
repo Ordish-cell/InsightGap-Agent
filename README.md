@@ -1,14 +1,38 @@
-# Agent OS / Open Deep Research
+# 信息差 Agent OS / Open Deep Research
 
-一个面向真实 Agent 产品化场景的全栈研究型智能体项目。项目基于 `langchain-ai/open_deep_research` 二次开发，在原始深度研究能力之上补齐了 Web App、LangGraph Runtime、MCP 工具治理、RAG 检索、Memory/GSSC 上下文管理、人工审批恢复、审计记录和前端可视化。
+> Gap Intelligence Workbench · 发现信息差 · 验证信息差 · 生成行动成果 · 沉淀长期认知
 
-它不是一个“只会聊天”的 Demo，而是一套可以解释、可恢复、可审计、可扩展的 Agent OS 原型：用户可以从信息流发现机会，发起研究，上传文档做 RAG 问答，生成 Artifact，把经验沉淀为 Memory / Skill，并在高风险工具调用前进入审批。
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-Web%20API-009688?style=flat-square&logo=fastapi&logoColor=white)
+![React](https://img.shields.io/badge/React-TypeScript-61DAFB?style=flat-square&logo=react&logoColor=111)
+![LangGraph](https://img.shields.io/badge/LangGraph-Agent%20Runtime-1C3C3C?style=flat-square)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Checkpoint%20%2B%20Data-4169E1?style=flat-square&logo=postgresql&logoColor=white)
+![Qdrant](https://img.shields.io/badge/Qdrant-Vector%20Search-DC244C?style=flat-square)
+
+一个围绕“打破信息差”构建的全栈 Agent 工作台。系统会从信息流中捕捉值得关注的信号，解释它和当前用户为什么相关，指出其中的信息差，再把这个信息差推进到深度研究、文档验证、成果生成、长期记忆和可复用技能。
+
+项目基于 LangChain 官方 `langchain-ai/open_deep_research` 二次开发，在官方深度研究能力之上补齐了 Web App、LangGraph Runtime、MCP 工具治理、RAG 检索、Memory/GSSC 上下文管理、人工审批恢复、审计记录和前端可视化。它的主线不是普通聊天，而是把“发现信息差 -> 验证信息差 -> 形成判断 -> 生成成果 -> 沉淀记忆和技能 -> 下次复用”做成完整闭环。
 
 ![首页主界面](images/index.jpg)
+
+## 能力总览
+
+| 能力 | 如何帮助打破信息差 | 关键模块 |
+|---|---|---|
+| 信息发现 | 从 GitHub、arXiv、搜索源和手动种子中筛出高价值信号，标注显性相关、邻近机会和远域启发 | FeedService、FeedCard、Source adapters |
+| 信息差解释 | 对每条卡片说明“差在哪里”“为什么与你有关”“下一步可以做什么” | Feed scorer、card generator、Profile |
+| 深度研究 | 对信息差进行系统性调研，生成有证据、有风险判断、有行动建议的研究报告 | LangChain 官方 Open Deep Research、`research_agent` |
+| 文档验证 | 用户上传自己的资料后，用 RAG 检索证据，验证信息差是否真实存在 | DocumentService、RagService、Qdrant |
+| 工具行动 | 对需要执行的动作进入工具治理链路，低风险直接执行，高风险审批 | MCP Registry、ToolRouter、ToolExecutor |
+| 成果沉淀 | 把研究结论、产品计划、Markdown 报告等保存为可回看的 Artifact | ArtifactService、Artifacts Page |
+| 长期记忆 | 把用户偏好、判断依据、历史片段保存下来，让下次发现更贴近用户 | MemoryService、GSSC、conversation summary |
+| 技能复用 | 将反复出现的研究/验证流程沉淀成 Skill 草稿，减少重复劳动 | SkillService、Skills Page |
 
 ## 目录
 
 - [项目定位](#项目定位)
+- [能力总览](#能力总览)
+- [深度研究来源](#深度研究来源)
 - [核心能力](#核心能力)
 - [架构概览](#架构概览)
 - [核心业务闭环](#核心业务闭环)
@@ -23,7 +47,16 @@
 
 ## 项目定位
 
-传统 Agent 应用原型往往只有一个 prompt、一组工具和一次性回答。这个项目关注的是 Agent 真正产品化时会遇到的问题：
+这个项目的核心不是“让 Agent 回答问题”，而是“让 Agent 帮用户持续发现并打破信息差”。信息差在这里指：用户当前没有注意到、没有验证过或没有转化为行动的高价值信号。
+
+系统围绕四个问题设计：
+
+- **发现**：哪些信息值得关注？它来自哪里？和用户当前领域有什么关系？
+- **解释**：这条信息差具体差在哪里？为什么可能影响用户的研究、产品或决策？
+- **验证**：能否通过深度研究、RAG 文档证据、外部搜索进一步确认？
+- **沉淀**：验证后的结论如何保存成 Artifact、Memory 或 Skill，方便下次复用？
+
+在这个主线下，项目同时处理 Agent 产品化时会遇到的问题：
 
 - 工具不能让模型想调就调，必须有参数校验、风险分级、审批和审计。
 - 高风险动作不能同步阻塞在内存里等待用户确认，必须可以跨请求、跨进程恢复。
@@ -31,7 +64,19 @@
 - 长对话不能只把最近消息塞进 prompt，需要 summary、segment、memory 和上下文选择。
 - 前端不能只显示最终答案，要能看到运行轨迹、工具调用、审批状态、Artifacts、Memory 和历史任务。
 
-因此，这个项目更接近一个 Agent 应用底座，而不是单次问答脚本。
+因此，它既是一个信息差发现与研究工作台，也是一个带运行时、工具治理、记忆和审计能力的 Agent 应用底座。
+
+## 深度研究来源
+
+本项目的深度研究能力集成自 LangChain 官方开源项目 [`langchain-ai/open_deep_research`](https://github.com/langchain-ai/open_deep_research)。
+
+在本仓库中：
+
+- `src/open_deep_research/` 保留官方 Open Deep Research 的核心研究图和配置。
+- `src/web_app/agent/adapters/open_deep_research_adapter.py` 将官方研究能力接入 Web App 的 Agent Runtime。
+- `research_agent` 负责在用户发起深度研究时调用该能力，并把结果接入本项目的 Artifact、Memory、Skill 和运行审计链路。
+
+也就是说，深度研究本身不是从零手写的临时 prompt，而是基于 LangChain 官方 Open Deep Research 工作流；本项目重点在其外围补齐产品化运行时、前端工作台、工具治理、审批恢复、上下文管理和成果沉淀。
 
 ## 核心能力
 
@@ -44,7 +89,7 @@
 - `tool_agent`：处理工具调用、审批和工具结果。
 - `rag_agent`：处理文档检索和证据回答。
 - `memory_agent`：处理长期记忆写入和召回。
-- `research_agent`：接入 Open Deep Research 做深度研究。
+- `research_agent`：接入 LangChain 官方 Open Deep Research 做深度研究。
 - `artifact_agent`：生成可持久化成果。
 - `skill_agent`：识别可复用工作流。
 - `post_agent_gate`：每个 agent 后做质量门判断，决定继续、重试当前 agent 或降级。
@@ -193,27 +238,37 @@ GSSC 的作用是把这些上下文组织成可控的 prompt sections，避免�
 
 上下文调试页可以继续补充展示 recent messages、summary、memory、RAG evidence 如何组合。
 
-### 6. Feed -> Research -> Artifact -> Memory / Skill 的产品闭环
+### 6. 信息差雷达 -> 深度研究 -> 成果沉淀的产品闭环
 
-项目不仅能回答用户问题，还把信息处理流程做成闭环：
+项目不仅能回答用户问题，还会主动把外部信息整理成“信息差卡片”。每张 FeedCard 不只是新闻摘要，而是包含：
+
+- 这条信息本身是什么。
+- 它和用户当前领域为什么有关。
+- 它揭示了什么信息差。
+- 它可能带来什么机会、风险或下一步行动。
+- 用户可以选择带入对话、发起深度研究、查看详情、保存或忽略。
+
+整体流程是：
 
 ```text
-Feed 信息接入
-  -> 用户选择高价值卡片
-  -> Agent 发起 research / RAG / tool
-  -> 生成 Artifact
-  -> 写入 Memory
-  -> 判断是否沉淀为 Skill
-  -> 下次任务复用上下文和工作流
+外部信息源 / 手动种子
+  -> Feed 生成信息差卡片
+  -> 用户筛选值得研究的信号
+  -> Agent 发起深度研究 / RAG 验证 / 工具调用
+  -> 生成研究报告、产品计划或 Markdown Artifact
+  -> 写入 Memory，记录用户偏好和判断依据
+  -> 形成 Skill 草稿，沉淀可复用研究流程
+  -> 下次信息差发现更贴近用户
 ```
 
 亮点：
 
-- Feed 可接入 arXiv、GitHub、DuckDuckGo、Tavily、SerpAPI、手动种子。
-- Research 结果可生成 artifact。
-- Memory 保存用户偏好和任务结论。
-- Skill 记录可复用 workflow。
-- 前端能查看 Research Runs、Artifacts、Skills 和 Memory。
+- Feed 可接入 arXiv、GitHub、DuckDuckGo、Tavily、SerpAPI 和手动种子。
+- 每张卡片会给出评分、相关类型、证据来源、信息差解释和建议行动。
+- 用户可以从卡片直接进入深度研究，把一个模糊信号变成结构化报告。
+- Research 结果可生成 Artifact，避免研究结论只停留在一次对话中。
+- Memory 保存用户偏好、历史判断和任务结论，让后续推荐更贴近用户。
+- Skill 记录可复用 workflow，让类似信息差的验证过程可以重复使用。
 
 > 截图建议 9：Feed 页面。
 >
@@ -291,21 +346,45 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    FEED["Feed Cards"] --> ASK["User asks / selects card"]
-    ASK --> RUN["Agent Run"]
-    RUN --> RAG["RAG Evidence"]
-    RUN --> TOOL["MCP Tools"]
-    RUN --> RESEARCH["Deep Research"]
-    RAG --> ART["Artifact"]
-    RESEARCH --> ART
+    SRC["External Signals<br/>GitHub / arXiv / Search / Manual Seed"] --> FEED["FeedCards<br/>信息差卡片"]
+    FEED --> GAP["Gap Explanation<br/>差在哪里 / 为什么有关 / 下一步做什么"]
+    GAP --> RESEARCH["Deep Research<br/>系统调研"]
+    GAP --> RAG["RAG Verification<br/>用户文档验证"]
+    GAP --> TOOL["MCP Tools<br/>受控行动"]
+    RESEARCH --> ART["Artifact<br/>报告 / 计划 / Markdown"]
+    RAG --> ART
     TOOL --> AUDIT["ToolCall / Approval Audit"]
-    ART --> MEM["Memory"]
-    ART --> SKILL["Skill Draft"]
-    MEM --> NEXT["Better next run"]
+    ART --> MEM["Memory<br/>偏好 / 判断 / 结论"]
+    ART --> SKILL["Skill Draft<br/>可复用流程"]
+    MEM --> NEXT["Next Gap Discovery<br/>更贴近用户的信息差发现"]
     SKILL --> NEXT
 ```
 
 ## 功能模块详解
+
+### 信息差 Feed
+
+关键文件：
+
+```text
+src/web_app/services/feed_service.py
+src/web_app/feed/sources/
+src/web_app/feed/scorer.py
+src/web_app/feed/card_generator.py
+src/web_app/db/repositories/feed_repository.py
+src/web_app/api/v1/feed.py
+```
+
+Feed 模块负责把外部信息源转化为可行动的信息差卡片：
+
+- 从 arXiv、GitHub、DuckDuckGo、Tavily、SerpAPI 和手动种子中获取候选信息。
+- 对候选信息做去重、归一化和评分。
+- 根据用户画像、历史记忆和当前关注方向判断相关性。
+- 将信息分成显性相关、邻近机会、远域启发等类型。
+- 生成“信息差”“为什么与你有关”“建议行动”等解释字段。
+- 支持从 FeedCard 直接进入对话、深度研究、详情页或保存/忽略。
+
+这部分是项目“打破信息差”的入口：它不是简单新闻流，而是把外部信号转成可验证、可研究、可沉淀的任务起点。
 
 ### Agent Runtime
 
