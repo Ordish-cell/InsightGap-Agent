@@ -781,61 +781,6 @@ npm run type-check
 npm run build
 ```
 
-## 系统截图清单
-
-当前项目截图放在根目录的 `images/` 文件夹：
-
-```text
-images/
-```
-
-### 已放入 README 的截图
-
-| 文件 | 截图内容 | README 位置 |
-|---|---|---|
-| `images/index.jpg` | 首页 / Agent Chat 总览 | README 顶部 |
-| `images/deepresearch.jpg` | 深度研究页面 | Runtime / 研究能力说明 |
-| `images/information.jpg` | 信息流列表 | Feed 产品闭环 |
-| `images/feedcard.jpg` | 今日精选信息差卡片 | Feed 产品闭环 |
-| `images/xiangxi.jpg` | 信息详情页 | Feed 详情与证据说明 |
-| `images/artifacts.jpg` | 成果库页面 | Artifact 成果沉淀 |
-| `images/memory.jpg` | 长期记忆页面 | Memory / GSSC |
-| `images/skills.jpg` | 技能库页面 | Skill / 前端模块 |
-
-### 后续可补充的截图
-
-| 文件 | 截图内容 | 说明 |
-|---|---|---|
-| `images/approval-flow.jpg` | Approval 页面或审批弹窗 | 说明 L3 人工审批流程 |
-| `images/tool-calls.jpg` | MCP Tool Calls 审计列表 | 说明工具调用记录 |
-| `images/rag-evidence.jpg` | RAG 问答和证据引用 | 说明检索证据如何进入回答 |
-| `images/document-upload.jpg` | 文档上传与解析状态 | 说明 RAG 入库链路 |
-| `images/context-debug.jpg` | GSSC / 上下文调试信息 | 说明上下文治理能力 |
-| `images/settings.jpg` | 设置页 | 说明配置能力 |
-
-### 截图规范
-
-- 截图宽度建议 1200-1600px。
-- README 顶部主图建议横向，比例接近 16:9 或 21:9。
-- 不要截到真实 API Key、邮箱、数据库地址、用户隐私或公司内部文档。
-- 文档、Memory、Artifact 的内容建议使用脱敏样例。
-- 文件名使用小写英文和短横线。
-- README 中使用相对路径：
-
-```md
-![首页主界面](images/index.jpg)
-```
-
-## 提交前安全清单
-
-- [ ] `.env` 没有被 Git 跟踪。
-- [ ] `.env.example` 只保留空值或明显占位符。
-- [ ] README 和截图中没有真实 token、邮箱密码、数据库密码。
-- [ ] `uploads/`、`storage/uploads/` 中没有敏感用户文件；如果要开源，建议清理或只保留脱敏样例。
-- [ ] `ARTIFACT_STORAGE_PATH` 指向的历史产物没有隐私内容。
-- [ ] GitHub token、DashScope key、SMTP 密码已在服务商后台确认可随时轮换。
-- [ ] 如果曾经把密钥提交进 Git 历史，必须先吊销密钥，再用 `git filter-repo` 或 BFG 清理历史，不要只删除最新提交。
-
 ## License
 
 本项目保留原始 Open Deep Research 的开源许可。发布到 GitHub 前请确认 `LICENSE` 与你的二次开发发布方式一致。
