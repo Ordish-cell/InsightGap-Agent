@@ -111,7 +111,7 @@ class FeedRepository(BaseRepository[FeedCard]):
         if failed:
             _logger.error("feed bulk_create construction failures: %s/%s cards could not be built", failed, len(rows))
         self.db.add_all(cards)
-        self.db.commit()
+        self._commit()
         for card in cards:
             self.db.refresh(card)
         if len(cards) != len(rows):

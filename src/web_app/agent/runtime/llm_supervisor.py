@@ -612,7 +612,7 @@ def _build_user_prompt(
     if "research_agent" in available_nodes:
         supervisor_task.append("If the user explicitly asks for deep research, a comprehensive report, or long-form investigation, route to research_agent.")
     if "memory_agent" in available_nodes:
-        supervisor_task.append("If the user asks to remember a preference or fact, route to memory_agent.")
+        supervisor_task.append("If the user states their name, identity, or a personal preference (even without saying 'remember'), route to memory_agent. Declarative statements like 'my name is X', '我叫Y', 'call me Z', 'I am ...', 'I prefer/like/use ...' are implicit memory writes. When the planner already detected intent=memory, do NOT override to final_response unless there is a clear safety reason.")
     supervisor_task.extend([
         "Never bypass permission or approval.",
         "Return only a JSON route decision. Do not answer the user.",

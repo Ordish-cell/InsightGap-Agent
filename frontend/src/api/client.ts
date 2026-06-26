@@ -22,7 +22,14 @@ interface RequestOptions {
 }
 
 export function apiBaseUrl() {
-  return localStorage.getItem('apiBaseUrl') || 'http://127.0.0.1:8000/api/v1'
+  const configured = localStorage.getItem('apiBaseUrl')
+  if (!configured) return 'http://127.0.0.1:8000/api/v1'
+  try {
+    return new URL(configured).toString().replace(/\/$/, '')
+  } catch {
+    localStorage.removeItem('apiBaseUrl')
+    return 'http://127.0.0.1:8000/api/v1'
+  }
 }
 
 export function authToken() {
@@ -47,7 +54,12 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     body = JSON.stringify(options.body)
   }
 
-  const response = await fetch(url, { method: options.method || 'GET', headers, body })
+  let response: Response
+  try {
+    response = await fetch(url, { method: options.method || 'GET', headers, body })
+  } catch (exc) {
+    throw new ApiError(0, `Network request failed: ${url.origin}`, exc)
+  }
   const contentType = response.headers.get('content-type') || ''
   const payload = contentType.includes('application/json') ? await response.json() : await response.text()
 

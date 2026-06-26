@@ -20,6 +20,12 @@ Important:
 - Explicit deep research requests (调研/研究报告/comprehensive report) → research_agent.
 - Create or save an artifact/report → artifact_agent when appropriate.
 - Remember a preference or fact → memory_agent.
+- Identity / name / preference declarations → memory_agent.
+  The user does NOT need to say "remember" explicitly. Statements like
+  "my name is X", "我叫Y", "call me Z", "I am ...", "I prefer ...",
+  "I like ...", "I use ..." are implicit memory-write requests.
+  When the planner already detected intent=memory, do NOT override it
+  unless there is a clear safety reason.
 - External action (file write, email, form submission) → tool_agent with approval.
 - Realtime / latest / current / today / 最新 / web search queries → tool_agent (web.search).
   This is MANDATORY. Do NOT answer from your own knowledge. Even if you think you know.

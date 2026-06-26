@@ -28,7 +28,7 @@ class AgentRunRepository(BaseRepository[AgentRun]):
         self.db.execute(delete(LLMCall).where(LLMCall.run_id == run_id))
         self.db.execute(delete(ToolCall).where(ToolCall.run_id == run_id))
         self.db.delete(run)
-        self.db.commit()
+        self._commit()
 
 
 class AgentStepRepository(BaseRepository[AgentStep]):
@@ -186,7 +186,7 @@ class AgentConversationRepository(BaseRepository[AgentConversation]):
 
         # 6) Delete the conversation itself
         self.db.delete(conversation)
-        self.db.commit()
+        self._commit()
         deleted += 1
         return deleted
 
@@ -246,7 +246,7 @@ class AgentChatMessageRepository(BaseRepository[AgentChatMessage]):
         count = len(rows)
         for row in rows:
             self.db.delete(row)
-        self.db.commit()
+        self._commit()
         return count
 
     def hard_delete_by_conversation(self, user_id: int, conversation_id: str) -> int:
@@ -259,7 +259,7 @@ class AgentChatMessageRepository(BaseRepository[AgentChatMessage]):
                     AgentChatMessage.conversation_id == conversation_id,
                 )
             )
-            self.db.commit()
+            self._commit()
         return count
 
 
@@ -395,7 +395,7 @@ class AgentConversationSummarySegmentRepository(BaseRepository[AgentConversation
             .values(embedding_id=embedding_id)
         )
         self.db.execute(stmt)
-        self.db.commit()
+        self._commit()
 
     def search_segments_ilike(
         self,

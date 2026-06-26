@@ -19,7 +19,8 @@ export function McpToolCallsPage() {
   async function load() {
     setLoading(true)
     try {
-      const [nextTools, nextCalls] = await Promise.all([mcp.listTools(), mcp.listToolCalls()])
+      const nextTools = await mcp.listTools()
+      const nextCalls = await mcp.listToolCalls().catch(() => [])
       setTools(nextTools)
       setCalls(nextCalls)
       setSelected(nextTools[0] || null)

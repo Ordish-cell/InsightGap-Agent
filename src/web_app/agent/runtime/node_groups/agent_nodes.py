@@ -1191,8 +1191,8 @@ class AgentNodesMixin:
                 )
                 return state
 
-            # Only write memory for high-value tasks, not casual chat
-            if intent in ("chat",) or not bool(self.payload.get("write_memory", False)):
+            # Only skip memory for casual chat without explicit write_memory flag
+            if intent in ("chat",) and not bool(self.payload.get("write_memory", False)):
                 state["memory_write_decision"] = {
                     "should_write": False,
                     "mode": "skipped",
@@ -1419,6 +1419,13 @@ class AgentNodesMixin:
         )
         return state
 
+    # ── Name / identity declarations (deterministic, no "记住" keyword needed) ──
+    _NAME_DECLARATION_PATTERNS = [
+        "我叫", "叫我", "我的名字", "我是", "称呼我",
+        "以后叫我", "称呼", "你可以叫我",
+        "my name is", "call me", "i am", "i'm",
+    ]
+
     def _is_explicit_memory_write(self, user_input: str) -> bool:
         """Check whether the user is explicitly asking to remember something."""
         if not user_input:
@@ -1431,14 +1438,18 @@ class AgentNodesMixin:
             "remember", "save preference", "save my preference",
             "don't forget", "do not forget",
         )
-        return any(pattern in text for pattern in self._MEMORY_WRITE_PATTERNS) or any(
-            literal in text for literal in explicit_literals
+        return (
+            any(pattern in text for pattern in self._MEMORY_WRITE_PATTERNS)
+            or any(literal in text for literal in explicit_literals)
+            or any(pattern in text for pattern in self._NAME_DECLARATION_PATTERNS)
         )
 
     def _extract_memory_from_user_input(self, text: str) -> str:
-        """Extract a clean memory sentence from a user input containing '记住'."""
+        """Extract a clean memory sentence from user input (explicit or declarative)."""
         import re
         content = text.strip()
+        # Remove trailing punctuation / question marks for declarations like "我叫C，好听吗？"
+        content = re.sub(r"[，,。.！!？?]+[^，,。.！!？?]*$", "", content)
         # Remove trailing "记住" / "帮我记" etc.
         content = re.sub(r"[，,]*\s*(记住|帮我记|记一下|记下来|别忘了|下次记住|保存下来)[。.]*$", "", content)
         content = re.sub(r"^[记住：:记住:\s]+", "", content)

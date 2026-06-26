@@ -48,7 +48,7 @@ class DocumentChunkRepository(BaseRepository[DocumentChunk]):
     def bulk_create_chunks(self, rows: list[dict]) -> list[DocumentChunk]:
         chunks = [DocumentChunk(**row) for row in rows]
         self.db.add_all(chunks)
-        self.db.commit()
+        self._commit()
         for chunk in chunks:
             self.db.refresh(chunk)
         return chunks
@@ -103,5 +103,5 @@ class DocumentChunkRepository(BaseRepository[DocumentChunk]):
 
     def delete_by_document(self, user_id: int, document_id: int) -> int:
         result = self.db.execute(delete(DocumentChunk).where(DocumentChunk.user_id == user_id, DocumentChunk.document_id == document_id))
-        self.db.commit()
+        self._commit()
         return result.rowcount or 0

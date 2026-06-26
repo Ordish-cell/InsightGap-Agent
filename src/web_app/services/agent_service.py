@@ -919,6 +919,10 @@ async def stream_agent_run(db: Session, user_id: int, payload: dict[str, Any]):
         try:
             await run_agent_async(db, user_id, payload, stream_queue=queue)
         except Exception as exc:
+            try:
+                db.rollback()
+            except Exception:
+                logger.exception("Failed to rollback DB session after stream_agent_run error")
             queue.put_nowait(
                 {
                     "event": "run_failed",
