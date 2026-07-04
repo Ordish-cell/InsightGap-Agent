@@ -93,36 +93,47 @@ function collectFallbackItems(message: AgentThoughtStreamProps['message']) {
   const metadata = asRecord(message.metadata)
   const finalResponse = asRecord(metadata.final_response)
   const langgraphstatus = asRecord(message.langgraphstatus)
-  const sources = [
-    finalResponse.pipeline_steps,
-    finalResponse.visible_thoughts,
-    finalResponse.thinking_summary,
-    metadata.pipeline_steps,
-    metadata.visible_thoughts,
-    langgraphstatus.visible_thoughts,
-    (message as unknown as UnknownRecord).visible_thoughts,
-  ]
-  sources.forEach((source, sourceIndex) => {
-    if (Array.isArray(source)) {
-      source.forEach((entry, index) => {
-        const record = asRecord(entry)
-        const value = record.detail || record.summary || record.text || record.title || thoughtText(entry)
-        pushItem(items, {
-          id: `fallback-${sourceIndex}-${index}`,
-          kind: 'progress',
-          text: String(value || ''),
-          status: String(record.status || 'completed'),
-        })
-      })
-    } else {
+  // Only use langgraphstatus.steps as the canonical fallback source.
+  // The other sources (pipeline_steps, visible_thoughts, etc.) overlap and
+  // cause duplicate entries when rendered alongside live trace_events.
+  const canonicalSteps = langgraphstatus.steps
+  if (Array.isArray(canonicalSteps)) {
+    canonicalSteps.forEach((entry, index) => {
+      const record = asRecord(entry)
+      const value = record.detail || record.summary || record.text || record.title || record.thought || thoughtText(entry)
       pushItem(items, {
-        id: `fallback-${sourceIndex}`,
+        id: `fallback-${index}`,
         kind: 'progress',
-        text: thoughtText(source),
-        status: 'completed',
+        text: String(value || ''),
+        status: String(record.status || 'completed'),
       })
-    }
-  })
+    })
+  }
+  // Fallback to visible_thoughts only when no steps at all
+  if (!items.length) {
+    const sources = [
+      finalResponse.pipeline_steps,
+      finalResponse.visible_thoughts,
+      metadata.pipeline_steps,
+      metadata.visible_thoughts,
+      langgraphstatus.visible_thoughts,
+      (message as unknown as UnknownRecord).visible_thoughts,
+    ]
+    sources.forEach((source, sourceIndex) => {
+      if (Array.isArray(source)) {
+        source.forEach((entry, index) => {
+          const record = asRecord(entry)
+          const value = record.detail || record.summary || record.text || record.title || thoughtText(entry)
+          pushItem(items, {
+            id: `fallback-${sourceIndex}-${index}`,
+            kind: 'progress',
+            text: String(value || ''),
+            status: String(record.status || 'completed'),
+          })
+        })
+      }
+    })
+  }
   return items
 }
 
@@ -285,6 +296,24 @@ function collectActivityTrace(message: AgentThoughtStreamProps['message'], local
         text: String(payload.text || payload.summary || ''),
         status: String(payload.status || 'completed'),
         createdAt,
+      })
+      return
+    }
+
+    if (eventType === 'status_step') {
+      const p = asRecord(event.payload)
+      const stepKey = String(p.key || event.node_name || '')
+      const stepTitle = String(p.title || stepKey)
+      const stepThought = String(p.thought || '')
+      const stepDetail = String(p.detail || '')
+      const text = stepThought ? `${stepTitle}：${stepThought}` : stepTitle
+      pushItem(items, {
+        id: `step-${stepKey}-${index}`,
+        kind: 'progress',
+        text,
+        status: String(p.status || 'completed'),
+        detail: stepDetail || undefined,
+        createdAt: String(event.created_at || p.started_at || ''),
       })
       return
     }

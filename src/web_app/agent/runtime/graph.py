@@ -28,6 +28,7 @@ from src.web_app.agent.runtime.fallback import run_fallback
 from src.web_app.agent.runtime.graph_builder import build_agent_runtime_graph
 from src.web_app.agent.runtime.graph_config import build_langgraph_invoke_config
 from src.web_app.agent.runtime.graph_registry import build_fallback_nodes
+from src.web_app.agent.runtime.langgraph_status import clear_status_stream_queue, set_status_stream_queue
 from src.web_app.agent.runtime.nodes import RuntimeNodes
 from src.web_app.agent.runtime.state import AgentRuntimeState
 from src.web_app.core.config import settings
@@ -45,15 +46,20 @@ class AgentRuntime:
         _run_log = logging.getLogger(__name__)
         # Remove non-serializable objects before LangGraph sees the state.
         state.pop("_stream_queue", None)
-        graph = await self._build_langgraph()
-        cfg = build_langgraph_invoke_config(state)
-        _run_log.info(
-            "[CHECKPOINTER] graph.ainvoke thread_id=%s run_id=%s",
-            cfg.get("configurable", {}).get("thread_id"), state.get("run_id"),
-        )
-        if graph:
-            return await graph.ainvoke(state, config=cfg)
-        return await run_fallback(self._fallback_nodes(), state)
+        # Set module-level queue so append_status_step can push SSE events in real-time.
+        set_status_stream_queue(self._stream_queue)
+        try:
+            graph = await self._build_langgraph()
+            cfg = build_langgraph_invoke_config(state)
+            _run_log.info(
+                "[CHECKPOINTER] graph.ainvoke thread_id=%s run_id=%s",
+                cfg.get("configurable", {}).get("thread_id"), state.get("run_id"),
+            )
+            if graph:
+                return await graph.ainvoke(state, config=cfg)
+            return await run_fallback(self._fallback_nodes(), state)
+        finally:
+            clear_status_stream_queue()
 
     async def resume_from_interrupt(
         self,

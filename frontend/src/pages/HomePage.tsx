@@ -1,9 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
 import * as feed from '../api/feed'
 import type { FeedCard } from '../api/types'
 import { AgentChatPanel } from '../components/agent/AgentChatPanel'
+
+// Module-level cache to survive component remounts during hot reload / StrictMode
+let _cachedCards: FeedCard[] | null = null
+let _cacheTs = 0
+const CACHE_TTL_MS = 30_000
 
 type PickedFeed = { label: string; percent: string; className: string; card: FeedCard }
 
@@ -64,12 +69,20 @@ export function HomePage() {
   )
 
   useEffect(() => {
-    setFeedLoading(true)
+    // Use cached data immediately to avoid loading flash on remount
+    if (_cachedCards && Date.now() - _cacheTs < CACHE_TTL_MS) {
+      setCards(_cachedCards)
+      setFeedLoading(false)
+    } else {
+      setFeedLoading(true)
+    }
     setFeedError('')
     try {
       feed.homeCards()
         .then((result) => {
           const safeCards: FeedCard[] = Array.isArray(result?.cards) ? result.cards.filter(Boolean) : []
+          _cachedCards = safeCards
+          _cacheTs = Date.now()
           setCards(safeCards)
 
           const refreshResult = result?.refresh_result as Record<string, unknown> | undefined

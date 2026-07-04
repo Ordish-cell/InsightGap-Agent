@@ -10,7 +10,9 @@ export function AppShell() {
     <div className="app-shell">
       <Sidebar />
       <main className={isHome ? 'app-main home-main' : 'app-main'}>
-        {isHome ? <Outlet /> : <div className="content"><Outlet /></div>}
+        <div className={isHome ? '' : 'content'}>
+          <Outlet />
+        </div>
       </main>
     </div>
   )

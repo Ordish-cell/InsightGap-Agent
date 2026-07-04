@@ -460,8 +460,10 @@ def plan_route(
     _tool_intents = {"tool", "tool.email", "tool.local_file", "tool.web_search", "tool.browser", "tool.comment", "tool.form_submit", "tool.shell_readonly", "tool.shell_write", "tool.dangerous", "system.time", "system.calc", "system.unit_convert", "system.uuid", "system.hash"}
     # Declaration + advice question → project_advice; LLM must not override to research.
     _is_declaration_advice = (_is_tech_stack or _is_memory_like) and _has_advice_question and not _has_explicit_research_request
+    # Pure memory / identity declaration — LLM must not override to research/rag.
+    _is_pure_memory_declaration = (_is_name_preference or _is_memory_like) and not _has_advice_question and not _has_explicit_research_request
     _llm_override_blocked = (
-        (_is_declaration_advice or is_project_diagnostic)
+        (_is_declaration_advice or is_project_diagnostic or _is_pure_memory_declaration)
         and llm_intent in ("research", "feed_research", "mixed", "rag")
     ) or (
         (_has_light_web_search_request or bool(local_tool))

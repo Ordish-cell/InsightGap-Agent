@@ -64,13 +64,13 @@ export function Sidebar() {
 
   function openConversation(conversationId: string) {
     sessionStorage.setItem('agentOpenConversationId', conversationId)
-    navigate('/')
+    navigate('/', { replace: true })
     window.dispatchEvent(new CustomEvent('agent:open-conversation', { detail: { conversationId } }))
   }
 
   function newConversation() {
     sessionStorage.removeItem('agentOpenConversationId')
-    navigate('/')
+    navigate('/', { replace: true })
     window.dispatchEvent(new CustomEvent('agent:new-conversation'))
   }
 

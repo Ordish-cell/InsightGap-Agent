@@ -3,6 +3,21 @@ from typing import Any
 
 from src.web_app.core.config import settings
 
+# Module-level stream queue — set by AgentRuntime.run() before graph execution,
+# read by _emit_status_sse(). Avoids putting a non-serializable queue into
+# LangGraph state (which would break checkpointing).
+_stream_queue: Any = None
+
+
+def set_status_stream_queue(queue: Any) -> None:
+    global _stream_queue
+    _stream_queue = queue
+
+
+def clear_status_stream_queue() -> None:
+    global _stream_queue
+    _stream_queue = None
+
 
 STEP_TITLES = {
     "home_intent": "\u5224\u65ad\u9700\u6c42",
@@ -93,7 +108,39 @@ def append_status_step(
         }
     )
     state["langgraphstatus"] = current
+
+    # ── Emit SSE event so frontend shows this step in real-time ──
+    _emit_status_sse(state, key, item, status)
+
     return state
+
+
+def _emit_status_sse(state: dict[str, Any], key: str, item: dict[str, Any], status: str) -> None:
+    """Push a status_step SSE event via the stream queue so the frontend
+    renders each pipeline step as it completes, not just on refresh."""
+    stream_queue = _stream_queue  # module-level, set by AgentRuntime.run()
+    if stream_queue is None:
+        return
+    try:
+        payload = {
+            "run_id": state.get("run_id"),
+            "thread_id": state.get("thread_id", ""),
+            "event_type": "status_step",
+            "node_name": key,
+            "visibility": "user",
+            "display_channel": "progress",
+            "payload": {
+                "key": key,
+                "title": item.get("title", key),
+                "status": status,
+                "detail": item.get("detail", ""),
+                "thought": item.get("thought", item.get("title", key)),
+            },
+            "created_at": item.get("started_at", ""),
+        }
+        stream_queue.put_nowait({"event": "status_step", "data": payload})
+    except Exception:
+        pass  # never let SSE failures break the pipeline
 
 
 def _add_visible_react_fields(item: dict[str, Any], key: str) -> None:
