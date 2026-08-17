@@ -123,7 +123,7 @@ class SkillService:
         feed_card = context.get("feed_card") or {}
         return " ".join(str(feed_card.get(key, "")) for key in ("title", "one_sentence_value", "why_you", "information_gap", "summary", "domain", "source_type"))
 
-    # ── Skill Evolution ───────────────────────────────────────────────
+    # Skill Evolution
 
     def record_skill_usage(self, skill_id: int, user_id: int, success: bool, db: Session | None = None) -> dict[str, Any]:
         """Record a skill usage event and update evolution stats."""

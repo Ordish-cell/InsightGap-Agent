@@ -528,6 +528,42 @@ def test_original_skill_matching_still_works():
     assert result.get("candidate_skills") or result.get("matched")
 
 
+def test_skill_matching_uses_chinese_trigger_terms():
+    from src.web_app.services.skill_service import skill_service
+    from src.web_app.db.repositories.skill_repository import SkillRepository
+    db = make_test_session()
+    user = _user(db)
+
+    skill = SkillRepository(db).create(
+        user_id=user.id,
+        name="研究报告流程",
+        description="复用研究报告工作流",
+        trigger_text="研究报告流程，复用",
+        status="approved",
+    )
+
+    result = skill_service.match_skill("请复用研究报告流程", user.id, db=db)
+
+    assert result["matched_skill"]["id"] == skill.id
+    assert result["matched_skill"]["match_score"] >= 0.75
+
+
+def test_skill_reusability_uses_chinese_intent_terms():
+    from src.web_app.services.skill_service import skill_service
+
+    result = skill_service.evaluate_reusability(
+        {
+            "user_input": "以后复用这个流程生成报告",
+            "route": "artifact",
+            "status": "completed",
+            "artifacts": [{"id": 1}],
+        }
+    )
+
+    assert result["should_create"] is True
+    assert result["reusable_score"] >= 0.70
+
+
 def test_original_feed_chinese_titles_still_work():
     from src.web_app.feed.card_generator import _generate_chinese_title, is_mostly_english
     title = _generate_chinese_title(
