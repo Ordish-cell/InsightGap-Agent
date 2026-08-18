@@ -1,8 +1,9 @@
 from dataclasses import asdict, dataclass
 from typing import Literal
 
-from src.web_app.agent.llm.config import get_llm_settings
+from src.web_app.agent.llm.context import get_model_context
 from src.web_app.agent.llm.errors import LLMRouterError
+from src.web_app.core.config import get_settings
 
 ModelPurpose = Literal[
     "intent",
@@ -47,15 +48,16 @@ DEFAULT_TIER_BY_PURPOSE: dict[ModelPurpose, ModelTier] = {
 
 
 def resolve_model_name(purpose: ModelPurpose | str, complexity: str = "normal") -> ModelResolution:
-    settings = get_llm_settings()
     normalized = _normalize_purpose(purpose)
     tier = _resolve_tier(normalized, complexity)
     if normalized == "embedding":
-        model = settings.embedding_model
-        provider = settings.embedding_provider
+        settings = get_settings()
+        model = settings.embed_model_name
+        provider = settings.embed_model_type
     else:
-        model = _purpose_model(normalized) or _tier_model(tier) or settings.default_model
-        provider = settings.provider
+        context = get_model_context()
+        model = context.model
+        provider = context.provider
     if not model:
         raise LLMRouterError(f"No model configured for purpose={normalized}")
     return ModelResolution(purpose=normalized, tier=tier, provider=provider, model=model)
@@ -74,27 +76,3 @@ def _resolve_tier(purpose: ModelPurpose, complexity: str) -> ModelTier:
     if complexity == "low":
         return "fast"
     return DEFAULT_TIER_BY_PURPOSE[purpose]
-
-
-def _purpose_model(purpose: ModelPurpose) -> str:
-    settings = get_llm_settings()
-    return {
-        "intent": settings.intent_model,
-        "safety": settings.safety_model,
-        "planner": settings.planner_model,
-        "rag": settings.rag_model,
-        "research": settings.research_model,
-        "artifact": settings.artifact_model,
-        "memory": settings.memory_model,
-        "skill": settings.skill_model,
-        "final": settings.final_model,
-    }.get(purpose, "")
-
-
-def _tier_model(tier: ModelTier) -> str:
-    settings = get_llm_settings()
-    return {
-        "fast": settings.fast_model,
-        "balanced": settings.balanced_model,
-        "strong": settings.strong_model,
-    }[tier]

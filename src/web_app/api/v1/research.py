@@ -25,7 +25,8 @@ async def create_research_run(
         result = research_service.create_research_run(db, user_id, payload)
         return ok(result)
     except ValueError as exc:
-        return fail("RESEARCH_CREATE_FAILED", str(exc))
+        code = "model_setup_required" if str(exc) == "model_setup_required" else "RESEARCH_CREATE_FAILED"
+        return fail(code, str(exc))
 
 
 @router.get("/runs")
@@ -46,31 +47,5 @@ def get_research_run(
 ):
     try:
         return ok(research_service.get_research_run(db, user_id, research_run_id))
-    except ValueError as exc:
-        return fail("RESEARCH_NOT_FOUND", str(exc))
-
-
-@router.post("/deep")
-async def deep_research(
-    payload: dict,
-    user_id: int = Depends(get_current_user_id),
-    db: Session = Depends(get_db),
-):
-    """Legacy synchronous deep-research endpoint (blocks until complete)."""
-    request = ResearchRequest(**payload)
-    try:
-        return ok(await research_service.research_query(db, user_id, request))
-    except ValueError as exc:
-        return fail("RESEARCH_CREATE_FAILED", str(exc))
-
-
-@router.get("/{run_id}")
-def legacy_get_research(
-    run_id: str,
-    user_id: int = Depends(get_current_user_id),
-    db: Session = Depends(get_db),
-):
-    try:
-        return ok(research_service.get_research_run(db, user_id, run_id))
     except ValueError as exc:
         return fail("RESEARCH_NOT_FOUND", str(exc))

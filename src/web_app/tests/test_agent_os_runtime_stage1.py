@@ -2,7 +2,12 @@ from src.web_app.agent.runtime.checkpointers import build_checkpointer
 from src.web_app.db.repositories.approval_repository import ApprovalRepository
 import pytest
 
-from src.web_app.services.agent_service import list_events, run_agent, stream_agent_run
+import json
+
+from sqlalchemy.orm import sessionmaker
+
+from src.web_app.agent.runtime.ledger_stream import stream_ledger_events
+from src.web_app.services.agent_service import replay_events, run_agent
 from src.web_app.services.approval_service import update_approval_status
 from src.web_app.models.orm import User
 from src.web_app.tests.db_test_utils import make_test_session
@@ -24,8 +29,8 @@ def test_chat_run_emits_agent_events():
 
     assert result["status"] == "completed"
     assert result["intent"] == "chat"
-    events = list_events(db, user.id, result["run_id"])
-    names = [event["event"] for event in events]
+    events = replay_events(db, user.id, result["run_id"], limit=500)["events"]
+    names = [event["event_type"] for event in events]
     assert "run_started" in names
     assert "run_completed" in names
     assert any(event["data"]["event_type"] == "node_completed" for event in events)
@@ -43,10 +48,10 @@ def test_chat_run_emits_visible_thoughts_without_react_fields():
     assert "answer" in result["final_response"]
     assert all("planner" not in item and "context_builder" not in item for item in thoughts)
 
-    events = list_events(db, user.id, result["run_id"])
-    visible_events = [event for event in events if event["event"] == "visible_thought"]
+    events = replay_events(db, user.id, result["run_id"], limit=500)["events"]
+    visible_events = [event for event in events if event["event_type"] == "visible_thought"]
     assert visible_events
-    assert visible_events[0]["data"]["payload"]["status"] == "completed"
+    assert visible_events[0]["payload"]["status"] == "completed"
     assert "text" in visible_events[0]["data"]["payload"]
     assert "action" not in visible_events[0]["data"]["payload"]
     assert "observation" not in visible_events[0]["data"]["payload"]
@@ -58,16 +63,22 @@ async def test_agent_run_stream_emits_visible_thought_and_answer_deltas_before_c
     db = make_test_session()
     user = _user(db, "visible-stream@example.com")
 
+    result = run_agent(db, user.id, {"user_input": "hello"})
+    session_factory = sessionmaker(bind=db.bind, future=True)
     event_types = []
     first_thought_delta = None
     first_answer_delta = None
-    async for event in stream_agent_run(db, user.id, {"user_input": "hello"}):
-        event_type = event["data"]["event_type"]
+    async for chunk in stream_ledger_events(session_factory, user.id, result["run_id"]):
+        data = next((line[6:] for line in chunk.splitlines() if line.startswith("data: ")), "")
+        if not data:
+            continue
+        event = json.loads(data)
+        event_type = event["event_type"]
         event_types.append(event_type)
         if event_type == "visible_thought_delta" and first_thought_delta is None:
-            first_thought_delta = event["data"]["payload"]
+            first_thought_delta = event["payload"]
         if event_type == "answer_delta" and first_answer_delta is None:
-            first_answer_delta = event["data"]["payload"]
+            first_answer_delta = event["payload"]
         if event_type == "run_completed":
             break
 
@@ -92,8 +103,8 @@ def test_home_intent_react_detects_research_route():
 
     assert result["risk_level"] in {"L1", "L2"}
     assert "research_agent" in result["route_plan"]
-    events = list_events(db, user.id, result["run_id"])
-    assert any(event["data"]["node_name"] == "home_intent_react" for event in events)
+    events = replay_events(db, user.id, result["run_id"], limit=500)["events"]
+    assert any(event["node_name"] == "home_intent_react" for event in events)
 
 
 def test_l3_email_task_creates_approval_and_events():
@@ -107,8 +118,8 @@ def test_l3_email_task_creates_approval_and_events():
     assert result["risk_level"] == "L3"
     approvals = ApprovalRepository(db).list_by_user(user.id)
     assert approvals
-    events = list_events(db, user.id, result["run_id"])
-    assert any(event["event"] == "approval_required" for event in events)
+    events = replay_events(db, user.id, result["run_id"], limit=500)["events"]
+    assert any(event["event_type"] == "approval_required" for event in events)
 
 
 def test_l4_delete_task_requires_strong_approval():
@@ -131,16 +142,16 @@ def test_approval_approve_and_reject_update_run_events():
     approved = update_approval_status(db, user.id, approval.id, "approved", {"decision": "approved"})
 
     assert approved["status"] == "approved"
-    events = list_events(db, user.id, result["run_id"])
-    assert any(event["event"] == "approval_approved" for event in events)
-    assert any(event["event"] == "run_completed" for event in events)
+    events = replay_events(db, user.id, result["run_id"], limit=500)["events"]
+    assert any(event["event_type"] == "approval_approved" for event in events)
+    assert any(event["event_type"] == "run_completed" for event in events)
 
     result2 = run_agent(db, user.id, {"user_input": "post comment to website"})
     approval2 = ApprovalRepository(db).list_by_user(user.id)[0]
     rejected = update_approval_status(db, user.id, approval2.id, "rejected", {"reason": "not now"})
     assert rejected["status"] == "rejected"
-    events2 = list_events(db, user.id, result2["run_id"])
-    assert any(event["event"] == "approval_rejected" for event in events2)
+    events2 = replay_events(db, user.id, result2["run_id"], limit=500)["events"]
+    assert any(event["event_type"] == "approval_rejected" for event in events2)
 
 
 def test_checkpointer_falls_back_when_redis_unavailable():

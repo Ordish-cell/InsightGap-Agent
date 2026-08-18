@@ -82,12 +82,8 @@ async def tavily_search(
     max_char_to_include = configurable.max_content_length
     
     # Initialize summarization model with retry logic
-    model_api_key = get_api_key_for_model(configurable.summarization_model, config)
     summarization_model = init_chat_model(
-        model=configurable.summarization_model,
-        max_tokens=configurable.summarization_model_max_tokens,
-        api_key=model_api_key,
-        tags=["langsmith:nostream"]
+        **get_model_runtime_config(configurable.summarization_model, configurable.summarization_model_max_tokens, config)
     ).with_structured_output(Summary).with_retry(
         stop_after_attempt=configurable.max_structured_output_retries
     )
@@ -890,31 +886,27 @@ def get_config_value(value):
         return value.value
 
 def get_api_key_for_model(model_name: str, config: RunnableConfig):
-    """Get API key for a specific model from environment or config."""
-    should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
-    model_name = model_name.lower()
-    if should_get_from_config.lower() == "true":
-        api_keys = config.get("configurable", {}).get("apiKeys", {})
-        if not api_keys:
-            return None
-        if model_name.startswith("openai:"):
-            return api_keys.get("OPENAI_API_KEY")
-        elif model_name.startswith("anthropic:"):
-            return api_keys.get("ANTHROPIC_API_KEY")
-        elif model_name.startswith("google"):
-            return api_keys.get("GOOGLE_API_KEY")
-        return None
-    else:
-        if model_name.startswith("openai:"): 
-            return os.getenv("OPENAI_API_KEY")
-        elif model_name.startswith("anthropic:"):
-            return os.getenv("ANTHROPIC_API_KEY")
-        elif model_name.startswith("google"):
-            return os.getenv("GOOGLE_API_KEY")
-        return None
+    """Return the Run-scoped credential injected by the web adapter."""
+    del model_name
+    return config.get("configurable", {}).get("model_api_key")
+
+
+def get_model_runtime_config(model_name: str, max_tokens: int, config: RunnableConfig) -> dict[str, Any]:
+    """Build the Run-scoped init_chat_model configuration for every ODR stage."""
+    extra = config.get("configurable", {}).get("model_extra", {})
+    return {
+        "model": model_name,
+        "max_tokens": max_tokens,
+        "api_key": get_api_key_for_model(model_name, config),
+        "tags": ["langsmith:nostream"],
+        **(extra if isinstance(extra, dict) else {}),
+    }
 
 def get_tavily_api_key(config: RunnableConfig):
     """Get Tavily API key from environment or config."""
+    configured_key = config.get("configurable", {}).get("apiKeys", {}).get("TAVILY_API_KEY")
+    if configured_key:
+        return configured_key
     should_get_from_config = os.getenv("GET_API_KEYS_FROM_CONFIG", "false")
     if should_get_from_config.lower() == "true":
         api_keys = config.get("configurable", {}).get("apiKeys", {})

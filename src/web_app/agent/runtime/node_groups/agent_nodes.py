@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from src.web_app.agent.runtime.events import queue_stream_event
+from src.web_app.agent.runtime.event_ledger import publish_event
 from src.web_app.agent.runtime.node_groups.base import *
 from src.web_app.agent.runtime.state_delta import record_agent_node_result
 from src.web_app.db.repositories.mcp_repository import ToolCallRepository
@@ -84,6 +84,7 @@ def _redact_tool_preview_value(value: Any) -> Any:
 
 
 def _queue_tool_event(
+    db,
     state: AgentRuntimeState,
     event_type: str,
     *,
@@ -116,11 +117,13 @@ def _queue_tool_event(
         payload["tool_call_record_id"] = tool_call_record_id
     if extra_payload:
         payload.update(extra_payload)
-    queue_stream_event(
+    publish_event(
+        db,
         stream_queue or state.get("_stream_queue"),
+        state.get("run_id"),
         event_type,
         payload,
-        run_id=state.get("run_id"),
+        user_id=state.get("user_id"),
         thread_id=state.get("thread_id", ""),
         node_name="tool_agent",
     )
@@ -650,6 +653,7 @@ class AgentNodesMixin:
             client_tool_call_id = _tool_event_id(state, tool_name)
             safe_tool_args = _sanitize_tool_args(tool_name, tool_input)
             _queue_tool_event(
+                self.db,
                 state,
                 "tool_call_started",
                 tool_call_id=client_tool_call_id,
@@ -688,6 +692,7 @@ class AgentNodesMixin:
                 )
             elif result["status"] in {"failed", "blocked"}:
                 _queue_tool_event(
+                    self.db,
                     state,
                     "tool_call_failed",
                     tool_call_id=client_tool_call_id,
@@ -724,6 +729,7 @@ class AgentNodesMixin:
                 )
             else:
                 _queue_tool_event(
+                    self.db,
                     state,
                     "tool_call_completed",
                     tool_call_id=client_tool_call_id,
@@ -898,6 +904,7 @@ class AgentNodesMixin:
             tool_args = state.get("pending_tool_args") or {}
             client_tool_call_id = str(tool_call_id or _tool_event_id(state, tool_name))
             _queue_tool_event(
+                self.db,
                 state,
                 "tool_call_started",
                 tool_call_id=client_tool_call_id,
@@ -925,6 +932,7 @@ class AgentNodesMixin:
                 }
             success = executed_result.get("success") is True
             _queue_tool_event(
+                self.db,
                 state,
                 "tool_call_completed" if success else "tool_call_failed",
                 tool_call_id=client_tool_call_id,

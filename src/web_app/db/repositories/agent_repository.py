@@ -45,6 +45,35 @@ class AgentEventRepository(BaseRepository[AgentEvent]):
         stmt = select(AgentEvent).where(AgentEvent.user_id == user_id, AgentEvent.run_id == run_id).order_by(AgentEvent.id)
         return list(self.db.execute(stmt).scalars())
 
+    def list_replay(
+        self,
+        user_id: int,
+        run_id: int,
+        *,
+        after_seq: int = 0,
+        until_seq: int | None = None,
+        limit: int = 200,
+        event_type: str | None = None,
+    ) -> list[AgentEvent]:
+        stmt = select(AgentEvent).where(
+            AgentEvent.user_id == user_id,
+            AgentEvent.run_id == run_id,
+            AgentEvent.id > after_seq,
+        )
+        if until_seq is not None:
+            stmt = stmt.where(AgentEvent.id <= until_seq)
+        if event_type:
+            stmt = stmt.where(AgentEvent.event_type == event_type)
+        stmt = stmt.order_by(AgentEvent.id).limit(limit)
+        return list(self.db.execute(stmt).scalars())
+
+    def max_seq(self, user_id: int, run_id: int) -> int:
+        stmt = select(func.max(AgentEvent.id)).where(
+            AgentEvent.user_id == user_id,
+            AgentEvent.run_id == run_id,
+        )
+        return int(self.db.execute(stmt).scalar() or 0)
+
 
 class LLMCallRepository(BaseRepository[LLMCall]):
     model = LLMCall

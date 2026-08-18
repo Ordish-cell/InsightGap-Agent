@@ -176,5 +176,5 @@ def update_approval_status(
 
     result = approval_to_dict(item)
     result["run_id"] = run_id
-    result["resume_stream_url"] = f"/api/v1/agent/runs/{run_id}/resume/stream"
+    result["resume_url"] = f"/api/v1/agent/runs/{run_id}/resume"
     return result

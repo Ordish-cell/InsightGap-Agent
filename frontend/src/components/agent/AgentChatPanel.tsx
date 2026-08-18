@@ -6,6 +6,7 @@ import { fetchDocumentBlobUrl, toApiUrl, uploadChatAttachment } from '../../api/
 import { JsonBlock } from '../common/JsonBlock'
 import { MarkdownRenderer } from '../common/MarkdownRenderer'
 import { StatusPill } from '../common/StatusPill'
+import { ModelSelector } from '../llm/ModelSelector'
 import { AgentThoughtStream } from './AgentThoughtStream'
 
 type LocalChatAttachment = ChatAttachment & {
@@ -203,6 +204,26 @@ function parseEvent(raw: string): AgentEvent | null {
   }
 }
 
+function eventIdentity(event: AgentEvent) {
+  const sequence = event.event_seq ?? event.id
+  if (sequence !== undefined && sequence !== null) return `ledger:${sequence}`
+  const payload = asRecord(event.payload)
+  const domainId = payload.event_id || payload.tool_call_id || payload.toolCallId || payload.approval_id
+  if (domainId) return `domain:${event.event_type || ''}:${String(domainId)}`
+  return ''
+}
+
+function appendTraceEvent(events: AgentEvent[] | undefined, event: AgentEvent) {
+  const current = events || []
+  const identity = eventIdentity(event)
+  if (identity && current.some((item) => eventIdentity(item) === identity)) return current
+  return [...current, event].slice(-LIVE_TRACE_LIMIT)
+}
+
+async function loadRunReplay(runId: number) {
+  return agent.agentLedgerClient.replay(runId)
+}
+
 function eventTitle(event: AgentEvent, locale: 'en' | 'zh') {
   const payload = event.payload || {}
   const title = payload.title || payload.summary
@@ -276,11 +297,6 @@ function eventsToSteps(events: AgentEvent[], locale: 'en' | 'zh'): AgentRunStep[
 }
 
 function stepsForMessage(message: UiMessage, locale: 'en' | 'zh') {
-  const direct = Array.isArray(message.steps) ? message.steps : []
-  if (direct.length) return direct
-  const status = asRecord(message.langgraphstatus)
-  const fromStatus = Array.isArray(status.steps) ? (status.steps as AgentRunStep[]) : []
-  if (fromStatus.length) return fromStatus
   return eventsToSteps(message.trace_events || [], locale)
 }
 
@@ -536,7 +552,10 @@ export function AgentChatPanel({
   const [activeConversationId, setActiveConversationId] = useState('')
   const [currentRun, setCurrentRun] = useState<AgentRun | null>(null)
   const [running, setRunning] = useState(false)
+  const [selectedModelConfigId, setSelectedModelConfigId] = useState<number | null>(null)
   const [error, setError] = useState('')
+  const [replayLoading, setReplayLoading] = useState(false)
+  const [replayError, setReplayError] = useState('')
 
   const [attachments, setAttachments] = useState<LocalChatAttachment[]>([])
   const fileInputRef = useRef<HTMLInputElement | null>(null)
@@ -544,8 +563,18 @@ export function AgentChatPanel({
   const lastPasteAtRef = useRef(0)
   const [isComposing, setIsComposing] = useState(false)
 
-  const hasConversation = messages.length > 0 || running || Boolean(activeConversationId) || Boolean(error)
+  const hasConversation = messages.length > 0 || running || replayLoading || Boolean(activeConversationId) || Boolean(error) || Boolean(replayError)
   const selectedFeedTitle = String(pageContext.selected_feed_card_title || '')
+
+  function handleNetworkStatus(status: 'recovering' | 'caught_up' | 'retrying') {
+    if (status === 'caught_up') {
+      setReplayError('')
+      return
+    }
+    setReplayError(status === 'recovering'
+      ? text(locale, '正在恢复连接…', 'Recovering connection…')
+      : text(locale, '恢复失败，正在继续重试…', 'Recovery failed; continuing to retry…'))
+  }
 
   // ── attachment helpers ──
   const buildScreenshotFilename = (mimeType: string) => {
@@ -740,9 +769,78 @@ export function AgentChatPanel({
   async function loadConversation(conversationId: string) {
     streamRef.current?.close()
     setError('')
-    const item = await agent.getConversation(conversationId)
-    setActiveConversationId(item.conversation_id)
-    setMessages((item.messages || []) as UiMessage[])
+    setReplayError('')
+    setReplayLoading(true)
+    try {
+      const item = await agent.getConversation(conversationId)
+      setActiveConversationId(item.conversation_id)
+      const rememberedModelId = Number((item.metadata as UnknownRecord | undefined)?.model_config_id || 0)
+      setSelectedModelConfigId(rememberedModelId > 0 ? rememberedModelId : null)
+      const conversationMessages = (item.messages || []) as UiMessage[]
+      const runIds = Array.from(new Set(
+        conversationMessages
+          .filter((message) => message.role === 'assistant' && Number(message.run_id) > 0)
+          .map((message) => Number(message.run_id)),
+      ))
+      const replayResults = await Promise.allSettled(runIds.map(async (runId) => [runId, await loadRunReplay(runId)] as const))
+      const replayByRun = new Map<number, AgentEvent[]>()
+      let failedRuns = 0
+      replayResults.forEach((result) => {
+        if (result.status === 'fulfilled') replayByRun.set(result.value[0], result.value[1])
+        else failedRuns += 1
+      })
+      const restoredMessages = conversationMessages.map((message) => {
+        const replay = replayByRun.get(Number(message.run_id))
+        return replay ? { ...message, trace_events: replay } : message
+      })
+      setMessages(restoredMessages)
+      const activeMessage = [...restoredMessages].reverse().find((message) =>
+        message.role === 'assistant' &&
+        Number(message.run_id) > 0 &&
+        ['created', 'thinking', 'running', 'streaming', 'resuming'].includes(String(message.status)),
+      )
+      if (activeMessage?.run_id) {
+        const activeRunId = Number(activeMessage.run_id)
+        setRunning(true)
+        streamRef.current = agent.agentLedgerClient.tailRun(activeRunId, 0, {
+          onNetworkStatus: handleNetworkStatus,
+          onMessage: (message) => {
+            const parsed = parseEvent(message.data)
+            if (!parsed) return
+            const payload = asRecord(parsed.payload)
+            setMessages((items) => items.map((item) => {
+              if (item.role !== 'assistant' || Number(item.run_id) !== activeRunId) return item
+              const trace_events = appendTraceEvent(item.trace_events, parsed)
+              if (parsed.event_type === 'answer_delta') {
+                return { ...item, status: 'streaming', content: `${item.content || ''}${String(payload.text || '')}`, trace_events }
+              }
+              if (parsed.event_type === 'answer_completed') {
+                return { ...item, status: 'completed', content: String(payload.answer || item.content || ''), trace_events }
+              }
+              if (parsed.event_type === 'approval_required' || parsed.event_type === 'run_paused') {
+                return { ...item, status: 'waiting_approval', trace_events }
+              }
+              if (parsed.event_type === 'run_completed') {
+                const response = asRecord(payload.response) as AgentRun
+                return { ...item, status: 'completed', content: agent.extractRunAnswer(response) || String(payload.answer || item.content || ''), trace_events }
+              }
+              if (parsed.event_type === 'run_failed' || parsed.event_type === 'run_interrupted') {
+                return { ...item, status: 'failed', content: String(payload.error || item.content || ''), trace_events }
+              }
+              return { ...item, trace_events }
+            }))
+            if (['run_completed', 'run_failed', 'run_interrupted', 'run_paused'].includes(String(parsed.event_type))) setRunning(false)
+          },
+        })
+      }
+      if (failedRuns) {
+        setReplayError(text(locale, `有 ${failedRuns} 条运行记录未能恢复，可重新打开会话重试。`, `${failedRuns} run timeline(s) could not be restored. Reopen the conversation to retry.`))
+      }
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : text(locale, '会话加载失败。', 'Failed to load conversation.'))
+    } finally {
+      setReplayLoading(false)
+    }
   }
 
   function startNewConversation() {
@@ -750,7 +848,10 @@ export function AgentChatPanel({
     setActiveConversationId('')
     setMessages([])
     setCurrentRun(null)
+    setSelectedModelConfigId(null)
     setError('')
+    setReplayError('')
+    setReplayLoading(false)
   }
 
   async function handleApproval(approvalId: number, approved: boolean) {
@@ -761,15 +862,15 @@ export function AgentChatPanel({
         : await agent.rejectRunApproval(approvalId, { decision: 'rejected' })) as Record<string, unknown>
 
       const runId = result?.run_id as number | undefined
-      const resumeUrl = result?.resume_stream_url as string | undefined
 
-      // 2. Close current stream and open resume stream
-      if (runId && resumeUrl) {
+      // 2. Resume the background task and reconnect to the same ledger.
+      if (runId) {
         streamRef.current?.close()
         setRunning(true)
 
         let resumeContent = ''
-        streamRef.current = agent.createRunResumeStream(runId, {
+        streamRef.current = agent.agentLedgerClient.resumeAndTail(runId, {
+          onNetworkStatus: handleNetworkStatus,
           onMessage: (message) => {
             const parsed = parseEvent(message.data)
             if (!parsed) return
@@ -803,7 +904,7 @@ export function AgentChatPanel({
                     ...item,
                     status: 'streaming',
                     content: resumeContent,
-                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    trace_events: appendTraceEvent(item.trace_events, parsed),
                   }
                 }
 
@@ -813,7 +914,7 @@ export function AgentChatPanel({
                     ...item,
                     status: 'completed',
                     content: finalAnswer || resumeContent,
-                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    trace_events: appendTraceEvent(item.trace_events, parsed),
                   }
                 }
 
@@ -827,7 +928,7 @@ export function AgentChatPanel({
                       ...item,
                       status: 'cancelled',
                       content: '该审批所属的会话或运行已经不存在，无法继续执行。',
-                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                      trace_events: appendTraceEvent(item.trace_events, parsed),
                     }
                   }
 
@@ -840,14 +941,14 @@ export function AgentChatPanel({
                   )
                   if (hasApprovalGranted && hasToolEvent && failText.toLowerCase().includes('approval_required')) {
                     console.warn('[AgentChatPanel] Suppressed spurious run_failed after approval+tool', failText)
-                    return { ...item, status: item.status, trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT) }
+                    return { ...item, status: item.status, trace_events: appendTraceEvent(item.trace_events, parsed) }
                   }
 
                   return {
                     ...item,
                     status: 'failed',
                     content: failText,
-                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    trace_events: appendTraceEvent(item.trace_events, parsed),
                   }
                 }
 
@@ -855,7 +956,7 @@ export function AgentChatPanel({
                 return {
                   ...item,
                   status: item.status === 'waiting_approval' ? 'resuming' : item.status,
-                  trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                  trace_events: appendTraceEvent(item.trace_events, parsed),
                 }
               })
             )
@@ -872,14 +973,11 @@ export function AgentChatPanel({
           },
         })
       } else {
-        // Fallback: just update local state
+        // The approval response is authoritative even when no resume stream is needed.
         setMessages((items) =>
           items.map((message) =>
             message.role === 'assistant' && message.status === 'waiting_approval'
-              ? {
-                  ...message,
-                  trace_events: [...(message.trace_events || []), { event_type: approved ? 'approval_approved' : 'approval_rejected', payload: { approval_id: approvalId } }],
-                }
+              ? { ...message, status: approved ? 'resuming' : 'cancelled' }
               : message
           )
         )
@@ -897,7 +995,6 @@ export function AgentChatPanel({
                   ...message,
                   status: 'cancelled',
                   content: '该审批所属的会话或运行已经不存在，无法继续执行。',
-                  trace_events: [...(message.trace_events || []), { event_type: 'approval_context_gone', payload: { approval_id: approvalId, approved } }],
                 }
               : message
           )
@@ -986,11 +1083,13 @@ export function AgentChatPanel({
     let liveRunId: number | undefined
     let liveAssistantMessageId = localAssistant.message_id
 
-    streamRef.current = agent.createRunLiveStream(
+    streamRef.current = agent.agentLedgerClient.startAndTail(
       {
+        onNetworkStatus: handleNetworkStatus,
         user_input: effectiveInput,
         input: effectiveInput,
         conversation_id: activeConversationId || undefined,
+        model_config_id: selectedModelConfigId,
         source,
         page_context: pageContext,
         auto_skill: true,
@@ -1044,7 +1143,7 @@ export function AgentChatPanel({
                     return {
                       ...assistantMessage,
                       content: fallbackContent || getUserVisibleMessageContent(response as unknown as { content?: unknown }),
-                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                      trace_events: appendTraceEvent(item.trace_events, parsed),
                     }
                   }
                   // Prevent short final answer from overwriting longer streamed content
@@ -1052,14 +1151,14 @@ export function AgentChatPanel({
                     return {
                       ...assistantMessage,
                       content: streamedContent,
-                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                      trace_events: appendTraceEvent(item.trace_events, parsed),
                     }
                   }
                   const finalContent = streamedContent.trim() ? streamedContent : fallbackContent
                   return {
                     ...assistantMessage,
                     content: finalContent,
-                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    trace_events: appendTraceEvent(item.trace_events, parsed),
                   }
                 }
                 return item
@@ -1106,7 +1205,7 @@ export function AgentChatPanel({
                       run_id: liveRunId || item.run_id,
                       status: 'streaming',
                       content: candidateContent,
-                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                      trace_events: appendTraceEvent(item.trace_events, parsed),
                     }
                   }
                   return item
@@ -1133,7 +1232,7 @@ export function AgentChatPanel({
                       run_id: liveRunId || item.run_id,
                       status: 'completed',
                       content: completedAnswer || item.content,
-                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                      trace_events: appendTraceEvent(item.trace_events, parsed),
                     }
                   : item
               )
@@ -1146,7 +1245,7 @@ export function AgentChatPanel({
             setMessages((items) =>
               items.map((item) =>
                 item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
-                  ? { ...item, status: 'failed', content: failedText, error_message: failedText, trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT) }
+                  ? { ...item, status: 'failed', content: failedText, error_message: failedText, trace_events: appendTraceEvent(item.trace_events, parsed) }
                   : item
               )
             )
@@ -1183,7 +1282,7 @@ export function AgentChatPanel({
                         approval_id: payload.approval_id,
                         approval_payload: payload,
                       },
-                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                      trace_events: appendTraceEvent(item.trace_events, parsed),
                     }
                   : item
               )
@@ -1198,7 +1297,7 @@ export function AgentChatPanel({
                   ? {
                       ...item,
                       status: 'waiting_approval',
-                      trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                      trace_events: appendTraceEvent(item.trace_events, parsed),
                     }
                   : item
               )
@@ -1215,7 +1314,7 @@ export function AgentChatPanel({
                     ...item,
                     run_id: liveRunId || item.run_id,
                     status: (item.status === 'completed' || item.status === 'streaming' || item.status === 'waiting_approval') ? item.status : 'thinking',
-                    trace_events: [...(item.trace_events || []), parsed].slice(-LIVE_TRACE_LIMIT),
+                    trace_events: appendTraceEvent(item.trace_events, parsed),
                   }
                 : item
             )
@@ -1247,7 +1346,7 @@ export function AgentChatPanel({
     attachments.length > 0 && uploadedAttachmentsForSend.length === 0 && !hasText
 
   const canSend =
-    !running && !hasUploading && (hasText || hasUploadedForSend) && !hasFailedOnly
+    !running && !hasUploading && Boolean(selectedModelConfigId) && (hasText || hasUploadedForSend) && !hasFailedOnly
 
   const composer = (
     <form
@@ -1372,6 +1471,7 @@ export function AgentChatPanel({
           <span>{text(locale, zh.research, 'Research')}</span>
           <span>{text(locale, zh.artifact, 'Artifact')}</span>
           <span>{text(locale, zh.skillDraft, 'Skill')}</span>
+          <ModelSelector value={selectedModelConfigId} onChange={setSelectedModelConfigId} disabled={running} />
         </div>
         <button
           className={canSend ? 'send-button active' : 'send-button'}
@@ -1397,6 +1497,12 @@ export function AgentChatPanel({
           <div className="chat-workspace">
             <div className="chat-scroll">
               <div className="message-list">
+                {replayLoading ? (
+                  <div className="replay-notice" role="status">
+                    {text(locale, '正在从事件账本恢复运行记录…', 'Restoring run history from the event ledger…')}
+                  </div>
+                ) : null}
+                {replayError ? <div className="replay-notice error" role="alert">{replayError}</div> : null}
                 {messages.map((message) => (
                   <AgentMessageItem
                     message={message}

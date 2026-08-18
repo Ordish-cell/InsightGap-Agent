@@ -68,7 +68,8 @@ async def research_card(card_id: int, payload: dict | None = None, user_id: int 
         result = research_service.create_research_run(db, user_id, request, feed_card=feed_card)
         return ok(result)
     except ValueError as exc:
-        return fail("FEED_RESEARCH_FAILED", str(exc))
+        code = "model_setup_required" if str(exc) == "model_setup_required" else "FEED_RESEARCH_FAILED"
+        return fail(code, str(exc))
 
 
 @router.get("/sources")

@@ -57,12 +57,6 @@ function truncate(value: unknown, limit = 520): string {
   return raw.length > limit ? `${raw.slice(0, limit)}...` : raw
 }
 
-function thoughtText(value: unknown) {
-  if (typeof value === 'string') return value
-  const item = asRecord(value)
-  return String(item.text || item.summary || item.detail || '').trim()
-}
-
 function getToolCallId(event: AgentEvent, index: number) {
   const payload = asRecord(event.payload)
   return String(
@@ -86,55 +80,6 @@ function pushItem(items: ActivityItem[], item: ActivityItem) {
   const previous = items[items.length - 1]
   if (previous?.kind === item.kind && previous.text === textValue && previous.status === item.status) return
   items.push({ ...item, text: textValue })
-}
-
-function collectFallbackItems(message: AgentThoughtStreamProps['message']) {
-  const items: ActivityItem[] = []
-  const metadata = asRecord(message.metadata)
-  const finalResponse = asRecord(metadata.final_response)
-  const langgraphstatus = asRecord(message.langgraphstatus)
-  // Only use langgraphstatus.steps as the canonical fallback source.
-  // The other sources (pipeline_steps, visible_thoughts, etc.) overlap and
-  // cause duplicate entries when rendered alongside live trace_events.
-  const canonicalSteps = langgraphstatus.steps
-  if (Array.isArray(canonicalSteps)) {
-    canonicalSteps.forEach((entry, index) => {
-      const record = asRecord(entry)
-      const value = record.detail || record.summary || record.text || record.title || record.thought || thoughtText(entry)
-      pushItem(items, {
-        id: `fallback-${index}`,
-        kind: 'progress',
-        text: String(value || ''),
-        status: String(record.status || 'completed'),
-      })
-    })
-  }
-  // Fallback to visible_thoughts only when no steps at all
-  if (!items.length) {
-    const sources = [
-      finalResponse.pipeline_steps,
-      finalResponse.visible_thoughts,
-      metadata.pipeline_steps,
-      metadata.visible_thoughts,
-      langgraphstatus.visible_thoughts,
-      (message as unknown as UnknownRecord).visible_thoughts,
-    ]
-    sources.forEach((source, sourceIndex) => {
-      if (Array.isArray(source)) {
-        source.forEach((entry, index) => {
-          const record = asRecord(entry)
-          const value = record.detail || record.summary || record.text || record.title || thoughtText(entry)
-          pushItem(items, {
-            id: `fallback-${sourceIndex}-${index}`,
-            kind: 'progress',
-            text: String(value || ''),
-            status: String(record.status || 'completed'),
-          })
-        })
-      }
-    })
-  }
-  return items
 }
 
 function toolArgs(payload: UnknownRecord): UnknownRecord {
@@ -433,10 +378,6 @@ function collectActivityTrace(message: AgentThoughtStreamProps['message'], local
       })
     }
   })
-
-  if (!items.length) {
-    collectFallbackItems(message).forEach((item) => pushItem(items, item))
-  }
 
   if (sawDone) {
     items.forEach((item) => {

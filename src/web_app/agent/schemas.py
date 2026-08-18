@@ -7,6 +7,7 @@ class AgentRunRequest(BaseModel):
     user_input: str = ""
     input: str | None = None
     conversation_id: str | None = None
+    model_config_id: int | None = None
     mode: str = "react"
     run_type: str = "agent_runtime"
     route: Literal["research", "rag", "artifact", "skill", "memory", "tool"] | None = None

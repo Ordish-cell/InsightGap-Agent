@@ -66,7 +66,6 @@ class RuntimeNodes(
             "workflow",
             "agent_llm_supervisor_enabled",
             "agent_llm_supervisor_mode",
-            "agent_llm_supervisor_model",
             "agent_llm_supervisor_temperature",
             "agent_llm_supervisor_timeout_seconds",
         ):

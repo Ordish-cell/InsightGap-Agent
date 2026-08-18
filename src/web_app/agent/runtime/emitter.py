@@ -1,19 +1,18 @@
 """Unified RuntimeEventEmitter — single source of truth for all SSE events.
 
 Every runtime node uses this emitter to produce events with consistent:
-- run_id, conversation_id, message_id, event_seq, display_channel, created_at
+- run_id, conversation_id, message_id, display_channel, created_at
 - DB persistence via record_event
 - SSE queue push via queue_stream_event
 """
 
-import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
-from src.web_app.agent.runtime.checkpoint import record_event
+from src.web_app.agent.runtime.event_ledger import publish_event
 from src.web_app.agent.runtime.events import DISPLAY_CHANNEL_THINKING, DISPLAY_CHANNEL_ANSWER, DISPLAY_CHANNEL_TOOL, DISPLAY_CHANNEL_STATUS, queue_stream_event
 
 logger = logging.getLogger(__name__)
@@ -22,8 +21,8 @@ logger = logging.getLogger(__name__)
 class RuntimeEventEmitter:
     """Centralised event emitter used by all runtime nodes.
 
-    Each run gets one emitter.  The emitter auto-increments event_seq and
-    attaches run_id/conversation_id/message_id/created_at to every event.
+    Each run gets one emitter. Persisted events receive their authoritative
+    sequence from the event ledger before they are projected to SSE.
 
     Usage inside a node::
 
@@ -37,7 +36,6 @@ class RuntimeEventEmitter:
         self.db = db
         self._state = state
         self._stream_queue = stream_queue
-        self._seq = state.setdefault("_event_seq", 0)
 
     # ── helpers ──────────────────────────────────────────────────
 
@@ -61,11 +59,6 @@ class RuntimeEventEmitter:
     def message_id(self) -> str:
         return self._state.get("message_id", "")
 
-    def _next_seq(self) -> int:
-        self._seq += 1
-        self._state["_event_seq"] = self._seq
-        return self._seq
-
     def _queue(self) -> Any:
         return self._stream_queue or self._state.get("_stream_queue")
 
@@ -81,7 +74,6 @@ class RuntimeEventEmitter:
         node_name: str = "",
     ) -> None:
         """Emit a single event to SSE queue and optionally persist to DB."""
-        seq = self._next_seq()
         run_id = self.run_id
         thread_id = self.thread_id
         user_id = self.user_id
@@ -91,11 +83,26 @@ class RuntimeEventEmitter:
             "run_id": run_id,
             "conversation_id": self.conversation_id,
             "message_id": self.message_id,
-            "event_seq": seq,
             "display_channel": display_channel,
             "created_at": now,
             **payload,
         }
+
+        if persist and self.db and run_id:
+            try:
+                publish_event(
+                    self.db,
+                    self._queue(),
+                    run_id,
+                    event_type,
+                    full_payload,
+                    node_name=node_name,
+                    user_id=user_id,
+                    thread_id=thread_id,
+                )
+            except Exception:
+                logger.exception("emit: persist failed event_type=%s run_id=%s", event_type, run_id)
+            return
 
         queue = self._queue()
         if queue:
@@ -107,21 +114,6 @@ class RuntimeEventEmitter:
                 thread_id=thread_id,
                 node_name=node_name,
             )
-            await asyncio.sleep(0)
-
-        if persist and self.db and run_id:
-            try:
-                record_event(
-                    self.db,
-                    run_id,
-                    event_type,
-                    full_payload,
-                    node_name=node_name,
-                    user_id=user_id,
-                    thread_id=thread_id,
-                )
-            except Exception:
-                logger.exception("emit: persist failed event_type=%s run_id=%s", event_type, run_id)
 
     async def thought(self, text: str, *, node_name: str = "", status: str = "streaming") -> None:
         """Emit a visible_thought_delta line."""

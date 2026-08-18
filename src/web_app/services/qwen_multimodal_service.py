@@ -5,8 +5,6 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from src.web_app.agent.llm.config import get_llm_settings
-from src.web_app.agent.llm.factory import _cached_chat_model
 from src.web_app.core.config import settings
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB per image for base64 encoding
@@ -39,18 +37,15 @@ class QwenMultimodalService:
         """Generate structured internal context for RAG / attachment_context injection."""
         if not images:
             return ""
-        llm_settings = get_llm_settings()
         vision_model = model or _get_vision_model()
         truncated = self._truncate_images(images)
         message_content = self._build_image_message_content(prompt, truncated)
 
         try:
-            chat_model = _cached_chat_model(
-                provider=llm_settings.provider, model=vision_model,
-                base_url=llm_settings.effective_base_url, api_key=llm_settings.effective_api_key,
-                timeout=llm_settings.timeout_seconds, max_retries=llm_settings.max_retries,
-                temperature=0.3, enabled=llm_settings.enabled, streaming=False,
-            )
+            from langchain_openai import ChatOpenAI
+            if not settings.qwen_vision_api_key:
+                raise ValueError("QWEN_VISION_API_KEY is not configured")
+            chat_model = ChatOpenAI(model=vision_model, base_url=settings.qwen_vision_base_url, api_key=settings.qwen_vision_api_key, timeout=settings.llm_timeout_seconds, max_retries=settings.llm_max_retries, temperature=0.3)
         except Exception as exc:
             logger.exception("Failed to create vision chat model")
             return f"[Image understanding unavailable: {exc}]"
@@ -84,7 +79,6 @@ class QwenMultimodalService:
         """User-facing natural language answer — no internal context markers."""
         if not images:
             return "没有可分析的图片。"
-        llm_settings = get_llm_settings()
         vision_model = model or _get_vision_model()
         truncated = self._truncate_images(images)
 
@@ -110,12 +104,10 @@ class QwenMultimodalService:
         message_content = self._build_image_message_content(final_prompt, truncated)
 
         try:
-            chat_model = _cached_chat_model(
-                provider=llm_settings.provider, model=vision_model,
-                base_url=llm_settings.effective_base_url, api_key=llm_settings.effective_api_key,
-                timeout=llm_settings.timeout_seconds, max_retries=llm_settings.max_retries,
-                temperature=0.3, enabled=llm_settings.enabled, streaming=False,
-            )
+            from langchain_openai import ChatOpenAI
+            if not settings.qwen_vision_api_key:
+                raise ValueError("QWEN_VISION_API_KEY is not configured")
+            chat_model = ChatOpenAI(model=vision_model, base_url=settings.qwen_vision_base_url, api_key=settings.qwen_vision_api_key, timeout=settings.llm_timeout_seconds, max_retries=settings.llm_max_retries, temperature=0.3)
         except Exception as exc:
             logger.exception("Failed to create vision chat model")
             return f"视觉模型不可用：{exc}"

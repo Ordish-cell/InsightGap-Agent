@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field
 
 class ResearchRequest(BaseModel):
     query: str | None = None
+    model_config_id: int | None = None
     depth: Literal["quick", "standard", "deep"] = "standard"
     source: Literal["manual", "feed_card"] = "manual"
     feed_card_id: int | None = None

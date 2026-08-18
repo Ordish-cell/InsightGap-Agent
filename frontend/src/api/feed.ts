@@ -5,7 +5,7 @@ import type { FeedCard } from './types'
 export const refresh = () => apiRequest<unknown>('/feed/refresh', { method: 'POST' })
 export const listCards = async (params?: Record<string, unknown>) => normalizeList<FeedCard>(await apiRequest<unknown>('/feed/cards', { query: params as Record<string, string> })).map(normalizeFeedCard)
 export const homeCards = async () => {
-  const result = await apiRequest<{ cards?: FeedCard[]; is_complete?: boolean; error?: string; message?: string }>('/feed/home')
+  const result = await apiRequest<{ cards?: FeedCard[]; is_complete?: boolean; error?: string; message?: string; refresh_result?: Record<string, unknown> }>('/feed/home')
   return { ...result, cards: (result.cards || []).map(normalizeFeedCard) }
 }
 export const getCard = async (cardId: number | string) => normalizeFeedCard(await apiRequest<FeedCard>(`/feed/cards/${cardId}`))
