@@ -54,11 +54,9 @@ def test_fast_trace_has_no_slow_path_hints():
 
 
 def test_latency_trace_event_payload_excludes_final_answer_text(monkeypatch):
-    persisted = []
-    queued = []
+    published = []
 
-    monkeypatch.setattr(agent_service, "record_event", lambda *args, **kwargs: persisted.append((args, kwargs)))
-    monkeypatch.setattr(agent_service, "_queue_stream_event", lambda *args, **kwargs: queued.append((args, kwargs)))
+    monkeypatch.setattr(agent_service, "publish_event", lambda *args, **kwargs: published.append((args, kwargs)))
 
     state = {
         "answer": "secret answer",
@@ -71,27 +69,30 @@ def test_latency_trace_event_payload_excludes_final_answer_text(monkeypatch):
 
     agent_service._emit_runtime_latency_trace_event(make_test_session(), None, 1, "t", 1, state)
 
-    assert persisted[0][0][2] == "runtime_latency_trace"
-    payload = persisted[0][0][3]
+    assert published[0][0][3] == "runtime_latency_trace"
+    payload = published[0][0][4]
     assert payload == {
         "runtime_latency_trace": {"mode": "runtime_latency_trace"},
         "runtime_latency_warnings": ["parallel_read_warnings_present"],
         "runtime_slow_path_hints": ["rag_prepare_no_evidence"],
     }
     assert "secret answer" not in str(payload)
-    assert queued[0][0][1] == "runtime_latency_trace"
 
 
 def test_agent_service_emits_latency_trace_before_terminal_run_events():
-    source = inspect.getsource(agent_service.run_agent_async)
+    source = inspect.getsource(agent_service.execute_prepared_run)
     trace_call = '_emit_runtime_latency_trace_event(db, stream_queue, run.id, thread_id, user_id, state)'
     trace_index = source.index(trace_call)
-    assert trace_index < source.index('record_event(db, run.id, "run_failed"', trace_index)
-    assert trace_index < source.index('record_event(db, run.id, "run_completed"', trace_index)
-    assert trace_index < source.index('_queue_stream_event(stream_queue, "run_paused"', trace_index)
+    assert trace_index < source.index('publish_event(db, stream_queue, run.id, "run_failed"', trace_index)
+    assert trace_index < source.index('publish_event(db, stream_queue, run.id, "run_completed"', trace_index)
+    assert trace_index < source.index('publish_event(db, stream_queue, run.id, "run_paused"', trace_index)
 
 
 def test_resume_path_emits_latency_trace_before_run_completed():
-    source = inspect.getsource(agent_service.resume_run_after_approval)
+    module_source = inspect.getsource(agent_service)
+    source = module_source[
+        module_source.index("async def resume_run_after_approval"):
+        module_source.index("def get_run")
+    ]
     trace_call = '_emit_runtime_latency_trace_event(db, stream_queue, run_id, thread_id, user_id, state)'
-    assert source.index(trace_call) < source.index('record_event(db, run_id, "run_completed"')
+    assert source.index(trace_call) < source.index('publish_event(db, stream_queue, run_id, "run_completed"')

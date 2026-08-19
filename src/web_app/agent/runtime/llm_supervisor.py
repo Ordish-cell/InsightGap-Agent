@@ -12,7 +12,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from src.web_app.agent.llm.factory import get_chat_model, get_chat_model_by_name
+from src.web_app.agent.llm.factory import get_chat_model
 from src.web_app.agent.runtime.llm_supervisor_prompts import (
     WEB_APP_LLM_SUPERVISOR_SYSTEM_PROMPT,
 )
@@ -117,7 +117,6 @@ class NormalizedSupervisorRouteDecision(BaseModel):
 class LLMSupervisorSettings(BaseModel):
     enabled: bool
     mode: SupervisorMode
-    model: str
     temperature: float
     timeout_seconds: int
 
@@ -176,7 +175,7 @@ async def llm_supervisor_route_node(
     print(f"[LLM_SUPERVISOR_TRACE] final_decision route={normalized.route} fallback={normalized.fallback} errors={normalized.validation_errors}")
     if raw_output is not None:
         normalized.raw_decision = raw_output
-    normalized.metadata.setdefault("model", settings.model or "default:planner")
+    normalized.metadata.setdefault("model", "run_selected_model")
     normalized.metadata.setdefault("mode", settings.mode)
     return apply_supervisor_route_plan(state, normalized, mode=settings.mode)
 
@@ -205,11 +204,6 @@ def resolve_llm_supervisor_settings(config: dict[str, Any] | None = None) -> LLM
     return LLMSupervisorSettings(
         enabled=enabled,
         mode=mode,  # type: ignore[arg-type]
-        model=str(
-            configurable.get("agent_llm_supervisor_model")
-            or getattr(app_settings, "agent_llm_supervisor_model", "")
-            or ""
-        ),
         temperature=float(
             configurable.get("agent_llm_supervisor_temperature")
             if configurable.get("agent_llm_supervisor_temperature") is not None
@@ -458,14 +452,7 @@ async def _invoke_llm_supervisor(
     planner_route: list[Any],
 ) -> LLMSupervisorRouteDecision:
     prompt = _build_user_prompt(state, available_nodes=available_nodes, planner_route=planner_route)
-    if settings.model:
-        model = get_chat_model_by_name(
-            settings.model,
-            temperature=settings.temperature,
-            timeout_seconds=settings.timeout_seconds,
-        )
-    else:
-        model = get_chat_model("planner", complexity="low", temperature=settings.temperature)
+    model = get_chat_model("planner", complexity="low", temperature=settings.temperature)
 
     async def _call() -> LLMSupervisorRouteDecision:
         if hasattr(model, "with_structured_output"):

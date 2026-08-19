@@ -150,6 +150,61 @@ export interface AgentRun {
   [key: string]: unknown
 }
 
+export type LlmProtocol = 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages' | 'google_generate_content' | 'ollama_chat'
+
+export interface LlmProviderField {
+  key: string
+  label: string
+  kind: 'text' | 'secret' | 'secret_json' | 'select' | 'url' | 'json'
+  required: boolean
+  default?: unknown
+  options?: Array<{ label: string; value: string }>
+  placeholder?: string
+}
+
+export interface LlmPresetModel {
+  model_id: string
+  display_name: string
+  tier: 'strong' | 'balanced' | 'fast'
+  capabilities?: Record<string, boolean>
+}
+
+export interface LlmProviderDefinition {
+  key: string
+  label: string
+  protocol: LlmProtocol
+  protocols: LlmProtocol[]
+  fields: LlmProviderField[]
+  models: LlmPresetModel[]
+  discovery: string
+  capabilities: Record<string, boolean>
+}
+
+export interface LlmModelConfig {
+  id: number
+  connection_id: number
+  model_id: string
+  display_name: string
+  source: 'preset' | 'discovered' | 'manual'
+  capabilities: Record<string, boolean>
+  enabled: boolean
+}
+
+export interface LlmConnection {
+  id: number
+  provider: string
+  protocol: LlmProtocol
+  display_name: string
+  fields: Record<string, unknown>
+  secrets: Record<string, { configured: boolean; masked: string }>
+  revision: number
+  status: 'draft' | 'active' | 'deleted'
+  last_test_status: 'untested' | 'passed' | 'failed'
+  last_test_error?: string
+  last_tested_at?: string | null
+  models: LlmModelConfig[]
+}
+
 export interface AgentConversation {
   id?: number
   conversation_id: string
@@ -232,6 +287,8 @@ export interface AgentStep {
 
 export interface AgentEvent {
   id?: number
+  event_seq?: number
+  schema_version?: number
   run_id?: number
   thread_id?: string
   event_type?: string
@@ -241,6 +298,15 @@ export interface AgentEvent {
   payload?: UnknownRecord
   created_at?: string
   [key: string]: unknown
+}
+
+export interface AgentReplayPage {
+  run_id: number
+  events: AgentEvent[]
+  after_seq: number
+  next_seq: number
+  until_seq: number
+  has_more: boolean
 }
 
 export type AgentTraceEventType =

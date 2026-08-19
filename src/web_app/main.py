@@ -62,6 +62,13 @@ async def startup_health_checks():
     _launch_cleanup_scheduler()
 
 
+@app.on_event("shutdown")
+async def shutdown_agent_runs():
+    from src.web_app.services.agent_run_task_manager import agent_run_task_manager
+
+    await agent_run_task_manager.shutdown()
+
+
 def _launch_cleanup_scheduler() -> None:
     """Start a background asyncio task for periodic checkpoint / approval cleanup."""
     enabled = getattr(settings, "agent_checkpoint_cleanup_enabled", True)

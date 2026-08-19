@@ -1,4 +1,6 @@
-export function PageHeader({ title, description, actions }: { title: string; description?: string; actions?: React.ReactNode }) {
+import type { ReactNode } from 'react'
+
+export function PageHeader({ title, description, actions }: { title: string; description?: ReactNode; actions?: ReactNode }) {
   return (
     <div className="page-header">
       <div>

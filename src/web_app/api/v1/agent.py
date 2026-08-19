@@ -1,10 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from src.web_app.agent.runtime.events import to_sse
+from src.web_app.agent.runtime.ledger_stream import stream_ledger_events
 from src.web_app.agent.schemas import AgentRunRequest
 from src.web_app.db.session import get_db
+from src.web_app.db.session import SessionLocal
+from src.web_app.db.repositories.agent_repository import AgentEventRepository, AgentRunRepository
 from src.web_app.schemas.common import ok
 from src.web_app.services.agent_service import (
     PendingApprovalExistsError,
@@ -16,45 +18,37 @@ from src.web_app.services.agent_service import (
     get_run as get_run_data,
     hard_delete_conversation,
     list_conversations,
-    list_events,
     list_steps,
+    prepare_agent_run,
+    replay_events,
     run_agent_async,
-    stream_agent_run,
-    stream_resume_run,
     update_conversation,
 )
+from src.web_app.services.agent_run_task_manager import agent_run_task_manager
 from src.web_app.services.approval_service import update_approval_status
 from src.web_app.services.auth_service import get_current_user_id
+from src.web_app.services.llm_registry_service import ModelSetupError
 
 router = APIRouter()
 
 
-@router.post("/run")
-async def run_agent_legacy(payload: dict, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    return ok(await run_agent_async(db, user_id, payload))
-
-
 @router.post("/runs")
 async def create_run(payload: AgentRunRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    return ok(await run_agent_async(db, user_id, payload.model_dump()))
+    try:
+        return ok(await run_agent_async(db, user_id, payload.model_dump()))
+    except ModelSetupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
-@router.post("/runs/stream")
-async def create_run_stream(payload: AgentRunRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    async def events():
-        async for event in stream_agent_run(db, user_id, payload.model_dump()):
-            for chunk in to_sse([event]):
-                yield chunk
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+@router.post("/runs/start", status_code=202)
+async def start_run(payload: AgentRunRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    request_payload = payload.model_dump()
+    try:
+        prepared = prepare_agent_run(db, user_id, request_payload)
+    except ModelSetupError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    agent_run_task_manager.start(prepared["run_id"], user_id, payload=request_payload)
+    return ok(prepared)
 
 
 @router.post("/conversations")
@@ -141,30 +135,40 @@ def get_steps(run_id: int, user_id: int = Depends(get_current_user_id), db: Sess
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.get("/runs/{run_id}/stream")
-def stream_run(run_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    def events():
-        yield from to_sse([{"event": "status", "data": {"run_id": run_id, "status": get_run_data(db, user_id, run_id)["status"]}}])
-        yield from to_sse(list_events(db, user_id, run_id))
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
 @router.get("/runs/{run_id}/events")
-def run_events(run_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    def events():
-        yield from to_sse(list_events(db, user_id, run_id))
+def run_events(
+    run_id: int,
+    after_seq: int = Query(0, ge=0),
+    until_seq: int | None = Query(None, ge=0),
+    limit: int = Query(200, ge=1, le=500),
+    event_type: str | None = None,
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    try:
+        return ok(replay_events(db, user_id, run_id, after_seq=after_seq, until_seq=until_seq, limit=limit, event_type=event_type))
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/runs/{run_id}/events/stream")
+def run_events_stream(
+    run_id: int,
+    after_seq: int | None = Query(None, ge=0),
+    last_event_id: str | None = Header(None, alias="Last-Event-ID"),
+    user_id: int = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    if not AgentRunRepository(db).get_by_user(user_id, run_id):
+        raise HTTPException(status_code=404, detail="AgentRun not found")
+    try:
+        header_cursor = max(0, int(last_event_id or 0))
+    except ValueError:
+        header_cursor = 0
+    cursor = after_seq if after_seq is not None else header_cursor
 
     return StreamingResponse(
-        events(),
+        stream_ledger_events(SessionLocal, user_id, run_id, after_seq=cursor),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
@@ -196,22 +200,12 @@ def reject_agent_approval(approval_id: int, payload: dict | None = None, user_id
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-@router.post("/runs/{run_id}/resume/stream")
-async def resume_run_stream(run_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    """Resume a paused run after approval and stream subsequent events."""
-    from src.web_app.agent.runtime.events import to_sse as sse_encode
-
-    async def events():
-        async for event in stream_resume_run(db, user_id, run_id):
-            for chunk in sse_encode([event]):
-                yield chunk
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+@router.post("/runs/{run_id}/resume", status_code=202)
+async def resume_run(run_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    run = AgentRunRepository(db).get_by_user(user_id, run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="AgentRun not found")
+    if run.status not in {"waiting_approval", "paused", "resuming"}:
+        raise HTTPException(status_code=409, detail=f"Run is not resumable (status={run.status})")
+    started = agent_run_task_manager.start(run_id, user_id, resume=True)
+    return ok({"run_id": run_id, "started": started, "last_event_seq": AgentEventRepository(db).max_seq(user_id, run_id)})

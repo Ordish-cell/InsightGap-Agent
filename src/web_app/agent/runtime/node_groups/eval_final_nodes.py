@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from src.web_app.agent.runtime.node_groups.base import *
 from src.web_app.agent.runtime.contracts import build_runtime_contract_report
+from src.web_app.agent.runtime.event_ledger import publish_event
 from src.web_app.agent.runtime.latency import build_runtime_latency_trace
 from src.web_app.agent.runtime.replanner import (
     build_replanner_candidate_plan,
@@ -666,8 +667,6 @@ class EvalFinalNodesMixin:
         if not get_llm_settings().enabled:
             return self._fallback_final_answer(state, draft_answer)
 
-        from src.web_app.agent.runtime.events import queue_stream_event  # noqa: F811
-
         resolution = resolve_model_name("final")
         prompt = self._build_final_answer_prompt(state, draft_answer)
         started = time.perf_counter()
@@ -678,11 +677,8 @@ class EvalFinalNodesMixin:
         queue = getattr(self, "_stream_queue", None) or state.get("_stream_queue")
         try:
             model = get_chat_model("final", temperature=0.35, streaming=True)
-            # Emit answer_started (SSE + DB)
-            if queue:
-                queue_stream_event(queue, "answer_started", {}, run_id=run_id, thread_id=thread_id, node_name="final_response")
-            record_event(
-                self.db, run_id, "answer_started", {},
+            publish_event(
+                self.db, queue, run_id, "answer_started", {},
                 node_name="final_response", user_id=user_id, thread_id=thread_id,
             )
             state["_answer_started_emitted"] = True
@@ -694,13 +690,11 @@ class EvalFinalNodesMixin:
                     continue
                 full_answer += content
                 chunk_index += 1
-                # Push to SSE only — do NOT persist each token to agent_events
-                if queue:
-                    queue_stream_event(
-                        queue, "answer_delta",
-                        {"text": content, "index": chunk_index},
-                        run_id=run_id, thread_id=thread_id, node_name="final_response",
-                    )
+                publish_event(
+                    self.db, queue, run_id, "answer_delta",
+                    {"text": content, "index": chunk_index},
+                    user_id=user_id, thread_id=thread_id, node_name="final_response",
+                )
 
             full_answer = full_answer.strip()
             # ── Guard: detect if LLM output internal JSON despite prompt ──
@@ -708,12 +702,11 @@ class EvalFinalNodesMixin:
                 extracted = self._extract_text_from_json_output(full_answer)
                 if extracted:
                     # Replace the streamed JSON with the extracted text
-                    if queue:
-                        queue_stream_event(
-                            queue, "answer_completed",
-                            {"answer": extracted, "status": "corrected"},
-                            run_id=run_id, thread_id=thread_id, node_name="final_response",
-                        )
+                    publish_event(
+                        self.db, queue, run_id, "answer_completed",
+                        {"answer": extracted, "status": "corrected"},
+                        user_id=user_id, thread_id=thread_id, node_name="final_response",
+                    )
                     record_event(
                         self.db, run_id, "answer_json_corrected",
                         {"original_len": len(full_answer), "extracted_len": len(extracted)},
@@ -739,14 +732,8 @@ class EvalFinalNodesMixin:
                 {"title": "生成最终回答", "summary": "已流式调用最终回复模型，把执行结果整理成用户可读回答。", "model": resolution.model},
                 node_name="final_response", user_id=user_id, thread_id=thread_id,
             )
-            # Emit answer_completed (SSE + DB)
-            if queue:
-                queue_stream_event(
-                    queue, "answer_completed", {"answer": full_answer},
-                    run_id=run_id, thread_id=thread_id, node_name="final_response",
-                )
-            record_event(
-                self.db, run_id, "answer_completed", {"answer": full_answer},
+            publish_event(
+                self.db, queue, run_id, "answer_completed", {"answer": full_answer},
                 node_name="final_response", user_id=user_id, thread_id=thread_id,
             )
             # Mark that streaming happened so agent_service fallback is skipped
@@ -766,15 +753,8 @@ class EvalFinalNodesMixin:
                 estimated_output_chars=len(full_answer),
                 metadata={"input_preview": user_input[:200], "streaming": True},
             )
-            # Emit partial answer_completed on error so SSE is not left hanging
-            if queue:
-                queue_stream_event(
-                    queue, "answer_completed",
-                    {"answer": full_answer, "status": "partial", "error": str(exc)},
-                    run_id=run_id, thread_id=thread_id, node_name="final_response",
-                )
-            record_event(
-                self.db, run_id, "answer_completed",
+            publish_event(
+                self.db, queue, run_id, "answer_completed",
                 {"answer": full_answer, "status": "partial", "error": str(exc)},
                 node_name="final_response", user_id=user_id, thread_id=thread_id,
             )

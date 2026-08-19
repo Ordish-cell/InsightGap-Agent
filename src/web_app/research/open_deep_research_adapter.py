@@ -96,25 +96,6 @@ class OpenDeepResearchAdapter:
                 "TAVILY_API_KEY is required when ODR_SEARCH_API=tavily"
             )
 
-    def _setup_env_for_upstream(self) -> None:
-        """Map DashScope credentials to the env vars the upstream expects.
-
-        The upstream ``Configuration`` reads ``OPENAI_API_KEY`` /
-        ``OPENAI_BASE_URL`` / ``TAVILY_API_KEY`` from the environment.
-        We inject them from our own settings so the user only needs to
-        configure credentials once.
-        """
-        dashscope_key = self._settings.dashscope_api_key or self._settings.aliyun_bailian_api_key or self._settings.agent_llm_api_key or ""
-        if dashscope_key:
-            os.environ["OPENAI_API_KEY"] = dashscope_key
-
-        dashscope_url = self._settings.dashscope_base_url or self._settings.aliyun_bailian_base_url or self._settings.agent_llm_base_url or ""
-        if dashscope_url:
-            os.environ["OPENAI_BASE_URL"] = dashscope_url
-
-        if self._settings.tavily_api_key:
-            os.environ["TAVILY_API_KEY"] = self._settings.tavily_api_key
-
     # Marker used to satisfy DashScope/Qwen JSON mode and later stripped
     # from the final report if it leaks through.
     #
@@ -150,10 +131,50 @@ class OpenDeepResearchAdapter:
         evidence: list[dict[str, Any]],
         depth: str,
     ) -> ResearchResult:
-        self._setup_env_for_upstream()
-
         from langchain_core.messages import HumanMessage, SystemMessage
         from open_deep_research.deep_researcher import deep_researcher
+        from src.web_app.agent.llm.context import get_model_context
+        from src.web_app.agent.llm.factory import normalize_model_endpoint
+
+        model_context = get_model_context()
+        provider_prefix = {
+            "anthropic_messages": "anthropic",
+            "google_generate_content": "google_genai",
+            "openai_chat_completions": "openai",
+            "openai_responses": "openai",
+            "ollama_chat": "openai",
+        }.get(model_context.protocol, "openai")
+        if model_context.provider == "azure_openai":
+            provider_prefix = "azure_openai"
+        model_spec = f"{provider_prefix}:{model_context.model}"
+        model_api_key = str(model_context.secrets.get("api_key") or "not-required")
+        model_base_url = normalize_model_endpoint(str(model_context.config.get("base_url") or ""), model_context.protocol)
+        if model_context.protocol == "ollama_chat" and model_base_url:
+            model_base_url = model_base_url.rstrip("/") + "/v1"
+        headers = dict(model_context.config.get("custom_headers") or {})
+        auth_header = str(model_context.config.get("auth_header") or "Authorization")
+        if model_context.provider == "custom" and auth_header != "Authorization" and model_api_key != "not-required":
+            headers[auth_header] = model_api_key
+            model_api_key = "not-required"
+        if model_context.provider == "openrouter":
+            if model_context.config.get("site_url"):
+                headers["HTTP-Referer"] = str(model_context.config["site_url"])
+            if model_context.config.get("app_name"):
+                headers["X-OpenRouter-Title"] = str(model_context.config["app_name"])
+        model_extra: dict[str, Any] = {}
+        if model_base_url:
+            model_extra["base_url"] = model_base_url
+        if model_context.provider == "azure_openai":
+            model_extra.update({
+                "azure_endpoint": model_context.config.get("endpoint"),
+                "azure_deployment": model_context.config.get("deployment") or model_context.model,
+                "api_version": model_context.config.get("api_version"),
+            })
+        if model_context.protocol == "openai_responses":
+            model_extra["use_responses_api"] = True
+        if headers:
+            header_key = "additional_headers" if model_context.protocol == "google_generate_content" else "default_headers"
+            model_extra[header_key] = headers
 
         thread_id = run_id or str(uuid4())
         config: dict[str, Any] = {
@@ -164,10 +185,13 @@ class OpenDeepResearchAdapter:
                 "max_concurrent_research_units": self._settings.odr_max_concurrent_research_units,
                 "max_researcher_iterations": self._settings.odr_max_researcher_iterations,
                 "max_react_tool_calls": self._settings.odr_max_react_tool_calls,
-                "research_model": self._settings.odr_research_model,
-                "summarization_model": self._settings.odr_summarization_model,
-                "compression_model": self._settings.odr_compression_model,
-                "final_report_model": self._settings.odr_final_report_model,
+                "research_model": model_spec,
+                "summarization_model": model_spec,
+                "compression_model": model_spec,
+                "final_report_model": model_spec,
+                "model_api_key": model_api_key,
+                "model_extra": model_extra,
+                "apiKeys": {"TAVILY_API_KEY": self._settings.tavily_api_key},
                 "research_model_max_tokens": self._settings.odr_research_model_max_tokens,
                 "summarization_model_max_tokens": self._settings.odr_summarization_model_max_tokens,
                 "compression_model_max_tokens": self._settings.odr_compression_model_max_tokens,
@@ -175,7 +199,6 @@ class OpenDeepResearchAdapter:
                 "max_content_length": self._settings.odr_max_content_length,
             }
         }
-
         # Include a SystemMessage with "json" so DashScope/Qwen
         # OpenAI-compatible endpoints satisfy the requirement that
         # messages contain "json" when response_format=json_object
@@ -203,7 +226,7 @@ class OpenDeepResearchAdapter:
             "[OpenDeepResearchAdapter] invoking graph run_id=%s thread_id=%s model=%s search_api=%s json_guard=true",
             run_id,
             thread_id,
-            self._settings.odr_research_model,
+            model_spec,
             self._settings.odr_search_api,
         )
 

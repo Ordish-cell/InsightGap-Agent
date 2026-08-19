@@ -55,14 +55,14 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
 def _embed_dashscope(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    api_key = settings.embed_api_key or settings.dashscope_api_key or settings.aliyun_bailian_api_key
+    api_key = settings.embed_api_key
     if not api_key:
         raise RuntimeError("DashScope embedding API key is not configured")
     model_info = get_embedding_model()
     model_name = model_info.get("model")
     if not model_name:
         raise RuntimeError("DashScope embedding model is not configured")
-    url = (settings.embed_base_url or settings.aliyun_bailian_base_url).rstrip("/") + "/embeddings"
+    url = settings.embed_base_url.rstrip("/") + "/embeddings"
     logger.info(
         "dashscope.embedding.request model=%s input_count=%s length_stats=%s previews=%s",
         model_name,
@@ -164,7 +164,7 @@ def _embed_dashscope_batch(
 def _sentence_model():
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer(settings.agent_embedding_model or settings.embed_model_name or "sentence-transformers/all-MiniLM-L6-v2")
+    return SentenceTransformer(settings.embed_model_name or "sentence-transformers/all-MiniLM-L6-v2")
 
 
 def _embed_sentence_transformers(texts: list[str]) -> list[list[float]]:

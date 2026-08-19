@@ -250,7 +250,7 @@ export function ResearchRunDetailPage() {
                     ) : (
                       String(s.title || `来源 ${i + 1}`)
                     )}
-                    {s.note && <span className="muted small"> — {String(s.note).slice(0, 200)}</span>}
+                    {Boolean(s.note) && <span className="muted small"> — {String(s.note).slice(0, 200)}</span>}
                   </li>
                 ))}
               </ul>

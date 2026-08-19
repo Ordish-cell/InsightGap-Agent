@@ -8,7 +8,7 @@ from src.web_app.agent.runtime.intent_llm import infer_home_intent_with_llm
 from src.web_app.agent.runtime.intent_schema import HomeIntentResult
 from src.web_app.db.repositories.agent_repository import LLMCallRepository
 from src.web_app.models.orm import AgentRun, FeedCard, InfoItem, User
-from src.web_app.services.agent_service import list_events, run_agent
+from src.web_app.services.agent_service import replay_events, run_agent
 from src.web_app.services.feed_service import list_home_cards
 from src.web_app.tests.db_test_utils import make_test_session
 
@@ -97,7 +97,8 @@ def test_home_intent_llm_success_logs_usage(monkeypatch):
     assert result.intent == "tool.email"
     assert result.risk_level == "L3"
     assert LLMCallRepository(db).list_by_run(user.id, run.id)[0].status == "completed"
-    assert any(event["event"] == "llm_call_completed" for event in list_events(db, user.id, run.id))
+    events = replay_events(db, user.id, run.id, limit=500)["events"]
+    assert any(event["event_type"] == "llm_call_completed" for event in events)
 
 
 def test_home_intent_llm_invalid_json_falls_back_in_runtime(monkeypatch):
@@ -111,10 +112,10 @@ def test_home_intent_llm_invalid_json_falls_back_in_runtime(monkeypatch):
     user = _user(db, "intent-invalid@example.com")
 
     result = run_agent(db, user.id, {"user_input": "帮我研究 LangGraph 多 Agent 趋势"})
-    events = list_events(db, user.id, result["run_id"])
+    events = replay_events(db, user.id, result["run_id"], limit=500)["events"]
 
     assert result["intent"] == "research"
-    assert any(event["event"] == "home_intent_fallback_used" for event in events)
+    assert any(event["event_type"] == "home_intent_fallback_used" for event in events)
     assert any(event["event"] == "llm_call_failed" for event in events)
 
 

@@ -48,6 +48,7 @@ class UserProfile(Base, TimestampMixin):
     feed_ratio_config: Mapped[dict[str, float]] = mapped_column(JSON, default=feed_ratio_default, nullable=False)
     last_feed_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_feed_refresh_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    default_llm_model_id: Mapped[int | None] = mapped_column(ForeignKey("llm_models.id"), nullable=True)
 
     user: Mapped[User] = relationship(back_populates="profile")
 
@@ -271,7 +272,11 @@ class AgentStep(Base):
 
 class AgentEvent(Base):
     __tablename__ = "agent_events"
-    __table_args__ = (Index("ix_agent_events_run_id", "run_id"), Index("ix_agent_events_user_run", "user_id", "run_id"))
+    __table_args__ = (
+        Index("ix_agent_events_run_id", "run_id"),
+        Index("ix_agent_events_user_run", "user_id", "run_id"),
+        Index("ix_agent_events_user_run_id", "user_id", "run_id", "id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id"), nullable=False)
@@ -279,6 +284,9 @@ class AgentEvent(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     node_name: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    schema_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    visibility: Mapped[str] = mapped_column(String(32), default="trace", nullable=False)
+    display_channel: Mapped[str] = mapped_column(String(32), default="status", nullable=False)
     payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
@@ -306,6 +314,41 @@ class LLMCall(Base):
     error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
+
+
+class LLMConnection(Base, TimestampMixin):
+    __tablename__ = "llm_connections"
+    __table_args__ = (Index("ix_llm_connections_user_status", "user_id", "status"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    protocol: Mapped[str] = mapped_column(String(64), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    config_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    encrypted_secrets: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="draft", nullable=False)
+    last_test_status: Mapped[str] = mapped_column(String(32), default="untested", nullable=False)
+    last_test_error: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    last_tested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class LLMModel(Base, TimestampMixin):
+    __tablename__ = "llm_models"
+    __table_args__ = (
+        Index("ix_llm_models_connection_enabled", "connection_id", "enabled"),
+        Index("ux_llm_models_connection_model", "connection_id", "model_id", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    connection_id: Mapped[int] = mapped_column(ForeignKey("llm_connections.id"), index=True, nullable=False)
+    model_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    source: Mapped[str] = mapped_column(String(32), default="manual", nullable=False)
+    capabilities_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
 
 class MCPServer(Base, TimestampMixin):

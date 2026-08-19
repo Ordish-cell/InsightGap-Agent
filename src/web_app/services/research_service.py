@@ -31,6 +31,7 @@ from src.web_app.services.artifact_service import artifact_service
 from src.web_app.services.memory_service import memory_service
 from src.web_app.services.rag_service import rag_service
 from src.web_app.services.skill_service import skill_service
+from src.web_app.services.llm_registry_service import resolve_model_context, resolve_run_model_context
 
 logger = logging.getLogger(__name__)
 
@@ -68,13 +69,16 @@ class ResearchService:
         if not query.strip():
             raise ValueError("Research query is required")
 
+        model_context = resolve_model_context(db, user_id, request.model_config_id)
+        model_snapshot = model_context.public_dict()
+
         agent_run = agent_repo.create(
             user_id=user_id,
             run_type="deep_research",
             mode="plan_and_solve",
             status="running",
             user_input=query,
-            graph_state={},
+            graph_state={"model_config_id": model_context.model_config_id, "model_context": model_snapshot},
         )
 
         run_id = str(uuid4())
@@ -114,6 +118,7 @@ class ResearchService:
                 "depth": request.depth,
                 "feed_card_id": request.feed_card_id or getattr(feed_card, "id", None),
                 "card_snapshot": card_snapshot,
+                "model_context": model_snapshot,
             },
         )
 
@@ -125,6 +130,7 @@ class ResearchService:
                 query=query,
                 request=request,
                 feed_card=feed_card,
+                model_snapshot=model_snapshot,
             )
         )
 
@@ -166,6 +172,7 @@ class ResearchService:
         query: str,
         request: ResearchRequest,
         feed_card: Any = None,
+        model_snapshot: dict[str, Any] | None = None,
     ) -> None:
         """Execute research in the background and persist the result."""
         # We need a fresh DB session for the background task.
@@ -182,6 +189,7 @@ class ResearchService:
                 return
 
             agent_run = agent_repo.get_by_id(run.agent_run_id) if run.agent_run_id else None
+            run_model_context = resolve_run_model_context(db, user_id, model_snapshot or {})
 
             # ── Collect evidence ────────────────────────────────────
             evidence = self._collect_evidence(user_id, query, feed_card)
@@ -200,14 +208,16 @@ class ResearchService:
                         run_id, len(query),
                     )
                     adapter = OpenDeepResearchAdapter()
-                    result = await adapter.run_research(
-                        query=query,
-                        user_id=user_id,
-                        run_id=run_id,
-                        context={"gssc_context": "", "evidence": evidence},
-                        evidence=evidence,
-                        depth=request.depth,
-                    )
+                    from src.web_app.agent.llm.context import use_model_context
+                    with use_model_context(run_model_context):
+                        result = await adapter.run_research(
+                            query=query,
+                            user_id=user_id,
+                            run_id=run_id,
+                            context={"gssc_context": "", "evidence": evidence},
+                            evidence=evidence,
+                            depth=request.depth,
+                        )
                     result.metadata.update({
                         "source": "open_deep_research",
                         "engine": "open_deep_research",
@@ -297,14 +307,20 @@ class ResearchService:
                 markdown_report=result.markdown_report,
                 artifact_id=artifact_id,
                 skill_draft_id=skill_id,
-                metadata_json=result.metadata,
+                metadata_json={**result.metadata, "model_context": model_snapshot},
                 completed_at=completed,
             )
             if agent_run:
-                agent_repo.update(agent_run, status="completed", result_summary=result.summary, graph_state={"research_run_id": run_id})
+                agent_repo.update(agent_run, status="completed", result_summary=result.summary, graph_state={**(agent_run.graph_state or {}), "research_run_id": run_id})
 
         except Exception as exc:
             logger.error("[ResearchService] unhandled background error run_id=%s error=%s", run_id, str(exc))
+            error_msg = _safe_error_message(exc)
+            run = ResearchRunRepository(db).get_by_user(user_id, run_id)
+            if run:
+                ResearchRunRepository(db).update(run, status="failed", error=error_msg)
+            if 'agent_run' in locals() and agent_run:
+                AgentRunRepository(db).update(agent_run, status="failed", error_message=error_msg)
         finally:
             db.close()
 
@@ -322,6 +338,13 @@ class ResearchService:
         Used by the Agent Runtime and the legacy sync API endpoints."""
         research_repo = ResearchRunRepository(db)
         agent_repo = AgentRunRepository(db)
+        from src.web_app.agent.llm.context import get_model_context, use_model_context
+        from src.web_app.agent.llm.errors import LLMUnavailableError
+        try:
+            model_context = get_model_context()
+        except LLMUnavailableError:
+            model_context = resolve_model_context(db, user_id, request.model_config_id)
+        model_snapshot = model_context.public_dict()
 
         agent_run = agent_repo.create(
             user_id=user_id,
@@ -329,7 +352,7 @@ class ResearchService:
             mode="plan_and_solve",
             status="running",
             user_input=query,
-            graph_state={},
+            graph_state={"model_config_id": model_context.model_config_id, "model_context": model_snapshot},
         )
 
         run_id = str(uuid4())
@@ -368,12 +391,14 @@ class ResearchService:
                 "depth": request.depth,
                 "feed_card_id": request.feed_card_id or getattr(feed_card, "id", None),
                 "card_snapshot": card_snapshot,
+                "model_context": model_snapshot,
             },
         )
 
         try:
             evidence = self._collect_evidence(user_id, query, feed_card)
-            result = await self._execute_research(user_id, run_id, query, request, evidence)
+            with use_model_context(model_context):
+                result = await self._execute_research(user_id, run_id, query, request, evidence)
 
             artifact_id = self._save_artifact(db, user_id, run_id, query, result.markdown_report, request) if request.save_artifact else None
             skill_id = self._create_skill(db, user_id, run_id, query, request) if request.create_skill_draft else None
@@ -409,10 +434,10 @@ class ResearchService:
                 markdown_report=result.markdown_report,
                 artifact_id=artifact_id,
                 skill_draft_id=skill_id,
-                metadata_json=result.metadata,
+                metadata_json={**result.metadata, "model_context": model_snapshot},
                 completed_at=completed,
             )
-            agent_repo.update(agent_run, status="completed", result_summary=result.summary, graph_state={"research_run_id": run_id})
+            agent_repo.update(agent_run, status="completed", result_summary=result.summary, graph_state={**(agent_run.graph_state or {}), "research_run_id": run_id})
 
         except Exception as exc:
             error_msg = _safe_error_message(exc)

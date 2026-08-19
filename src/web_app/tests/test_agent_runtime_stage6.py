@@ -101,10 +101,10 @@ def test_agent_runtime_events_from_steps(monkeypatch):
     monkeypatch.setattr(runtime_nodes.rag_service, "ask", lambda *args, **kwargs: {"answer": "RAG answer", "answer_mode": "test", "evidence": []})
 
     result = run_agent(db, user.id, {"user_input": "知识库问答", "route": "rag"})
-    events = agent_service.list_events(db, user.id, result["run_id"])
+    events = agent_service.replay_events(db, user.id, result["run_id"], limit=500)["events"]
 
     assert events
-    assert events[0]["event"] == "run_started"
+    assert events[0]["event_type"] == "run_started"
     assert any(event["event"] == "node_completed" and event["data"]["node_name"] in ("rag", "rag_agent") for event in events)
 
 

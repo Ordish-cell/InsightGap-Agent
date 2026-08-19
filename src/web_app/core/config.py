@@ -8,6 +8,9 @@ class Settings(BaseSettings):
     app_env: str = "local"
     secret_key: str = "change-me"
     access_token_expire_minutes: int = 10080
+    model_credentials_encryption_key: str = ""
+    llm_timeout_seconds: int = 60
+    llm_max_retries: int = 2
     postgres_host: str = "127.0.0.1"
     postgres_port: int = 5432
     postgres_user: str = "postgres"
@@ -50,10 +53,6 @@ class Settings(BaseSettings):
     embed_api_key: str = ""
     embed_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     dashscope_embedding_batch_size: int = 10
-    default_llm_provider: str = "openai"
-    default_llm_model: str = ""
-    embedding_provider: str = "openai"
-    embedding_model: str = ""
     open_deep_research_mode: str = "adapter"
     # ── Open Deep Research (upstream) ──────────────────────────────
     enable_open_deep_research: bool = True
@@ -63,16 +62,11 @@ class Settings(BaseSettings):
     odr_max_researcher_iterations: int = 2
     odr_max_react_tool_calls: int = 4
     odr_timeout_seconds: int = 600
-    odr_research_model: str = "openai:qwen-plus"
-    odr_summarization_model: str = "openai:qwen-plus"
-    odr_compression_model: str = "openai:qwen-plus"
-    odr_final_report_model: str = "openai:qwen-plus"
     odr_research_model_max_tokens: int = 10000
     odr_summarization_model_max_tokens: int = 8192
     odr_compression_model_max_tokens: int = 8192
     odr_final_report_model_max_tokens: int = 10000
     odr_max_content_length: int = 50000
-    dashscope_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     artifact_storage_path: str = "uploads/artifacts"
     cors_origins_raw: str = Field("http://localhost:5173,http://127.0.0.1:5173", validation_alias="CORS_ORIGINS")
     feed_refresh_max_items: int = 50
@@ -116,31 +110,6 @@ class Settings(BaseSettings):
     feed_min_personal_relevance: float = 0.15
     feed_min_source_credibility: float = 0.40
     feed_low_confidence_max_ratio: float = 0.20
-    agent_llm_enabled: bool = True
-    agent_llm_provider: str = "aliyun"
-    agent_llm_timeout_seconds: int = 60
-    agent_llm_max_retries: int = 2
-    agent_llm_temperature: float = 0.2
-    dashscope_api_key: str = ""
-    aliyun_bailian_api_key: str = ""
-    aliyun_bailian_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    agent_llm_base_url: str = ""
-    agent_llm_api_key: str = ""
-    agent_fast_model: str = "qwen3.6-max-preview"
-    agent_balanced_model: str = "qwen3.6-max-preview"
-    agent_strong_model: str = "qwen3.7-plus"
-    agent_llm_model: str = "qwen3.6-plus"
-    agent_intent_model: str = "qwen3.6-max-preview"
-    agent_safety_model: str = "qwen3.6-max-preview"
-    agent_planner_model: str = "qwen3.6-max-preview"
-    agent_rag_model: str = "qwen3.6-max-preview"
-    agent_research_model: str = "qwen3.7-plus"
-    agent_artifact_model: str = "qwen3.6-plus"
-    agent_memory_model: str = "qwen3.6-max-preview"
-    agent_skill_model: str = "qwen3.6-max-preview"
-    agent_final_model: str = "qwen3.6-plus"
-    agent_embedding_provider: str = "aliyun"
-    agent_embedding_model: str = "text-embedding-v4"
     agent_intent_llm_enabled: bool = True
     agent_planner_llm_enabled: bool = False
     agent_memory_llm_enabled: bool = True
@@ -203,7 +172,6 @@ class Settings(BaseSettings):
     agent_replanner_control_enabled: bool = False
     agent_llm_supervisor_enabled: bool = True
     agent_llm_supervisor_mode: str = "full"
-    agent_llm_supervisor_model: str = "qwen-plus"
     agent_llm_supervisor_temperature: float = 0
     agent_llm_supervisor_timeout_seconds: int = 20
     agent_langgraph_checkpointer_enabled: bool = True
@@ -225,11 +193,9 @@ class Settings(BaseSettings):
     # Redis checkpointer configuration (when backend=redis)
     redis_password: str = ""
     redis_checkpointer_key_prefix: str = "langgraph:checkpoint:"
-    # Qwen model tier configuration
-    qwen_fast_model: str = "qwen3.6-max-preview"
-    qwen_balanced_model: str = "qwen3.6-plus"
-    qwen_advanced_model: str = "qwen3.6-max-preview"
     qwen_vision_model: str = "qwen3.6-plus"
+    qwen_vision_api_key: str = ""
+    qwen_vision_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     max_chat_upload_bytes: int = 20 * 1024 * 1024
     # ── Local File Tools ───────────────────────────────────────────
     local_tools_enabled: bool = True
