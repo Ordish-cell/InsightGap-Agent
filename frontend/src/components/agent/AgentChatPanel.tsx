@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useRef, useState } from 'react'
 
 import type { AgentChatMessage, AgentEvent, AgentRun, AgentRunStep, ChatAttachment, UnknownRecord } from '../../api/types'
 import * as agent from '../../api/agent'
-import { fetchDocumentBlobUrl, toApiUrl, uploadChatAttachment } from '../../api/documents'
+import { fetchDocumentBlobUrl, retryDocumentIngest, toApiUrl, uploadChatAttachment, waitForDocumentReady } from '../../api/documents'
 import { JsonBlock } from '../common/JsonBlock'
 import { MarkdownRenderer } from '../common/MarkdownRenderer'
 import { StatusPill } from '../common/StatusPill'
@@ -13,7 +13,7 @@ type LocalChatAttachment = ChatAttachment & {
   localId: string
   file?: File
   uploadProgress: number
-  uploadStatus: 'queued' | 'uploading' | 'uploaded' | 'failed'
+  uploadStatus: 'queued' | 'uploading' | 'processing' | 'uploaded' | 'failed'
   localPreviewUrl?: string
   error?: string
 }
@@ -631,8 +631,27 @@ export function AgentChatPanel({
           ),
         )
       })
-        .then((uploaded) => {
-          const isReady = uploaded.status === 'ready' && (uploaded.kind === 'image' || (((uploaded as unknown) as Record<string, unknown>).chunks_count as number ?? 0) > 0)
+        .then(async (uploaded) => {
+          if (uploaded.kind === 'document' && uploaded.status === 'processing') {
+            setAttachments((prev) => prev.map((item) => item.localId === localId ? {
+              ...item,
+              ...uploaded,
+              uploadProgress: uploaded.progress ?? 0,
+              uploadStatus: 'processing',
+              status: 'processing',
+            } : item))
+            const readyStatus = await waitForDocumentReady(uploaded.document_id, (status) => {
+              setAttachments((prev) => prev.map((item) => item.localId === localId ? {
+                ...item,
+                ...status,
+                uploadProgress: status.progress ?? item.uploadProgress,
+                uploadStatus: 'processing',
+                status: 'processing',
+              } : item))
+            })
+            uploaded = { ...uploaded, ...readyStatus }
+          }
+          const isReady = uploaded.status === 'ready' && (uploaded.kind === 'image' || (uploaded.chunks_count ?? 0) > 0)
           setAttachments((prev) =>
             prev.map((item) =>
               item.localId === localId
@@ -665,6 +684,28 @@ export function AgentChatPanel({
             ),
           )
         })
+    }
+  }
+
+  const retryAttachment = async (attachment: LocalChatAttachment) => {
+    if (attachment.document_id <= 0) return
+    try {
+      await retryDocumentIngest(attachment.document_id)
+      setAttachments((prev) => prev.map((item) => item.localId === attachment.localId ? {
+        ...item, uploadStatus: 'processing', status: 'processing', uploadProgress: 0, stage: 'queued', error: undefined,
+      } : item))
+      const ready = await waitForDocumentReady(attachment.document_id, (status) => {
+        setAttachments((prev) => prev.map((item) => item.localId === attachment.localId ? {
+          ...item, ...status, uploadStatus: 'processing', status: 'processing', uploadProgress: status.progress ?? item.uploadProgress,
+        } : item))
+      })
+      setAttachments((prev) => prev.map((item) => item.localId === attachment.localId ? {
+        ...item, ...ready, uploadStatus: 'uploaded', status: 'uploaded', uploadProgress: 100, error: undefined,
+      } : item))
+    } catch (error) {
+      setAttachments((prev) => prev.map((item) => item.localId === attachment.localId ? {
+        ...item, uploadStatus: 'failed', status: 'failed', error: error instanceof Error ? error.message : '重新处理失败',
+      } : item))
     }
   }
 
@@ -1021,7 +1062,7 @@ export function AgentChatPanel({
     const uploadedAttachments = attachments.filter(
       (item) => item.uploadStatus === 'uploaded' && item.document_id > 0,
     )
-    const hasUploading = attachments.some((item) => item.uploadStatus === 'uploading')
+    const hasUploading = attachments.some((item) => item.uploadStatus === 'uploading' || item.uploadStatus === 'processing')
     if ((!input && uploadedAttachments.length === 0) || running || hasUploading) return
 
     streamRef.current?.close()
@@ -1339,7 +1380,7 @@ export function AgentChatPanel({
   const uploadedAttachmentsForSend = attachments.filter(
     (item) => item.uploadStatus === 'uploaded' && item.document_id > 0,
   )
-  const hasUploading = attachments.some((item) => item.uploadStatus === 'uploading')
+  const hasUploading = attachments.some((item) => item.uploadStatus === 'uploading' || item.uploadStatus === 'processing')
   const hasText = userInput.trim().length > 0
   const hasUploadedForSend = uploadedAttachmentsForSend.length > 0
   const hasFailedOnly =
@@ -1417,12 +1458,14 @@ export function AgentChatPanel({
                 <div className="composer-attachment-sub">
                   {item.uploadStatus === 'uploading'
                     ? `${item.uploadProgress}%`
+                    : item.uploadStatus === 'processing'
+                      ? `${item.stage || '解析中'} ${item.uploadProgress}%`
                     : item.uploadStatus === 'failed'
                       ? item.error || '上传失败'
                       : '已上传'}
                 </div>
 
-                {item.uploadStatus === 'uploading' || item.uploadStatus === 'uploaded' ? (
+                {item.uploadStatus === 'uploading' || item.uploadStatus === 'processing' || item.uploadStatus === 'uploaded' ? (
                   <div className="composer-attachment-progress">
                     <div
                       className="composer-attachment-progress-bar"
@@ -1430,7 +1473,12 @@ export function AgentChatPanel({
                     />
                   </div>
                 ) : item.uploadStatus === 'failed' ? (
-                  <div className="composer-attachment-error">{item.error || '上传失败'}</div>
+                  <div className="composer-attachment-error">
+                    {item.error || '上传失败'}
+                    {item.document_id > 0 && item.kind === 'document' ? (
+                      <button type="button" onClick={() => void retryAttachment(item)}>重新处理</button>
+                    ) : null}
+                  </div>
                 ) : null}
               </div>
 

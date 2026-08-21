@@ -138,7 +138,7 @@ class QdrantVectorStore:
         """
         import logging
         _logger = logging.getLogger(__name__)
-        for field in ("user_id", "document_id", "file_type", "created_at"):
+        for field in ("user_id", "document_id", "file_type", "chunk_role", "created_at"):
             try:
                 self.client.create_payload_index(
                     collection_name=self.collection,
@@ -200,11 +200,13 @@ class QdrantVectorStore:
             self.client.upsert(collection_name=self.collection, points=points)
         return point_ids
 
-    def search(self, user_id: int, query_vector: list[float], top_k: int = 5, min_score: float = 0.2, document_ids: list[int] | None = None) -> list[dict[str, Any]]:
+    def search(self, user_id: int, query_vector: list[float], top_k: int = 5, min_score: float = 0.2, document_ids: list[int] | None = None, chunk_roles: list[str] | None = None) -> list[dict[str, Any]]:
         self.ensure_collection()
         conditions = [FieldCondition(key="user_id", match=MatchValue(value=str(user_id)))]
         if document_ids:
             conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(item) for item in document_ids])))
+        if chunk_roles:
+            conditions.append(FieldCondition(key="chunk_role", match=MatchAny(any=chunk_roles)))
         if hasattr(self.client, "query_points"):
             response = self.client.query_points(
                 collection_name=self.collection,
@@ -254,7 +256,7 @@ class QdrantVectorStore:
             )
         return results
 
-    def search_hybrid(self, user_id: int, query_vector: list[float], query_text: str, top_k: int = 5, min_score: float = 0.2, document_ids: list[int] | None = None) -> list[dict[str, Any]]:
+    def search_hybrid(self, user_id: int, query_vector: list[float], query_text: str, top_k: int = 5, min_score: float = 0.2, document_ids: list[int] | None = None, chunk_roles: list[str] | None = None) -> list[dict[str, Any]]:
         self.ensure_collection()
         status = self.capability_status()
         if not status.get("supported"):
@@ -265,6 +267,8 @@ class QdrantVectorStore:
         conditions = [FieldCondition(key="user_id", match=MatchValue(value=str(user_id)))]
         if document_ids:
             conditions.append(FieldCondition(key="document_id", match=MatchAny(any=[str(item) for item in document_ids])))
+        if chunk_roles:
+            conditions.append(FieldCondition(key="chunk_role", match=MatchAny(any=chunk_roles)))
         query_filter = Filter(must=conditions)
         response = self.client.query_points(
             collection_name=self.collection,

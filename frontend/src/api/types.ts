@@ -247,7 +247,7 @@ export interface AgentChatMessage {
 
 export type ChatAttachmentKind = 'image' | 'document' | 'audio' | 'video' | 'file'
 
-export type ChatAttachmentStatus = 'queued' | 'uploading' | 'uploaded' | 'failed'
+export type ChatAttachmentStatus = 'queued' | 'uploading' | 'processing' | 'uploaded' | 'failed'
 
 export interface ChatAttachment {
   document_id: number
@@ -259,6 +259,13 @@ export interface ChatAttachment {
   preview_url?: string
   status?: string
   ingest_status?: string
+  stage?: string
+  progress?: number
+  processed_chunks?: number
+  total_chunks?: number
+  chunks_count?: number
+  token_count?: number
+  summary_status?: string
   error?: string
 }
 

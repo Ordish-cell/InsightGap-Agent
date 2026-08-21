@@ -196,7 +196,7 @@ class Settings(BaseSettings):
     qwen_vision_model: str = "qwen3.6-plus"
     qwen_vision_api_key: str = ""
     qwen_vision_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    max_chat_upload_bytes: int = 20 * 1024 * 1024
+    max_chat_upload_bytes: int = 50 * 1024 * 1024
     # ── Local File Tools ───────────────────────────────────────────
     local_tools_enabled: bool = True
     local_tools_workspace_dir: str = "./agent_workspace"

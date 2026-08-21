@@ -12,6 +12,7 @@ from src.web_app.rag import embeddings
 from src.web_app.rag import document_parser
 from src.web_app.rag import vector_store as vector_store_module
 from src.web_app.rag.structured_chunker import build_structured_chunks
+from src.web_app.rag.document_summarizer import build_document_summary
 from src.web_app.services.agent_service import hard_delete_conversation
 from src.web_app.services.rag_service import rag_service
 from src.web_app.tests.db_test_utils import make_test_session
@@ -71,7 +72,7 @@ class FakeVectorStore:
 
 
 @pytest.fixture()
-def client(monkeypatch):
+def client(monkeypatch, tmp_path):
     db = make_test_session()
     user = User(email="rag@example.com", hashed_password="x")
     other = User(email="other@example.com", hashed_password="x")
@@ -86,6 +87,7 @@ def client(monkeypatch):
     import src.web_app.services.document_service as document_service_module
     import src.web_app.services.rag_service as rag_service_module
 
+    monkeypatch.setattr(document_service_module.DocumentService, "_document_dir", lambda _self, user_id, document_id: tmp_path / str(user_id) / str(document_id))
     monkeypatch.setattr(document_service_module, "QdrantVectorStore", FakeVectorStore)
     monkeypatch.setattr(document_service_module, "embed_texts", lambda texts: [[0.1] * 384 for _ in texts])
     monkeypatch.setattr(rag_service_module, "QdrantVectorStore", FakeVectorStore)
@@ -109,6 +111,15 @@ def test_document_upload_txt_success(client):
     assert response.json()["data"]["status"] == "uploaded"
 
 
+def test_upload_enforces_configured_size_limit(client, monkeypatch):
+    import src.web_app.services.document_service as document_service_module
+
+    monkeypatch.setattr(document_service_module, "MAX_UPLOAD_BYTES", 4)
+    response = client.post("/api/v1/documents/upload", files={"file": ("large.txt", b"12345", "text/plain")})
+    assert response.json()["success"] is False
+    assert "too large" in response.json()["error"]["message"].lower()
+
+
 def test_upload_rejects_unsupported_file(client):
     response = client.post("/api/v1/documents/upload", files={"file": ("bad.exe", b"x", "application/octet-stream")})
     assert response.json()["success"] is False
@@ -118,6 +129,38 @@ def test_upload_prevents_path_traversal(client):
     response = client.post("/api/v1/documents/upload", files={"file": ("../safe.txt", b"safe", "text/plain")})
     assert response.status_code == 200
     assert response.json()["data"]["filename"] == "safe.txt"
+
+
+def test_chat_document_upload_returns_processing_and_status(client, monkeypatch):
+    import src.web_app.api.v1.documents as documents_api
+
+    starts: list[tuple[int, int]] = []
+    monkeypatch.setattr(documents_api.document_ingest_task_manager, "start", lambda user_id, document_id: starts.append((user_id, document_id)) or True)
+    upload = client.post("/api/v1/documents/chat-upload", files={"file": ("long.txt", b"whole document", "text/plain")}).json()["data"]
+    assert upload["status"] == "processing"
+    assert starts == [(client.user_id, upload["document_id"])]
+
+    status = client.get(f"/api/v1/documents/{upload['document_id']}/status").json()["data"]
+    assert status["ingest_status"] == "processing"
+    assert status["stage"] == "queued"
+    assert status["progress"] == 0
+
+
+def test_failed_chat_document_can_be_requeued(client, monkeypatch):
+    import src.web_app.api.v1.documents as documents_api
+
+    monkeypatch.setattr(documents_api.document_ingest_task_manager, "start", lambda *_args: True)
+    upload = client.post("/api/v1/documents/chat-upload", files={"file": ("retry.txt", b"retry", "text/plain")}).json()["data"]
+    db = next(app.dependency_overrides[get_db]())
+    document = db.get(Document, upload["document_id"])
+    document.status = "failed"
+    document.metadata_json = {**document.metadata_json, "ingest_status": "failed", "error": "boom"}
+    db.commit()
+
+    response = client.post(f"/api/v1/documents/{document.id}/ingest-background").json()["data"]
+    assert response["ingest_status"] == "processing"
+    assert response["stage"] == "queued"
+    assert response["error"] is None
 
 
 def test_document_ingest_creates_chunks_and_writes_qdrant(client):
@@ -145,7 +188,7 @@ def test_qdrant_payload_has_stable_chunk_id_and_content_hash(client):
     assert point["content_hash"]
 
 
-def test_structured_ingest_stores_parent_overview_and_child_only_vectors(client):
+def test_structured_ingest_stores_parent_and_indexes_child_and_summaries(client):
     content = b"# Intro\n\nAlpha evidence.\n\n## Details\n\nBeta evidence for retrieval."
     upload = client.post("/api/v1/documents/upload", files={"file": ("structured.md", content, "text/markdown")}).json()["data"]
     ingest = client.post(f"/api/v1/documents/{upload['id']}/ingest")
@@ -161,8 +204,9 @@ def test_structured_ingest_stores_parent_overview_and_child_only_vectors(client)
     assert "parent" in roles
     assert child_chunks
     assert all(chunk.metadata_json.get("parent_id") for chunk in child_chunks)
-    assert all(point["chunk_role"] == "child" for point in FakeVectorStore.points)
-    assert len(FakeVectorStore.points) == len(child_chunks)
+    vector_roles = {point["chunk_role"] for point in FakeVectorStore.points}
+    assert {"child", "overview", "section_summary"} <= vector_roles
+    assert len(FakeVectorStore.points) > len(child_chunks)
     assert document.metadata_json["chunk_count"] == len(child_chunks)
     assert document.metadata_json["chunk_count"] < len(chunks)
     assert document.metadata_json["overview"]["summary_text"]
@@ -185,7 +229,8 @@ def test_structured_csv_ingest_uses_row_blocks(client):
     assert all(chunk.metadata_json.get("header") == ["name", "score", "comment"] for chunk in child_chunks)
     assert all("Columns: name | score | comment" in chunk.content for chunk in child_chunks)
     assert document.metadata_json["chunk_count"] == len(child_chunks)
-    assert len(FakeVectorStore.points) == len(child_chunks)
+    assert len([point for point in FakeVectorStore.points if point["chunk_role"] == "child"]) == len(child_chunks)
+    assert any(point["chunk_role"] == "overview" for point in FakeVectorStore.points)
 
 
 def test_structured_xlsx_text_uses_sheet_row_blocks():
@@ -198,6 +243,33 @@ def test_structured_xlsx_text_uses_sheet_row_blocks():
     assert child_chunks[0]["metadata"]["sheet_name"] == "Budget"
     assert child_chunks[0]["metadata"]["header"] == ["team", "amount"]
     assert result["stats"]["chunk_count"] == len(result["vector_chunks"]) == len(child_chunks)
+
+
+def test_small_document_summary_uses_all_parent_content():
+    parents = [
+        {"content": "First section.", "metadata": {"chunk_id": "p-1", "page_number": 1}},
+        {"content": "Last section.", "metadata": {"chunk_id": "p-2", "page_number": 2}},
+    ]
+    result = build_document_summary("whole.pdf", parents)
+    assert result["status"] == "generated"
+    assert "First section" in result["summary_text"]
+    assert "Last section" in result["summary_text"]
+
+
+def test_long_document_summary_uses_hierarchical_reduction(monkeypatch):
+    import src.web_app.rag.document_summarizer as summarizer
+
+    calls: list[str] = []
+    monkeypatch.setattr(summarizer, "_llm_summary", lambda prompt: calls.append(prompt) or f"summary-{len(calls)}")
+    parents = [
+        {"content": "A" * 9000, "metadata": {"chunk_id": "p-1", "page_number": 1}},
+        {"content": "B" * 9000, "metadata": {"chunk_id": "p-2", "page_number": 2}},
+    ]
+    result = summarizer.build_document_summary("long.pdf", parents)
+    assert result["status"] == "generated"
+    assert result["method"] == "hierarchical_llm_v1"
+    assert len(result["section_summaries"]) == 2
+    assert len(calls) == 3
 
 
 def test_structured_chunker_failure_falls_back_to_legacy(client, monkeypatch):
@@ -374,7 +446,7 @@ def test_ask_document_summary_prefers_overview_and_document_map(client):
         source_type="user_upload",
         status="ingested",
         metadata_json={
-            "overview": {"summary_text": "Overview says this document is about parent-child retrieval."},
+            "overview": {"summary_text": "Overview says this document is about parent-child retrieval.", "summary_status": "generated"},
             "document_map": {"filename": "overview.md", "sections": [{"parent_id": "p-1", "heading_path": ["Intro"], "chunk_type": "section"}]},
         },
     )
@@ -384,7 +456,7 @@ def test_ask_document_summary_prefers_overview_and_document_map(client):
 
     result = rag_service.ask_document(client.user_id, "总结这个文档", document_ids=[document.id], top_k=3, overview_mode=False, db=db)
     assert result["evidence"]
-    assert result["evidence"][0]["chunk_id"] == "overview"
+    assert result["evidence"][0]["chunk_id"] == "overview-0000"
     assert "parent-child retrieval" in result["evidence"][0]["quote"]
     assert result["evidence"][0]["document_map"]["sections"][0]["heading_path"] == ["Intro"]
 

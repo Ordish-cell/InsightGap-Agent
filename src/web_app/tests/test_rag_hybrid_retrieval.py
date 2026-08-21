@@ -181,7 +181,7 @@ def test_ask_document_summary_still_prefers_overview(hybrid_env):
         file_type="md",
         source_type="user_upload",
         status="ingested",
-        metadata_json={"overview": {"summary_text": "Overview remains first."}, "document_map": {"sections": []}},
+        metadata_json={"overview": {"summary_text": "Overview remains first.", "summary_status": "generated"}, "document_map": {"sections": []}},
     )
     db.add(doc)
     db.commit()
@@ -189,7 +189,7 @@ def test_ask_document_summary_still_prefers_overview(hybrid_env):
     _add_child(db, user.id, doc.id, "child summary keyword", chunk_id="c-overview", parent_id="p-overview")
 
     result = rag_service.ask_document(user.id, "summary", document_ids=[doc.id], top_k=3, db=db)
-    assert result["evidence"][0]["chunk_id"] == "overview"
+    assert result["evidence"][0]["chunk_id"] == "overview-0000"
     assert "Overview remains first" in result["evidence"][0]["quote"]
 
 
