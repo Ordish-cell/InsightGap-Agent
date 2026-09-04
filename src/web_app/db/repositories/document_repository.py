@@ -90,16 +90,18 @@ class DocumentChunkRepository(BaseRepository[DocumentChunk]):
         return parents
 
     def list_child_candidates(self, user_id: int, document_ids: list[int] | None = None, limit: int = 1000) -> list[DocumentChunk]:
-        stmt = select(DocumentChunk).where(DocumentChunk.user_id == user_id).order_by(DocumentChunk.created_at.desc(), DocumentChunk.id.desc())
+        return self.list_role_candidates(user_id, ["child"], document_ids=document_ids, limit=limit)
+
+    def list_role_candidates(self, user_id: int, roles: list[str], document_ids: list[int] | None = None, limit: int = 1000) -> list[DocumentChunk]:
+        stmt = select(DocumentChunk).where(
+            DocumentChunk.user_id == user_id,
+            DocumentChunk.metadata_json["chunk_role"].as_string().in_(roles),
+        ).order_by(DocumentChunk.created_at.desc(), DocumentChunk.id.desc())
         if document_ids:
             stmt = stmt.where(DocumentChunk.document_id.in_([int(item) for item in document_ids]))
         if limit and limit > 0:
             stmt = stmt.limit(limit)
-        chunks: list[DocumentChunk] = []
-        for chunk in self.db.execute(stmt).scalars():
-            if (chunk.metadata_json or {}).get("chunk_role") == "child":
-                chunks.append(chunk)
-        return chunks
+        return list(self.db.execute(stmt).scalars())
 
     def delete_by_document(self, user_id: int, document_id: int) -> int:
         result = self.db.execute(delete(DocumentChunk).where(DocumentChunk.user_id == user_id, DocumentChunk.document_id == document_id))

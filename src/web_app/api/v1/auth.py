@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -38,10 +38,8 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 
 @router.get("/me")
-def me(authorization: str | None = Header(default=None), db: Session = Depends(get_db)):
-    try:
-        user_id = get_current_user_id(authorization)
-        user = UserRepository(db).get_by_user_id(user_id)
-        return ok(user_to_public(user)) if user else fail("USER_NOT_FOUND", "User not found")
-    except Exception as exc:
-        return fail("INVALID_TOKEN", str(exc))
+def me(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    user = UserRepository(db).get_by_user_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return ok(user_to_public(user))

@@ -58,8 +58,8 @@ class RAGService:
             "collection": settings.qdrant_collection,
             "hybrid_backend": settings.rag_hybrid_backend,
             "hybrid_collection": settings.qdrant_hybrid_collection,
-            "embedding_model": resolve_model_name("embedding").model,
-            "answer_model": resolve_model_name("rag").model,
+            "embedding_model": _model_name("embedding"),
+            "answer_model": _model_name("rag"),
         }
 
     def ingest_text(self, user_id: int, document_id: int, text: str) -> dict[str, Any]:
@@ -126,6 +126,15 @@ class RAGService:
         ]
 
     def ask(self, user_id: int, question: str, top_k: int = 5, min_score: float = 0.2, document_ids: list[int] | None = None, answer_mode: str = "auto", db: Session | None = None) -> dict[str, Any]:
+        if is_document_overview_query(question) and document_ids:
+            return self.ask_document(
+                user_id,
+                question,
+                document_ids=document_ids,
+                top_k=max(top_k, 8),
+                overview_mode=True,
+                db=db,
+            )
         search_result = self.search(user_id, question, top_k, min_score, document_ids, db=db)
         results = search_result.get("results", [])
         if not results:
@@ -136,7 +145,7 @@ class RAGService:
                 "answer_mode": "general_knowledge_fallback" if (is_general and not is_doc_specific) else "no_evidence",
                 "evidence": [],
                 "needs_general_fallback": is_general and not is_doc_specific,
-                "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0, "embedding_model": resolve_model_name("embedding").model, "answer_model": resolve_model_name("rag").model},
+                "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0, "embedding_model": _model_name("embedding"), "answer_model": _model_name("rag")},
             }
 
         evidence = self._evidence_from_results(results)
@@ -145,7 +154,7 @@ class RAGService:
             "answer": self._extractive_answer(question, evidence),
             "answer_mode": "extractive_fallback",
             "evidence": evidence,
-            "context": {"gssc_used": True, "selected_chunks": len(evidence), "token_estimate": max(1, len(context) // 4), "embedding_model": resolve_model_name("embedding").model, "answer_model": resolve_model_name("rag").model},
+            "context": {"gssc_used": True, "selected_chunks": len(evidence), "token_estimate": max(1, len(context) // 4), "embedding_model": _model_name("embedding"), "answer_model": _model_name("rag")},
         }
 
     def stats(self, db: Session, user_id: int) -> dict[str, Any]:
@@ -166,11 +175,12 @@ class RAGService:
                     metadata = document.metadata_json or {}
                     overview = metadata.get("overview") or {}
                     document_map = metadata.get("document_map") or {}
-                    overview_text = overview.get("summary_text") or (_document_map_to_text(document_map) if document_map else "")
+                    summary_status = overview.get("summary_status") or metadata.get("summary_status")
+                    overview_text = (overview.get("summary_text") or "") if summary_status == "generated" else ""
                     if overview_text:
                         evidence.append({
                             "document_id": str(document.id),
-                            "chunk_id": "overview",
+                            "chunk_id": "overview-0000",
                             "child_chunk_id": "",
                             "parent_id": None,
                             "score": 1.0,
@@ -187,11 +197,18 @@ class RAGService:
         search_result = self.search(user_id, question, top_k=top_k, min_score=0.1, document_ids=document_ids, db=db)
         results = search_result.get("results", [])
         if not results and not evidence:
+            if overview_mode or is_document_overview_query(question):
+                return {
+                    "answer": "全文摘要尚未生成或生成失败，请重新处理文档后再试。",
+                    "answer_mode": "summary_unavailable",
+                    "evidence": [],
+                    "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0, "embedding_model": _model_name("embedding"), "answer_model": _model_name("rag")},
+                }
             return {
                 "answer": "没有从当前上传的文档中解析到足够正文内容。",
                 "answer_mode": "no_evidence",
                 "evidence": [],
-                "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0, "embedding_model": resolve_model_name("embedding").model, "answer_model": resolve_model_name("rag").model},
+                "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0, "embedding_model": _model_name("embedding"), "answer_model": _model_name("rag")},
             }
 
         evidence.extend(self._evidence_from_results(results, existing=evidence))
@@ -204,8 +221,8 @@ class RAGService:
                 "gssc_used": True,
                 "selected_chunks": len(evidence),
                 "token_estimate": max(1, len(context_text) // 4),
-                "embedding_model": resolve_model_name("embedding").model,
-                "answer_model": resolve_model_name("rag").model,
+                "embedding_model": _model_name("embedding"),
+                "answer_model": _model_name("rag"),
                 "document_context_block": context_text,
             },
         }
@@ -277,6 +294,13 @@ def _document_map_to_text(document_map: dict[str, Any]) -> str:
                 title += f" sheet={section.get('sheet_name')} rows={section.get('row_start')}-{section.get('row_end')}"
             lines.append(f"- {title}")
     return "\n".join(line for line in lines if line)
+
+
+def _model_name(purpose: str) -> str:
+    try:
+        return resolve_model_name(purpose).model
+    except Exception:
+        return settings.embed_model_name if purpose == "embedding" else "unconfigured"
 
 
 rag_service = RAGService()

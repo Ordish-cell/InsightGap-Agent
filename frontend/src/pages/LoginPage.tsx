@@ -16,7 +16,14 @@ export function LoginPage() {
   const canSubmit = useMemo(() => Boolean(email.trim() && password.trim() && !loading), [email, password, loading])
 
   useEffect(() => {
-    if (localStorage.getItem('authToken')) navigate('/', { replace: true })
+    if (!localStorage.getItem('authToken')) return
+    let active = true
+    auth.me()
+      .then(() => {
+        if (active) navigate('/', { replace: true })
+      })
+      .catch(() => localStorage.removeItem('authToken'))
+    return () => { active = false }
   }, [navigate])
 
   async function submit(event: FormEvent) {

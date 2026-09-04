@@ -188,9 +188,10 @@ tool_agent 判断 L3
 上传文档
   -> DocumentService 保存文件
   -> DocumentParser 解析
-  -> StructuredChunker 生成 Overview / Parent / Child
-  -> Child 写入 Qdrant
-  -> Parent / Overview 写入 PostgreSQL
+  -> StructuredChunker 生成 Parent / Child
+  -> DocumentSummarizer 分层生成 Section Summary / Overview
+  -> Child / Section Summary / Overview 写入 Qdrant
+  -> 全部 Chunk 写入 PostgreSQL
   -> Query Analyzer
   -> Dense + Sparse / BM25 检索
   -> RRF 融合
@@ -449,7 +450,8 @@ chunk 分工：
 
 | Chunk | 作用 | 是否入 Qdrant | 是否用于回答上下文 |
 |---|---|---:|---:|
-| Overview | 文档整体摘要 | 否 | 可选 |
+| Overview | 文档整体摘要 | 是 | 总览问题 |
+| Section Summary | 分章节/分页组摘要 | 是 | 总览问题与引用 |
 | Parent | 完整段落 / 章节上下文 | 否 | 是 |
 | Child | 精准检索单元 | 是 | 命中后回查 parent |
 

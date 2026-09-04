@@ -38,18 +38,19 @@ class ParentChildRetriever:
         allow_fallback: bool = True,
     ) -> list[dict[str, Any]]:
         analysis = analyze_query(query)
+        chunk_roles = ["overview", "section_summary"] if analysis.is_summary else ["child"]
         if backend == "qdrant_hybrid":
             try:
-                return self._qdrant_hybrid_search(user_id, query, query_vector, top_k, min_score, document_ids, analysis)
+                return self._qdrant_hybrid_search(user_id, query, query_vector, top_k, min_score, document_ids, analysis, chunk_roles)
             except Exception as exc:
                 logger.warning("qdrant_hybrid_failed fallback_to_python_bm25 user_id=%s error=%s", user_id, exc, exc_info=True)
                 if not allow_fallback:
                     raise
-                fallback_results = self._python_bm25_hybrid_search(user_id, query, query_vector, top_k, min_score, document_ids, bm25_candidate_limit, analysis)
+                fallback_results = self._python_bm25_hybrid_search(user_id, query, query_vector, top_k, min_score, document_ids, bm25_candidate_limit, analysis, chunk_roles)
                 for item in fallback_results:
                     item["retrieval_warning"] = f"qdrant_hybrid_failed: {exc}"
                 return fallback_results
-        return self._python_bm25_hybrid_search(user_id, query, query_vector, top_k, min_score, document_ids, bm25_candidate_limit, analysis)
+        return self._python_bm25_hybrid_search(user_id, query, query_vector, top_k, min_score, document_ids, bm25_candidate_limit, analysis, chunk_roles)
 
     def _qdrant_hybrid_search(
         self,
@@ -60,17 +61,11 @@ class ParentChildRetriever:
         min_score: float,
         document_ids: list[int] | None,
         analysis: QueryAnalysis,
+        chunk_roles: list[str],
     ) -> list[dict[str, Any]]:
         if not self.vector_store or not query_vector:
             raise RuntimeError("Qdrant hybrid requires vector store and dense query vector")
-        hits = self.vector_store.search_hybrid(
-            user_id=user_id,
-            query_vector=query_vector,
-            query_text=query,
-            top_k=max(top_k * 2, top_k),
-            min_score=min_score,
-            document_ids=document_ids,
-        )
+        hits = self._vector_store_search_hybrid(user_id, query_vector, query, max(top_k * 2, top_k), min_score, document_ids, chunk_roles)
         if not hits:
             return []
         for hit in hits:
@@ -93,9 +88,10 @@ class ParentChildRetriever:
         document_ids: list[int] | None,
         bm25_candidate_limit: int,
         analysis: QueryAnalysis,
+        chunk_roles: list[str],
     ) -> list[dict[str, Any]]:
-        vector_hits = self._vector_search(user_id, query_vector, top_k, min_score, document_ids)
-        bm25_hits = self._bm25_search(user_id, query, max(top_k * 4, top_k), document_ids, bm25_candidate_limit)
+        vector_hits = self._vector_search(user_id, query_vector, top_k, min_score, document_ids, chunk_roles)
+        bm25_hits = self._bm25_search(user_id, query, max(top_k * 4, top_k), document_ids, bm25_candidate_limit, chunk_roles)
         merged = self._merge_hits(vector_hits, bm25_hits, analysis)
         if not merged:
             return []
@@ -109,17 +105,12 @@ class ParentChildRetriever:
         top_k: int,
         min_score: float,
         document_ids: list[int] | None,
+        chunk_roles: list[str],
     ) -> list[dict[str, Any]]:
         if not self.vector_store or not query_vector:
             return []
         try:
-            hits = self.vector_store.search(
-                user_id=user_id,
-                query_vector=query_vector,
-                top_k=max(top_k * 3, top_k),
-                min_score=min_score,
-                document_ids=document_ids,
-            )
+            hits = self._vector_store_search(user_id, query_vector, max(top_k * 3, top_k), min_score, document_ids, chunk_roles)
         except Exception as exc:
             logger.warning("vector_search_failed fallback_to_bm25 user_id=%s error=%s", user_id, exc, exc_info=True)
             return []
@@ -139,12 +130,13 @@ class ParentChildRetriever:
         top_k: int,
         document_ids: list[int] | None,
         candidate_limit: int,
+        chunk_roles: list[str],
     ) -> list[dict[str, Any]]:
         if not query:
             return []
         try:
             chunk_repo = DocumentChunkRepository(self.db)
-            chunks = chunk_repo.list_child_candidates(user_id, document_ids=document_ids, limit=candidate_limit)
+            chunks = chunk_repo.list_role_candidates(user_id, chunk_roles, document_ids=document_ids, limit=candidate_limit)
             if not chunks:
                 return []
             docs_by_id = self._documents_by_id(user_id, [chunk.document_id for chunk in chunks])
@@ -178,7 +170,7 @@ class ParentChildRetriever:
                 "file_type": document.file_type if document else "",
                 "token_count": chunk.token_count,
                 "content_hash": metadata.get("content_hash", ""),
-                "chunk_role": "child",
+                "chunk_role": metadata.get("chunk_role", "child"),
                 "chunk_type": metadata.get("chunk_type", ""),
                 "parent_id": metadata.get("parent_id"),
                 "page_number": metadata.get("page_number"),
@@ -192,6 +184,36 @@ class ParentChildRetriever:
                 "retrieval_source": "bm25",
             })
         return results
+
+    def _vector_store_search(self, user_id: int, query_vector: list[float], top_k: int, min_score: float, document_ids: list[int] | None, chunk_roles: list[str]) -> list[dict[str, Any]]:
+        try:
+            return self.vector_store.search(
+                user_id=user_id, query_vector=query_vector, top_k=top_k, min_score=min_score,
+                document_ids=document_ids, chunk_roles=chunk_roles,
+            )
+        except TypeError as exc:
+            if "chunk_roles" not in str(exc):
+                raise
+            hits = self.vector_store.search(
+                user_id=user_id, query_vector=query_vector, top_k=top_k, min_score=min_score,
+                document_ids=document_ids,
+            )
+            return [hit for hit in hits if str(hit.get("chunk_role") or (hit.get("metadata") or {}).get("chunk_role") or "child") in chunk_roles]
+
+    def _vector_store_search_hybrid(self, user_id: int, query_vector: list[float], query: str, top_k: int, min_score: float, document_ids: list[int] | None, chunk_roles: list[str]) -> list[dict[str, Any]]:
+        try:
+            return self.vector_store.search_hybrid(
+                user_id=user_id, query_vector=query_vector, query_text=query, top_k=top_k,
+                min_score=min_score, document_ids=document_ids, chunk_roles=chunk_roles,
+            )
+        except TypeError as exc:
+            if "chunk_roles" not in str(exc):
+                raise
+            hits = self.vector_store.search_hybrid(
+                user_id=user_id, query_vector=query_vector, query_text=query, top_k=top_k,
+                min_score=min_score, document_ids=document_ids,
+            )
+            return [hit for hit in hits if str(hit.get("chunk_role") or (hit.get("metadata") or {}).get("chunk_role") or "child") in chunk_roles]
 
     def _merge_hits(self, vector_hits: list[dict[str, Any]], bm25_hits: list[dict[str, Any]], analysis: QueryAnalysis) -> list[dict[str, Any]]:
         merged: dict[str, dict[str, Any]] = {}

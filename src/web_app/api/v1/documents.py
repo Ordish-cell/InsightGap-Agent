@@ -6,6 +6,7 @@ from src.web_app.db.session import get_db
 from src.web_app.schemas.common import fail, ok
 from src.web_app.services.auth_service import get_current_user_id
 from src.web_app.services.document_service import document_service
+from src.web_app.services.document_ingest_task_manager import document_ingest_task_manager
 from src.web_app.services.rag_service import rag_service
 
 router = APIRouter()
@@ -92,12 +93,32 @@ def rag_stats(user_id: int = Depends(get_current_user_id), db: Session = Depends
 
 
 @router.post("/documents/chat-upload")
-def chat_upload(file: UploadFile, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+async def chat_upload(file: UploadFile, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     try:
         result = document_service.upload_chat_attachment(db, user_id, file)
+        if result.get("kind") == "document" and result.get("status") == "processing":
+            document_ingest_task_manager.start(user_id, int(result["document_id"]))
         return ok(result)
     except ValueError as exc:
         return fail("CHAT_UPLOAD_FAILED", str(exc))
+
+
+@router.get("/documents/{document_id}/status")
+def get_document_status(document_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    try:
+        return ok(document_service.get_ingest_status(db, user_id, document_id))
+    except ValueError as exc:
+        return fail("DOCUMENT_NOT_FOUND", str(exc))
+
+
+@router.post("/documents/{document_id}/ingest-background")
+async def retry_document_ingest(document_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    try:
+        result = document_service.queue_ingest_retry(db, user_id, document_id)
+        document_ingest_task_manager.start(user_id, document_id)
+        return ok(result)
+    except ValueError as exc:
+        return fail("DOCUMENT_INGEST_FAILED", str(exc))
     except Exception as exc:
         from src.web_app.core.errors import DocumentIngestError
         if isinstance(exc, DocumentIngestError):

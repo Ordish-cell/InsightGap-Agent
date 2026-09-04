@@ -1,5 +1,7 @@
+import { useEffect, useState } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
 
+import * as auth from './api/auth'
 import { AppShell } from './components/layout/AppShell'
 import { AgentRunPage } from './pages/AgentRunPage'
 import { ApprovalsPage } from './pages/ApprovalsPage'
@@ -17,7 +19,39 @@ import { SettingsPage } from './pages/SettingsPage'
 import { SkillsPage } from './pages/SkillsPage'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
-  return localStorage.getItem('authToken') ? children : <Navigate to="/login" replace />
+  const [status, setStatus] = useState<'checking' | 'authenticated' | 'unauthenticated'>(() =>
+    localStorage.getItem('authToken') ? 'checking' : 'unauthenticated',
+  )
+
+  useEffect(() => {
+    let active = true
+    const handleUnauthorized = () => {
+      if (active) setStatus('unauthenticated')
+    }
+
+    window.addEventListener('auth:unauthorized', handleUnauthorized)
+    if (!localStorage.getItem('authToken')) {
+      setStatus('unauthenticated')
+    } else {
+      setStatus('checking')
+      auth.me()
+        .then(() => {
+          if (active) setStatus('authenticated')
+        })
+        .catch(() => {
+          localStorage.removeItem('authToken')
+          if (active) setStatus('unauthenticated')
+        })
+    }
+
+    return () => {
+      active = false
+      window.removeEventListener('auth:unauthorized', handleUnauthorized)
+    }
+  }, [])
+
+  if (status === 'checking') return <main className="simple-login-page" aria-busy="true">正在验证登录状态...</main>
+  return status === 'authenticated' ? children : <Navigate to="/login" replace />
 }
 
 export default function App() {

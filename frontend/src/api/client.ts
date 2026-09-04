@@ -64,7 +64,10 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
   const payload = contentType.includes('application/json') ? await response.json() : await response.text()
 
   if (!response.ok) {
-    if (response.status === 401) localStorage.removeItem('authToken')
+    if (response.status === 401) {
+      localStorage.removeItem('authToken')
+      window.dispatchEvent(new Event('auth:unauthorized'))
+    }
     const message =
       typeof payload === 'object' && payload?.error?.message
         ? payload.error.message

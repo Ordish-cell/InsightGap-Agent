@@ -16,21 +16,17 @@ def parse_document(path: str | Path, original_filename: str | None = None, mime_
     if ext not in ALLOWED_EXTENSIONS:
         raise ValueError(f"Unsupported document type: {ext}")
 
+    if ext == ".pdf":
+        metadata = _base_metadata(file_path, "pymupdf", original_filename, mime_type)
+        text, metadata = _parse_pdf(file_path, metadata)
+        metadata.update({"used_fallback": False, "fallback_reason": ""})
+        return {"text": text, "markdown": text, "metadata": metadata}
+
     fallback_reason = ""
     try:
         parsed = _parse_markitdown(file_path)
         if parsed["text"].strip():
             parsed["metadata"].update(_base_metadata(file_path, "markitdown", original_filename, mime_type))
-            if ext == ".pdf":
-                try:
-                    _, pdf_metadata = _parse_pdf(file_path, dict(parsed["metadata"]))
-                    parsed["metadata"].update({
-                        "page_count": pdf_metadata.get("page_count", 0),
-                        "pages": pdf_metadata.get("pages", []),
-                        "page_parser": pdf_metadata.get("parser", ""),
-                    })
-                except Exception:
-                    pass
             parsed["metadata"].update({"used_fallback": False, "fallback_reason": ""})
             return parsed
     except Exception as exc:
@@ -93,15 +89,19 @@ def _parse_pdf(file_path: Path, metadata: dict[str, Any]) -> tuple[str, dict[str
     import fitz
 
     doc = fitz.open(str(file_path))
-    metadata["parser"] = "pymupdf"
-    metadata["page_count"] = doc.page_count
-    pages = []
-    for index, page in enumerate(doc, 1):
-        page_text = page.get_text("text")
-        pages.append({"page_number": index, "text": page_text})
-    metadata["pages"] = pages
-    text = "\n\n".join(page["text"] for page in pages)
-    doc.close()
+    try:
+        metadata["parser"] = "pymupdf"
+        metadata["page_count"] = doc.page_count
+        pages = []
+        text_parts = []
+        for index, page in enumerate(doc, 1):
+            page_text = page.get_text("text")
+            pages.append({"page_number": index, "text": page_text})
+            text_parts.append(page_text)
+        metadata["pages"] = pages
+        text = "\n\n".join(text_parts)
+    finally:
+        doc.close()
     return text, metadata
 
 
@@ -165,8 +165,13 @@ def _parse_xlsx(file_path: Path, metadata: dict[str, Any]) -> tuple[str, dict[st
 
 def _parse_csv(file_path: Path, metadata: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     with file_path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
-        rows = list(csv.reader(handle))
+        lines: list[str] = []
+        column_count = 0
+        for row in csv.reader(handle):
+            if not lines:
+                column_count = len(row)
+            lines.append("\t".join(row))
     metadata["parser"] = "csv"
-    metadata["row_count"] = max(0, len(rows) - 1)
-    metadata["column_count"] = len(rows[0]) if rows else 0
-    return "\n".join("\t".join(row) for row in rows), metadata
+    metadata["row_count"] = max(0, len(lines) - 1)
+    metadata["column_count"] = column_count
+    return "\n".join(lines), metadata

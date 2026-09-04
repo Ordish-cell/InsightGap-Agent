@@ -65,8 +65,9 @@ async def startup_health_checks():
 @app.on_event("shutdown")
 async def shutdown_agent_runs():
     from src.web_app.services.agent_run_task_manager import agent_run_task_manager
+    from src.web_app.services.document_ingest_task_manager import document_ingest_task_manager
 
-    await agent_run_task_manager.shutdown()
+    await asyncio.gather(agent_run_task_manager.shutdown(), document_ingest_task_manager.shutdown())
 
 
 def _launch_cleanup_scheduler() -> None:

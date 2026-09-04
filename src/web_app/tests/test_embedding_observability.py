@@ -156,7 +156,7 @@ def test_document_service_rejects_too_long_embedding_chunk(caplog):
     assert "chunk_id=c-too-long" in logs
 
 
-def test_chat_upload_ingest_failure_response_has_failed_status(monkeypatch):
+def test_chat_upload_ingest_failure_response_has_failed_status(monkeypatch, tmp_path):
     db = make_test_session()
     user = User(email="embed-fail@example.com", hashed_password="x")
     db.add(user)
@@ -170,18 +170,23 @@ def test_chat_upload_ingest_failure_response_has_failed_status(monkeypatch):
     app.dependency_overrides[get_current_user_id] = lambda: user.id
 
     import src.web_app.services.document_service as document_service_module
+    import src.web_app.api.v1.documents as documents_api
 
     def fail_embed(_texts):
         raise requests.HTTPError("400 Client Error: Bad Request for url")
 
     monkeypatch.setattr(document_service_module.settings, "qdrant_url", "")
     monkeypatch.setattr(document_service_module, "embed_texts", fail_embed)
+    monkeypatch.setattr(document_service_module.DocumentService, "_document_dir", lambda _self, user_id, document_id: tmp_path / str(user_id) / str(document_id))
+    monkeypatch.setattr(documents_api.document_ingest_task_manager, "start", lambda *_args: True)
     with TestClient(app) as client:
         response = client.post("/api/v1/documents/chat-upload", files={"file": ("bad.txt", b"hello", "text/plain")})
     data = response.json()
+    result = document_service_module.document_service.ingest_chat_document(db, user.id, data["data"]["document_id"])
     app.dependency_overrides.clear()
     db.close()
 
-    assert data["success"] is False
-    assert data["error"]["details"]["ingest_status"] == "failed"
-    assert data["error"]["details"]["error_message"]
+    assert data["success"] is True
+    assert data["data"]["ingest_status"] == "processing"
+    assert result["status"] == "failed"
+    assert result["error"]

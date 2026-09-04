@@ -8,16 +8,17 @@ from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
 from src.web_app.core.config import settings
-from src.web_app.core.errors import DocumentIngestError
 from src.web_app.db.repositories.document_repository import DocumentChunkRepository, DocumentRepository
 from src.web_app.models.orm import Document
 from src.web_app.rag.document_parser import ALLOWED_EXTENSIONS, parse_document
+from src.web_app.rag.document_summarizer import build_document_summary, summary_chunks
 from src.web_app.rag.embeddings import MAX_EMBED_CHARS, embed_texts
 from src.web_app.rag.structured_chunker import build_structured_chunks, fallback_structured_chunks
 from src.web_app.rag.vector_store import QdrantVectorStore
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
-MAX_CHAT_UPLOAD_BYTES = getattr(settings, "max_chat_upload_bytes", None) or 20 * 1024 * 1024
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_CHAT_UPLOAD_BYTES = getattr(settings, "max_chat_upload_bytes", None) or MAX_UPLOAD_BYTES
+EMBED_BATCH_SIZE = 10
 
 ALLOWED_CHAT_UPLOAD_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".webp", ".gif",
@@ -85,6 +86,7 @@ class DocumentService:
             raise ValueError("Invalid upload path")
 
         size = 0
+        too_large = False
         with target.open("wb") as handle:
             while True:
                 chunk = file.file.read(1024 * 1024)
@@ -93,9 +95,12 @@ class DocumentService:
                 size += len(chunk)
                 if size > MAX_UPLOAD_BYTES:
                     repo.mark_failed(document, "File is too large", failed_stage="upload")
-                    target.unlink(missing_ok=True)
-                    raise ValueError("File is too large")
+                    too_large = True
+                    break
                 handle.write(chunk)
+        if too_large:
+            target.unlink(missing_ok=True)
+            raise ValueError("File is too large")
         repo.update(document, file_path=str(target), metadata_json={**(document.metadata_json or {}), "size": size})
         return document_to_dict(document)
 
@@ -192,6 +197,7 @@ class DocumentService:
             raise ValueError("Invalid upload path")
 
         size = 0
+        too_large = False
         with target.open("wb") as handle:
             while True:
                 chunk = file.file.read(1024 * 1024)
@@ -200,70 +206,42 @@ class DocumentService:
                 size += len(chunk)
                 if size > MAX_CHAT_UPLOAD_BYTES:
                     repo.mark_failed(document, "File is too large", failed_stage="upload")
-                    target.unlink(missing_ok=True)
-                    raise ValueError("File is too large")
+                    too_large = True
+                    break
                 handle.write(chunk)
+        if too_large:
+            target.unlink(missing_ok=True)
+            raise ValueError("File is too large")
 
         metadata = dict(document.metadata_json or {})
         metadata["size"] = size
         repo.update(document, file_path=str(target), metadata_json=metadata)
 
-        # ── Sync ingest for documents (images skip) ──────────────────────
+        # Documents are ingested by the process-local background task manager.
         if kind == "document":
-            try:
-                ingest_result = self._ingest_document_internal(db, user_id, document)
-                if ingest_result.get("status") != "ingested":
-                    error_msg = str(ingest_result.get("error") or "Document ingestion returned non-ingested status")
-                    repo.mark_failed(document, error_msg, failed_stage="ingest")
-                    repo.update(document, metadata_json={
-                        **(document.metadata_json or {}),
-                        "ingest_status": "failed",
-                        "error": error_msg,
-                        "ingest_error_type": "IngestError",
-                    })
-                    raise DocumentIngestError(
-                        f"文档摄入失败：{error_msg}",
-                        document_id=document.id,
-                        http_status=500,
-                        detail=error_msg,
-                    )
-                metadata = dict(document.metadata_json or {})
-                metadata["ingest_status"] = "ingested"
-                metadata["chunk_count"] = ingest_result.get("chunk_count", 0)
-                metadata["token_count"] = ingest_result.get("token_count", 0)
-                repo.update(document, status="ingested", metadata_json=metadata)
-                return {
-                    "document_id": document.id,
-                    "filename": filename,
-                    "file_type": suffix.lstrip("."),
-                    "mime_type": file.content_type or "",
-                    "kind": kind,
-                    "size": size,
-                    "preview_url": f"/api/v1/documents/{document.id}/file",
-                    "status": "ready",
-                    "ingest_status": "ingested",
-                    "chunks_count": ingest_result.get("chunk_count", 0),
-                    "token_count": ingest_result.get("token_count", 0),
-                }
-            except DocumentIngestError:
-                raise
-            except Exception as exc:
-                logger.exception("Chat document sync ingest failed for document_id=%s", document.id)
-                failed_stage = (document.metadata_json or {}).get("failed_stage") or "ingest"
-                repo.mark_failed(document, str(exc), failed_stage=failed_stage)
-                repo.update(document, metadata_json={
-                    **(document.metadata_json or {}),
-                    "ingest_status": "failed",
-                    "error": str(exc),
-                    "ingest_error_type": type(exc).__name__,
-                })
-                http_status = 400 if isinstance(exc, (ValueError, FileNotFoundError)) else 500
-                raise DocumentIngestError(
-                    str(exc),
-                    document_id=document.id,
-                    http_status=http_status,
-                    detail=str(exc),
-                ) from exc
+            metadata = {
+                **(document.metadata_json or {}),
+                "ingest_status": "processing",
+                "stage": "queued",
+                "progress": 0,
+                "error": None,
+            }
+            repo.update(document, status="processing", metadata_json=metadata)
+            return {
+                "document_id": document.id,
+                "filename": filename,
+                "file_type": suffix.lstrip("."),
+                "mime_type": file.content_type or "",
+                "kind": kind,
+                "size": size,
+                "preview_url": f"/api/v1/documents/{document.id}/file",
+                "status": "processing",
+                "ingest_status": "processing",
+                "stage": "queued",
+                "progress": 0,
+                "chunks_count": 0,
+                "token_count": 0,
+            }
 
         return {
             "document_id": document.id,
@@ -289,9 +267,9 @@ class DocumentService:
             self._delete_document_vectors(user_id, document.id, required=True)
             chunk_repo.delete_by_document(user_id, document.id)
         try:
-            doc_repo.update_status(document, "ingesting", {"failed_stage": "parse"})
+            self._update_ingest_progress(doc_repo, document, "parse", 10)
             parsed = parse_document(document.file_path, document.filename, document.file_type)
-            doc_repo.update_status(document, "ingesting", {"failed_stage": "chunk"})
+            self._update_ingest_progress(doc_repo, document, "chunk", 25)
             try:
                 structured = build_structured_chunks(
                     parsed["markdown"] or parsed["text"],
@@ -304,17 +282,32 @@ class DocumentService:
                 structured = fallback_structured_chunks(parsed["markdown"] or parsed["text"])
                 structured["stats"] = {**structured.get("stats", {}), "structured_error": str(exc)}
             chunks = structured["chunks"]
-            vector_chunks = structured["vector_chunks"]
+            parent_chunks = [chunk for chunk in chunks if (chunk.get("metadata") or {}).get("chunk_role") == "parent"]
+            self._update_ingest_progress(doc_repo, document, "summary", 35)
+            document_summary = build_document_summary(document.filename, parent_chunks)
+            generated_summary_chunks = summary_chunks(
+                document_summary,
+                max((int(chunk.get("chunk_index") or 0) for chunk in chunks), default=-1) + 1,
+            )
+            chunks = [chunk for chunk in chunks if (chunk.get("metadata") or {}).get("chunk_role") != "overview"]
+            chunks.extend(generated_summary_chunks)
+            vector_chunks = [*structured["vector_chunks"], *generated_summary_chunks]
             if not vector_chunks:
                 raise ValueError("No readable content chunks produced")
             vector_chunks = self._validate_embedding_chunks(document.id, vector_chunks)
-            doc_repo.update_status(document, "ingesting", {"failed_stage": "embed"})
-            vectors = embed_texts([chunk["content"] for chunk in vector_chunks])
-            doc_repo.update_status(document, "ingesting", {"failed_stage": "qdrant_upsert"})
-            point_ids = QdrantVectorStore().upsert_chunks(user_id, document.id, vector_chunks, vectors, document)
+            point_ids: list[str] = []
+            vector_store = QdrantVectorStore()
+            total = len(vector_chunks)
+            for batch_start in range(0, total, EMBED_BATCH_SIZE):
+                batch = vector_chunks[batch_start:batch_start + EMBED_BATCH_SIZE]
+                progress = 40 + int(50 * batch_start / max(1, total))
+                self._update_ingest_progress(doc_repo, document, "embed", progress, processed_chunks=batch_start, total_chunks=total)
+                vectors = embed_texts([chunk["content"] for chunk in batch])
+                self._update_ingest_progress(doc_repo, document, "qdrant_upsert", progress, processed_chunks=batch_start, total_chunks=total)
+                point_ids.extend(vector_store.upsert_chunks(user_id, document.id, batch, vectors, document))
         except Exception:
             raise
-        doc_repo.update_status(document, "ingesting", {"failed_stage": "db_write"})
+        self._update_ingest_progress(doc_repo, document, "db_write", 95, processed_chunks=len(vector_chunks), total_chunks=len(vector_chunks))
         point_by_chunk_id = {
             str(chunk.get("metadata", {}).get("chunk_id")): point_id
             for chunk, point_id in zip(vector_chunks, point_ids, strict=True)
@@ -325,7 +318,7 @@ class DocumentService:
             chunk_metadata = dict(chunk.get("metadata", {}))
             chunk_metadata.update({"char_start": chunk["char_start"], "char_end": chunk["char_end"], "heading_path": chunk.get("heading_path", [])})
             qdrant_point_id = ""
-            if chunk_metadata.get("chunk_role") == "child":
+            if chunk_metadata.get("chunk_role") in {"child", "overview", "section_summary"}:
                 qdrant_point_id = point_by_chunk_id.get(str(chunk_metadata.get("chunk_id")), "")
             rows.append(
                 {
@@ -342,19 +335,49 @@ class DocumentService:
         child_chunks = [chunk for chunk in saved_chunks if (chunk.metadata_json or {}).get("chunk_role") == "child"]
         token_count = sum(chunk.token_count for chunk in child_chunks)
         child_count = len(child_chunks)
+        parser_metadata = dict(parsed.get("metadata", {}))
+        parser_metadata.pop("pages", None)
+        structural_overview = structured.get("overview", {})
+        overview = {
+            **structural_overview,
+            "summary_text": document_summary.get("summary_text", ""),
+            "summary_status": document_summary.get("status", "failed"),
+            "summary_method": document_summary.get("method", ""),
+            "summary_error": document_summary.get("error", ""),
+        }
         doc_repo.update_ingest_stats(
             document,
             child_count,
             token_count,
-            parsed.get("metadata", {}),
+            parser_metadata,
             {
-                "overview": structured.get("overview", {}),
+                "overview": overview,
                 "document_map": structured.get("document_map", {}),
                 "chunking_stats": structured.get("stats", {}),
                 "pg_chunk_count": len(saved_chunks),
+                "summary_status": document_summary.get("status", "failed"),
+                "stage": "completed",
+                "progress": 100,
+                "processed_chunks": len(vector_chunks),
+                "total_chunks": len(vector_chunks),
             },
         )
         return {"status": "ingested", "chunk_count": child_count, "token_count": token_count}
+
+    def _update_ingest_progress(
+        self,
+        repo: DocumentRepository,
+        document: Document,
+        stage: str,
+        progress: int,
+        **metadata: Any,
+    ) -> None:
+        repo.update_status(document, "ingesting", {
+            "failed_stage": stage,
+            "stage": stage,
+            "progress": max(0, min(100, int(progress))),
+            **metadata,
+        })
 
     def _validate_embedding_chunks(self, document_id: int, chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
         valid_chunks: list[dict[str, Any]] = []
@@ -418,6 +441,45 @@ class DocumentService:
         if metadata.get("upload_type") != "chat" and document.source_type not in ("chat_upload", "user_upload"):
             raise ValueError("Document is not a chat attachment")
         return document
+
+    def get_ingest_status(self, db: Session, user_id: int, document_id: int) -> dict[str, Any]:
+        document = DocumentRepository(db).get_by_id_for_user(user_id, document_id)
+        if not document:
+            raise ValueError("Document not found")
+        metadata = document.metadata_json or {}
+        ingest_status = str(metadata.get("ingest_status") or document.status)
+        return {
+            "document_id": document.id,
+            "status": "ready" if ingest_status in INGESTED_STATUSES else ingest_status,
+            "ingest_status": ingest_status,
+            "stage": metadata.get("stage", ""),
+            "progress": int(metadata.get("progress") or (100 if ingest_status in INGESTED_STATUSES else 0)),
+            "processed_chunks": int(metadata.get("processed_chunks") or 0),
+            "total_chunks": int(metadata.get("total_chunks") or 0),
+            "chunks_count": int(metadata.get("chunk_count") or 0),
+            "token_count": int(metadata.get("token_count") or 0),
+            "summary_status": metadata.get("summary_status", "pending"),
+            "error": metadata.get("error") or metadata.get("error_message"),
+        }
+
+    def queue_ingest_retry(self, db: Session, user_id: int, document_id: int) -> dict[str, Any]:
+        repo = DocumentRepository(db)
+        document = repo.get_by_id_for_user(user_id, document_id)
+        if not document:
+            raise ValueError("Document not found")
+        if (document.metadata_json or {}).get("kind") != "document":
+            raise ValueError("Only chat documents can be processed in background")
+        metadata = {
+            **(document.metadata_json or {}),
+            "ingest_status": "processing",
+            "stage": "queued",
+            "progress": 0,
+            "error": None,
+            "error_message": None,
+            "failed_stage": None,
+        }
+        repo.update(document, status="processing", metadata_json=metadata)
+        return self.get_ingest_status(db, user_id, document_id)
 
     def _document_dir(self, user_id: int, document_id: int) -> Path:
         return Path("storage/uploads") / str(user_id) / str(document_id)
