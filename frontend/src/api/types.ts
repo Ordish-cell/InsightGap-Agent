@@ -121,6 +121,10 @@ export interface ResearchRun {
 }
 
 export interface AgentRun {
+  can_interrupt?: boolean
+  can_steer?: boolean
+  supersedes_run_id?: number | null
+  controls?: ChatControlResult[]
   run_id?: number
   id?: number
   conversation_id?: string
@@ -148,6 +152,15 @@ export interface AgentRun {
   tool_call?: McpToolCall
   evaluation?: UnknownRecord
   [key: string]: unknown
+}
+
+export interface ChatControlResult {
+  client_command_id: string
+  run_id: number
+  successor_run_id: number | null
+  kind: 'interrupt' | 'steer'
+  status: 'accepted' | 'applied' | 'failed'
+  error?: string
 }
 
 export type LlmProtocol = 'openai_chat_completions' | 'openai_responses' | 'anthropic_messages' | 'google_generate_content' | 'ollama_chat'
@@ -206,6 +219,7 @@ export interface LlmConnection {
 }
 
 export interface AgentConversation {
+  files?: { document_id: number; filename: string; source_message_id: string; source_message_order: number; status: string }[]
   id?: number
   conversation_id: string
   thread_id?: string
@@ -317,6 +331,14 @@ export interface AgentReplayPage {
 }
 
 export type AgentTraceEventType =
+  | 'interaction_mode'
+  | 'progress_delta'
+  | 'progress_completed'
+  | 'node_started'
+  | 'node_completed'
+  | 'node_failed'
+  | 'node_cancelled'
+  | 'node_paused'
   | 'visible_thought_delta'
   | 'visible_progress_delta'
   | 'tool_call_started'

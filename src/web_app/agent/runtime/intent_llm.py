@@ -68,6 +68,36 @@ def infer_home_intent_with_llm(
         raise LLMInvocationError(str(exc)) from exc
 
 
+async def infer_home_intent_async(db, *, run_id, thread_id, user_id, user_input, page_context, selected_feed_card_id=None, memory_summary=""):
+    """Nonblocking intent call for cancellable chat; keep the legacy API intact."""
+    resolution = resolve_model_name("intent", complexity="low")
+    started = time.perf_counter()
+    output_text = ""
+    try:
+        model = get_chat_model("intent", complexity="low", temperature=0)
+        prompt = _build_prompt(user_input, page_context, selected_feed_card_id, memory_summary)
+        message = await model.ainvoke(prompt)
+        from src.web_app.agent.runtime.chat_control import check_active
+        check_active(run_id)
+        output_text = _message_content(message)
+        result = HomeIntentResult.model_validate(_parse_json(output_text))
+        result.model_used = resolution.model
+        result.raw_intent_source = "llm"
+        record_llm_call(db, run_id=run_id, thread_id=thread_id, user_id=user_id,
+                        node_name="home_intent_react", purpose="intent", provider=resolution.provider,
+                        model=resolution.model, tier=resolution.tier, latency_ms=int((time.perf_counter()-started)*1000),
+                        status="completed", estimated_input_chars=len(prompt), estimated_output_chars=len(output_text))
+        return result
+    except LLMUnavailableError:
+        raise
+    except (json.JSONDecodeError, ValueError) as exc:
+        _record_failed_call(db, run_id, thread_id, user_id, resolution, started, user_input, output_text, str(exc))
+        raise LLMParseError(str(exc)) from exc
+    except Exception as exc:
+        _record_failed_call(db, run_id, thread_id, user_id, resolution, started, user_input, output_text, str(exc))
+        raise LLMInvocationError(str(exc)) from exc
+
+
 def _build_prompt(user_input: str, page_context: dict[str, Any], selected_feed_card_id: Any, memory_summary: str) -> str:
     payload = {
         "user_input": user_input,
@@ -117,10 +147,8 @@ def _build_prompt(user_input: str, page_context: dict[str, Any], selected_feed_c
 
 
 def _message_content(message: Any) -> str:
-    content = getattr(message, "content", message)
-    if isinstance(content, list):
-        return "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
-    return str(content)
+    from src.web_app.agent.llm.content import message_text
+    return message_text(message)
 
 
 def _parse_json(text: str) -> dict[str, Any]:

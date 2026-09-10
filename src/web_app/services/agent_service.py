@@ -34,6 +34,9 @@ from src.web_app.services.conversation_lock import conversation_lock_manager
 
 
 logger = logging.getLogger(__name__)
+from src.web_app.core.config import settings
+from src.web_app.services.conversation_files import conversation_files
+from src.web_app.services.deletion_guard import guarded_transition, check_conversation, ConversationDeletingError
 
 
 GENERIC_COMPLETED_ANSWERS = {
@@ -65,6 +68,8 @@ def load_chat_attachments(db: Session, user_id: int, attachment_ids: list[int]) 
         doc = repo.get_by_id_for_user(user_id, doc_id)
         if not doc:
             raise ValueError(f"Attachment document not found: {doc_id}")
+        if doc.status == "deleting":
+            raise ConversationDeletingError("附件正在删除，不能继续引用。")
         meta = doc.metadata_json or {}
         attachments.append({
             "document_id": doc.id,
@@ -307,10 +312,16 @@ async def _build_attachment_context(attachments: list[dict[str, Any]], user_inpu
     return "\n\n".join(parts)
 
 
+from src.web_app.agent.runtime.chat_control import serialized_transition, capabilities, check_active
+
+
+@serialized_transition
+@guarded_transition
 def prepare_agent_run(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     """Create the durable run and chat placeholders before execution starts."""
     user_input = payload.get("user_input") or payload.get("input") or payload.get("query") or ""
     payload = {**payload, "user_input": user_input}
+    check_conversation(db, user_id, payload.get("conversation_id"))
     page_context = payload.get("page_context") or {}
     conversation_repo = AgentConversationRepository(db)
     message_repo = AgentChatMessageRepository(db)
@@ -319,6 +330,8 @@ def prepare_agent_run(db: Session, user_id: int, payload: dict[str, Any]) -> dic
     payload["model_config_id"] = model_context.model_config_id
     conversation = _get_or_create_conversation(db, user_id, payload, user_input)
     conversation_id = conversation.conversation_id
+    from src.web_app.services.chat_control_service import ensure_conversation_idle
+    ensure_conversation_idle(db, user_id, conversation_id)
     remember_conversation_model(db, user_id, conversation_id, model_context.model_config_id)
     selected_feed_card_id = page_context.get("selected_feed_card_id") or page_context.get("feed_card_id")
     selected_feed_card_title = str(page_context.get("selected_feed_card_title") or page_context.get("feed_card_title") or "")
@@ -336,6 +349,7 @@ def prepare_agent_run(db: Session, user_id: int, payload: dict[str, Any]) -> dic
         mode=payload.get("mode", "react"),
         status="created",
         user_input=user_input,
+        chat_control_phase="enabled" if payload.get("_chat_managed") else "disabled",
     )
     # Stable LangGraph checkpoint thread_id — one per run.
     checkpoint_thread_id = f"run:{run.id}"
@@ -346,6 +360,8 @@ def prepare_agent_run(db: Session, user_id: int, payload: dict[str, Any]) -> dic
     _agent_logger = logging.getLogger(__name__)
     _agent_logger.info("agent attachment_ids=%s", attachment_ids)
     attachments_data = load_chat_attachments(db, user_id, attachment_ids) if attachment_ids else []
+    if attachments_data and (not settings.chat_document_path_enabled or any(a.get("kind") != "document" for a in attachments_data)):
+        run.chat_control_phase = "disabled"
     _agent_logger.info("loaded chat attachments count=%s kinds=%s", len(attachments_data), [a.get("kind") for a in attachments_data])
     attachment_snapshot = _attachment_snapshot(attachments_data)
 
@@ -369,7 +385,7 @@ def prepare_agent_run(db: Session, user_id: int, payload: dict[str, Any]) -> dic
         role="assistant",
         content="",
         status="thinking",
-        metadata_json={"source": payload.get("source", "agent_page")},
+        metadata_json={"source": payload.get("source", "agent_page"), "interaction_version": 2},
     )
     created_event = publish_event(
         db,
@@ -377,6 +393,7 @@ def prepare_agent_run(db: Session, user_id: int, payload: dict[str, Any]) -> dic
         run.id,
         "run_created",
         {
+            "interaction_version": 2,
             "run_id": run.id,
             "conversation_id": conversation_id,
             "thread_id": thread_id,
@@ -391,6 +408,7 @@ def prepare_agent_run(db: Session, user_id: int, payload: dict[str, Any]) -> dic
     return {
         "run_id": run.id,
         "conversation_id": conversation_id,
+        **capabilities(run),
         "thread_id": thread_id,
         "user_message": _message_response(user_message),
         "assistant_message": _message_response(assistant_message),
@@ -416,6 +434,10 @@ async def execute_prepared_run(
         return get_run(db, user_id, run_id)
 
     payload = {**payload, "user_input": run.user_input}
+    from src.web_app.services.chat_control_service import continuation_context
+    continuation = continuation_context(db, run)
+    if continuation:
+        payload["chat_continuation"] = continuation
     user_input = run.user_input
     page_context = payload.get("page_context") or {}
     conversation_repo = AgentConversationRepository(db)
@@ -445,21 +467,7 @@ async def execute_prepared_run(
 
     run_repo.update(run, status="running")
     record_event(db, run.id, "run_started", {"user_input": user_input, "source": payload.get("source", "agent_page"), "model_context": model_context.public_dict()}, user_id=user_id, thread_id=thread_id)
-    publish_event(
-        db,
-        stream_queue,
-        run.id,
-        "visible_progress_delta",
-        {
-            "id": f"run-{run.id}-started",
-            "text": "我开始执行了，会先判断任务类型和需要的上下文。",
-            "status": "streaming",
-            "source": "activity",
-        },
-        node_name="run_start",
-        user_id=user_id,
-        thread_id=thread_id,
-    )
+
 
     # ── Direct image analysis fast path ──
     is_direct_image = _is_direct_image_question(user_input, attachments_data)
@@ -579,7 +587,7 @@ async def execute_prepared_run(
 
     # ── Pre-flight: check document attachments status before expensive Agent run ──
     document_attachments_for_guard = [a for a in attachments_data if a.get("kind") == "document"]
-    if document_attachments_for_guard:
+    if document_attachments_for_guard and not settings.chat_document_path_enabled:
         from src.web_app.db.repositories.document_repository import DocumentRepository as _DocRepo
         _doc_repo = _DocRepo(db)
         _failed_msgs: list[str] = []
@@ -629,7 +637,8 @@ async def execute_prepared_run(
     try:
         try:
             # Build attachment context and inject into payload
-            attachment_context = await _build_attachment_context(attachments_data, user_input, db, user_id)
+            deferred_documents = settings.chat_document_path_enabled and bool(attachments_data) and all(a.get("kind") == "document" for a in attachments_data)
+            attachment_context = "" if deferred_documents else await _build_attachment_context(attachments_data, user_input, db, user_id)
             _agent_logger.info("final attachment_context length=%s has_context=%s", len(attachment_context or ""), bool(attachment_context))
             enriched_payload = dict(payload)
             if attachment_context:
@@ -638,21 +647,7 @@ async def execute_prepared_run(
                 page_context["attachment_context"] = attachment_context
                 enriched_payload["page_context"] = page_context
 
-            publish_event(
-                db,
-                stream_queue,
-                run.id,
-                "visible_progress_delta",
-                {
-                    "id": f"run-{run.id}-runtime",
-                    "text": "我正在检查相关上下文，并准备进入执行步骤。",
-                    "status": "streaming",
-                    "source": "activity",
-                },
-                node_name="runtime_start",
-                user_id=user_id,
-                thread_id=thread_id,
-            )
+
             graph_interrupt_payload = None
             try:
                 state = await AgentRuntime(db, enriched_payload, stream_queue).run({"user_id": user_id, "run_id": run.id, "thread_id": checkpoint_thread_id, "conversation_id": conversation_id, "user_input": user_input, "mode": run.mode, "source": payload.get("source", "agent_page"), "page_context": page_context, "model_context": model_context.public_dict(), "_answer_started_emitted": False, "_answer_delta_emitted": False, "_answer_completed_emitted": False})
@@ -729,6 +724,10 @@ async def execute_prepared_run(
                     "steps": [],
                 },
             }
+        check_active(run.id)
+        # LangGraph filters undeclared state keys; retain the frozen model choice
+        # in the durable run snapshot so a completed run can also be continued.
+        state["model_context"] = model_context.public_dict()
         elapsed_ms = max(0, int((datetime.now() - started_at).total_seconds() * 1000))
         answer = build_user_facing_answer(state)
         state["answer"] = answer
@@ -867,7 +866,7 @@ async def execute_prepared_run(
                 langgraphstatus_json=_json_safe(langgraphstatus),
                 steps_json=_json_safe(steps),
                 error_message=state.get("error", ""),
-                metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", [])), "pipeline_steps": _json_safe(final_payload.get("pipeline_steps", []))},
+                metadata_json={"file_context": _json_safe(state.get("file_context", {})), "interaction_version": 2, "run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", [])), "pipeline_steps": _json_safe(final_payload.get("pipeline_steps", []))},
             )
             conversation_repo.touch(
                 conversation,
@@ -876,12 +875,7 @@ async def execute_prepared_run(
                 selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
                 selected_feed_card_title=selected_feed_card_title or None,
             )
-            _update_conversation_summary_after_turn(
-                db=db,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                run_id=run.id,
-            )
+
 
         else:
             # ── Completed ─────────────────────────────────────────
@@ -906,7 +900,7 @@ async def execute_prepared_run(
                 langgraphstatus_json=_json_safe(langgraphstatus),
                 steps_json=_json_safe(steps),
                 error_message=state.get("error", ""),
-                metadata_json={"run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", [])), "pipeline_steps": _json_safe(final_payload.get("pipeline_steps", []))},
+                metadata_json={"file_context": _json_safe(state.get("file_context", {})), "interaction_version": 2, "run_id": run.id, "final_response": _json_safe(final_payload), "visible_thoughts": _json_safe(state.get("visible_thoughts", [])), "pipeline_steps": _json_safe(final_payload.get("pipeline_steps", []))},
             )
             conversation_repo.touch(
                 conversation,
@@ -915,13 +909,10 @@ async def execute_prepared_run(
                 selected_feed_card_id=int(selected_feed_card_id) if str(selected_feed_card_id or "").isdigit() else None,
                 selected_feed_card_title=selected_feed_card_title or None,
             )
-            _update_conversation_summary_after_turn(
-                db=db,
-                user_id=user_id,
-                conversation_id=conversation_id,
-                run_id=run.id,
-            )
 
+
+            if state.get("chat_entry_route") == "chat":
+                publish_event(db, stream_queue, run.id, "answer_completed", {"answer": answer}, user_id=user_id, thread_id=thread_id)
             already_streamed = state.get("_answer_delta_emitted", False)
             await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
             publish_event(db, stream_queue, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)
@@ -936,6 +927,8 @@ async def execute_prepared_run(
             publish_event(db, stream_queue, run.id, "run_failed", {"status": "failed", "answer": answer, "error": state.get("error", ""), "response": response}, user_id=user_id, thread_id=thread_id)
         else:
             publish_event(db, stream_queue, run.id, "run_completed", {"status": "completed", "answer": answer, "response": response}, user_id=user_id, thread_id=thread_id)
+            from src.web_app.services.summary_tasks import summary_tasks
+            summary_tasks.schedule(user_id, conversation_id)
         return response
     finally:
         reset_model_context(model_context_token)
@@ -1014,7 +1007,7 @@ async def resume_run_after_approval(
         raise ValueError("APPROVAL_CONTEXT_GONE: 会话已不存在。")
 
     conversation_obj = conversation_repo.get_by_conversation_id(user_id, conversation_id)
-    if not conversation_obj or conversation_obj.status == "deleted":
+    if not conversation_obj or conversation_obj.status in {"deleted", "deleting"}:
         raise ValueError("APPROVAL_CONTEXT_GONE: 会话已被删除。")
 
     graph_state = dict(run.graph_state or {})
@@ -1402,39 +1395,6 @@ async def _finalize_resume(
     conversation = conversation_repo.get_by_conversation_id(user_id, conversation_id) if conversation_id else None
     if conversation:
         conversation_repo.touch(conversation, preview=answer, last_run_id=run_id)
-    _update_conversation_summary_after_turn(
-        db=db,
-        user_id=user_id,
-        conversation_id=conversation_id,
-        run_id=run_id,
-    )
-
-    # ── Trigger segment creation after messages are persisted ──────
-    # Deliberately created in a background thread WITHOUT the caller's db session:
-    # SQLAlchemy sessions are not thread-safe, so create_segment_if_needed opens
-    # its own session when db=None. Do NOT pass db here.
-    if conversation_id and run_id:
-        try:
-            from src.web_app.services.conversation_summary_service import conversation_summary_service
-
-            def _segment_job():
-                return conversation_summary_service.create_segment_if_needed(
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                    db=None,
-                )
-
-            await asyncio.to_thread(_segment_job)
-        except Exception:
-            logger.exception(
-                "conversation_segment_creation_failed",
-                extra={
-                    "conversation_id": conversation_id,
-                    "run_id": run_id,
-                    "user_id": user_id,
-                },
-            )
-
     # Stream answer + run_completed
     already_streamed = state.get("_answer_delta_emitted", False)
     await _stream_answer_deltas(db, stream_queue, run_id, thread_id, user_id, answer, already_streamed=already_streamed)
@@ -1442,6 +1402,10 @@ async def _finalize_resume(
     publish_event(db, stream_queue, run_id, "run_completed", {
         "status": final_status, "answer": answer, "run_id": run_id,
     }, user_id=user_id, thread_id=thread_id)
+
+    if final_status == "completed":
+        from src.web_app.services.summary_tasks import summary_tasks
+        summary_tasks.schedule(user_id, conversation_id)
 
     return _run_response(run_id, state, elapsed_ms=elapsed_ms)
 
@@ -1455,6 +1419,7 @@ def get_run(db: Session, user_id: int, run_id: int) -> dict[str, Any]:
     return {
         "id": run.id,
         "status": run.status,
+        **capabilities(run),
         "run_type": run.run_type,
         "mode": run.mode,
         "user_input": run.user_input,
@@ -1472,7 +1437,18 @@ def get_run(db: Session, user_id: int, run_id: int) -> dict[str, Any]:
         "conversation_id": run.conversation_id or graph_state.get("conversation_id", ""),
         "thread_id": run.thread_id or graph_state.get("thread_id", ""),
         "model_context": graph_state.get("model_context", {}),
+        "controls": _run_controls(db, user_id, run.id),
     }
+
+
+def _run_controls(db, user_id, run_id):
+    from sqlalchemy import select
+    from src.web_app.models.orm import AgentRunControl
+    from src.web_app.services.chat_control_service import control_response
+    return [control_response(item) for item in db.execute(select(AgentRunControl).where(
+        AgentRunControl.user_id == user_id,
+        (AgentRunControl.run_id == run_id) | (AgentRunControl.successor_run_id == run_id),
+    ).order_by(AgentRunControl.id)).scalars()]
 
 
 def list_steps(db: Session, user_id: int, run_id: int) -> list[dict[str, Any]]:
@@ -1529,7 +1505,7 @@ def list_conversations(db: Session, user_id: int, status: str = "active", limit:
 def get_conversation(db: Session, user_id: int, conversation_id: str) -> dict[str, Any]:
     conversation = _require_conversation(db, user_id, conversation_id)
     messages = AgentChatMessageRepository(db).list_by_conversation(user_id, conversation_id)
-    return _conversation_response(conversation, messages=messages)
+    return {**_conversation_response(conversation, messages=messages), "files": conversation_files(db, user_id, conversation_id)}
 
 
 def update_conversation(db: Session, user_id: int, conversation_id: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1594,140 +1570,9 @@ def hard_delete_conversation(
     *,
     cancel_pending: bool = False,
 ) -> dict[str, Any]:
-    repo = AgentConversationRepository(db)
-    run_repo = AgentRunRepository(db)
-    approval_repo = ApprovalRepository(db)
-    message_repo = AgentChatMessageRepository(db)
-
-    runs = run_repo.list_by_conversation(user_id, conversation_id)
-
-    # ── Precise pending guard ──────────────────────────────────
-    # Only block when there is a TRULY pending approval:
-    #   1. run.status IN ("waiting_approval", "paused")
-    #   2. run.graph_state.approval_required=true + pending_approval_id → truly pending approval
-    # NOT blocked: approved/rejected/cancelled/expired approvals,
-    #              completed/failed/cancelled runs,
-    #              stale graph_state on otherwise finished runs.
-    waiting_run_ids = [r.id for r in runs if r.status in ("waiting_approval", "paused")]
-    approval_required_run_ids: list[int] = []
-    pending_approval_ids: list[int] = []
-
-    for r in runs:
-        gs = r.graph_state or {}
-        if gs.get("approval_required") and gs.get("pending_approval_id"):
-            try:
-                approval = approval_repo.get_by_user(user_id, int(gs["pending_approval_id"]))
-                if approval and approval.status in ("pending", "waiting"):
-                    approval_required_run_ids.append(r.id)
-                    pending_approval_ids.append(approval.id)
-            except (ValueError, TypeError):
-                pass
-
-    # Also collect pending approvals linked to waiting runs (belt-and-suspenders)
-    for rid in waiting_run_ids:
-        for a in approval_repo.list_by_run(rid):
-            if a.status in ("pending", "waiting") and a.id not in pending_approval_ids:
-                pending_approval_ids.append(a.id)
-
-    blocked_run_ids = list(dict.fromkeys(waiting_run_ids + approval_required_run_ids))
-    has_pending = bool(blocked_run_ids)
-
-    logger.info(
-        "[conversation_delete] pending_guard conversation_id=%s pending_approval_count=%s "
-        "waiting_run_count=%s approval_required_run_count=%s blocked=%s",
-        conversation_id,
-        len(pending_approval_ids),
-        len(waiting_run_ids),
-        len(approval_required_run_ids),
-        has_pending,
-    )
-
-    # ── cancel_pending: cancel all pending approvals before deleting ──
-    if has_pending and cancel_pending:
-        import logging
-        _log = logging.getLogger(__name__)
-        now = datetime.now()
-
-        # Cancel all pending approvals
-        for aid in pending_approval_ids:
-            approval = approval_repo.get_by_user(user_id, aid)
-            if approval and approval.status == "pending":
-                payload = dict(approval.payload or {})
-                payload["cancelled_at"] = now.isoformat()
-                payload["cancelled_by"] = user_id
-                payload["cancelled_reason"] = "conversation_deleted"
-                payload["executed"] = False
-                approval_repo.update(approval, status="cancelled", payload=payload)
-                _log.info("cancel_pending: approval %s → cancelled", aid)
-
-        # Cancel all waiting runs
-        for run_id in blocked_run_ids:
-            run = run_repo.get_by_user(user_id, run_id)
-            if run:
-                gs = dict(run.graph_state or {})
-                gs["approval_required"] = False
-                gs["approval_payload"] = None
-                gs["pending_approval_id"] = None
-                gs["pending_tool_call_id"] = None
-                gs["error"] = ""
-                run_repo.update(
-                    run,
-                    status="cancelled",
-                    graph_state=_json_safe(gs),
-                    result_summary="会话被删除，待审批操作已取消。",
-                )
-                _log.info("cancel_pending: run %s → cancelled", run_id)
-
-        # Cancel assistant messages
-        messages = message_repo.list_by_conversation(user_id, conversation_id)
-        for msg in messages:
-            if msg.role == "assistant" and msg.status == "waiting_approval":
-                message_repo.update(
-                    msg,
-                    content="会话被删除，待审批操作已取消。",
-                    status="cancelled",
-                )
-
-        # Proceed with deletion
-        all_run_ids = [r.id for r in runs]
-        _cleanup_checkpoints_for_runs(all_run_ids)
-        try:
-            doc_ids = repo.get_conversation_document_ids(user_id, conversation_id)
-        except Exception:
-            doc_ids = set()
-        deleted = repo.hard_delete(user_id, conversation_id)
-        if not deleted:
-            raise ValueError("Agent conversation not found")
-        _cleanup_qdrant(db, user_id, doc_ids)
-        return {
-            "conversation_id": conversation_id,
-            "deleted_records": deleted,
-            "cancelled_approvals": len(pending_approval_ids),
-            "cancelled_runs": len(blocked_run_ids),
-        }
-
-    # ── No cancel_pending flag: block deletion ──────────────────
-    if has_pending:
-        raise PendingApprovalExistsError(
-            "当前会话有等待审批的操作，请先同意或拒绝后再删除。或者使用 cancel_pending=true 先取消再删除。",
-            blocked_run_ids=blocked_run_ids,
-            run_ids=pending_approval_ids,
-        )
-
-    all_run_ids = [r.id for r in runs]
-    _cleanup_checkpoints_for_runs(all_run_ids)
-    try:
-        doc_ids = repo.get_conversation_document_ids(user_id, conversation_id)
-    except Exception:
-        doc_ids = set()
-    deleted = repo.hard_delete(user_id, conversation_id)
-    if not deleted:
-        raise ValueError("Agent conversation not found")
-    _cleanup_qdrant(db, user_id, doc_ids)
-    return {
-        "conversation_id": conversation_id,
-        "deleted_records": deleted,
-    }
+    """Compatibility entry: enqueue only; the async API owns task scheduling."""
+    from src.web_app.services.conversation_deletion import request_deletion
+    return request_deletion(db, user_id, conversation_id, cancel_pending)
 
 
 def extract_user_visible_answer(value: Any) -> str:
@@ -1789,7 +1634,7 @@ def _update_conversation_summary_after_turn(
         new_messages = [
             {
                 "role": str(getattr(message, "role", "") or ""),
-                "content": str(getattr(message, "content", "") or ""),
+                "content": ("[未完成的回复，不作为已确认结论] " if getattr(message, "status", "") == "interrupted" else "") + str(getattr(message, "content", "") or ""),
             }
             for message in messages
         ]
@@ -2115,6 +1960,7 @@ def _create_conversation(db: Session, user_id: int, payload: dict[str, Any], tit
 
 
 def _require_conversation(db: Session, user_id: int, conversation_id: str):
+    check_conversation(db, user_id, conversation_id)
     conversation = AgentConversationRepository(db).get_by_conversation_id(user_id, conversation_id)
     if not conversation:
         raise ValueError("Agent conversation not found")

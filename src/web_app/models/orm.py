@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.web_app.db.base import Base
@@ -207,6 +207,23 @@ class AgentRun(Base, TimestampMixin):
     elapsed_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    supersedes_run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True)
+    chat_control_phase: Mapped[str] = mapped_column(String(32), default="disabled", server_default="disabled", nullable=False)
+
+
+class AgentRunControl(Base, TimestampMixin):
+    __tablename__ = "agent_run_controls"
+    __table_args__ = (Index("ix_agent_control_request", "user_id", "client_command_id", unique=True),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), index=True, nullable=False)
+    successor_run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True)
+    client_command_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    text: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="accepted", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
 
 
 class AgentConversation(Base, TimestampMixin):
@@ -457,6 +474,21 @@ class ResearchRun(Base, TimestampMixin):
     error: Mapped[str] = mapped_column(Text, default="", nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class ConversationDeletionTask(Base, TimestampMixin):
+    __tablename__ = "conversation_deletion_tasks"
+    __table_args__ = (UniqueConstraint("user_id", "conversation_id", name="uq_conversation_deletion_owner"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    phase: Mapped[str] = mapped_column(String(32), default="stopping", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    progress: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
 
 
 class AgentConversationSummary(Base, TimestampMixin):

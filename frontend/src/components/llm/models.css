@@ -1,0 +1,49 @@
+/* Model workspace: compact controls, quiet surfaces, explicit selection. */
+.mc-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 24px; background: rgb(20 26 34 / 35%); }
+.mc-dialog { width: min(1040px, 100%); height: min(740px, calc(100dvh - 48px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid #d6dde5; border-radius: 16px; background: #fff; color: #1c2530; box-shadow: 0 24px 80px rgb(16 28 45 / 20%); font-size: 14px; }
+.mc-dialog button, .mc-picker button { transition: background-color 160ms ease-out, border-color 160ms ease-out; }
+.mc-dialog button { border: 1px solid #d4dce5; border-radius: 7px; background: #fff; color: #303d4b; padding: 7px 11px; min-height: 34px; font-size: 12px; font-weight: 600; }
+.mc-dialog button:not(:disabled):hover { background: #edf2f7; border-color: #a9b8ca; }
+.mc-dialog :is(button, input, select, textarea, summary):focus-visible, .mc-picker :is(button, input):focus-visible { outline: 2px solid #2868ac; outline-offset: 3px; }
+.mc-dialog input, .mc-dialog select, .mc-dialog textarea, .mc-picker .mc-search { width: 100%; min-width: 0; border: 1px solid #cfd8e2; border-radius: 7px; padding: 9px 11px; background: #fff; color: #202c3a; font-size: 13px; }
+.mc-dialog input::placeholder, .mc-dialog textarea::placeholder, .mc-picker input::placeholder { color: #647184; opacity: 1; }
+.mc-header { display: flex; justify-content: space-between; align-items: center; padding: 22px 26px; border-bottom: 1px solid #e2e7ee; }
+.mc-header h2 { margin: 0; font-size: 21px; font-weight: 650; }
+.mc-header p { margin: 6px 0 0; color: #586679; font-size: 13px; }
+.mc-dialog .mc-icon-button { font-size: 23px; line-height: 1; border: 0; background: transparent; width: 36px; }
+.mc-body { display: grid; grid-template-columns: 238px minmax(0, 1fr); flex: 1; min-height: 0; }
+.mc-sidebar { display: flex; flex-direction: column; min-height: 0; background: #f3f6fa; border-right: 1px solid #e2e7ee; padding: 18px 12px; }
+.mc-sidebar-heading { display: flex; align-items: center; justify-content: space-between; padding: 0 6px 14px; }
+.mc-sidebar-heading strong { font-size: 12px; }.mc-sidebar-heading small { margin-left: 6px; color: #586679; }
+.mc-sidebar-heading button { min-height: 28px; padding: 1px 7px; font-size: 18px; }
+.mc-sidebar nav { overflow-y: auto; min-height: 0; padding-top: 14px; }
+.mc-dialog .mc-connection { display: flex; align-items: center; gap: 10px; width: 100%; border: 1px solid transparent; background: transparent; text-align: left; margin-bottom: 5px; padding: 10px 9px; }
+.mc-dialog .mc-connection.selected { background: #fff; border-color: #bdcfe2; box-shadow: 0 1px 3px rgb(30 50 70 / 5%); }
+.mc-connection > span:last-child { display: grid; gap: 5px; min-width: 0; }
+.mc-connection strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.mc-connection small { color: #566579; font-size: 11px; font-weight: 400; }
+.mc-provider-mark { flex: 0 0 30px; width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid #d2dce7; border-radius: 8px; background: #e8eef6; color: #355b83; }
+.mc-sidebar-note { margin: auto 6px 0; padding-top: 24px; font-size: 11px; color: #5b697a; line-height: 1.7; }
+.mc-main { position: relative; padding: 26px 28px; overflow-y: auto; min-width: 0; }
+.mc-detail-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 22px; }
+.mc-detail-heading h3 { margin: 0; font-size: 20px; overflow-wrap: anywhere; }.mc-detail-heading p { margin: 7px 0 0; font-size: 12px; color: #5b697a; }
+.mc-status { flex-shrink: 0; border: 1px solid #d8dfe7; border-radius: 20px; padding: 4px 9px; font-size: 11px; color: #5e6874; background: #f5f7fa; }
+.mc-status.ready { color: #226044; border-color: #c4dece; background: #edf7f0; }
+.mc-tabs { display: flex; gap: 6px; border-bottom: 1px solid #e2e7ee; margin-bottom: 22px; padding-bottom: 10px; }
+.mc-dialog .mc-tabs button { border-color: transparent; background: transparent; color: #5c6878; }.mc-dialog .mc-tabs button[aria-pressed=true] { color: #234f7f; background: #edf3fa; }
+.mc-form { max-width: 580px; }.mc-form fieldset { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 17px; }
+.mc-field { display: grid; gap: 8px; font-size: 12px; font-weight: 600; }.mc-field > span { display: flex; align-items: center; gap: 8px; }.mc-field small { color: #647184; font-size: 11px; font-weight: 400; }
+.mc-input-action { display: flex; gap: 7px; }.mc-input-action button { flex-shrink: 0; }.mc-advanced { padding-top: 5px; }.mc-advanced summary { cursor: pointer; font-size: 12px; color: #52647a; }.mc-advanced .mc-field { margin-top: 16px; }
+.mc-hint { color: #5a687a; font-size: 12px; line-height: 1.75; margin: 10px 0; }.mc-footer { display: flex; gap: 8px; padding: 6px 0 12px; }.mc-dialog .mc-primary { color: #fff; background: #284f79; border-color: #284f79; }.mc-dialog .mc-primary:not(:disabled):hover { background: #1e3e60; }
+.mc-delete-area { border-top: 1px solid #e3e8ef; margin-top: 24px; padding-top: 18px; font-size: 12px; }.mc-delete-area button { color: #a12720; margin-right: 8px; }
+.mc-model-toolbar, .mc-add-model { display: flex; gap: 9px; }.mc-model-toolbar button, .mc-add-model button { flex-shrink: 0; }
+.mc-model-list { margin: 20px 0; border-top: 1px solid #e3e8ef; }.mc-model-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 0; border-bottom: 1px solid #e3e8ef; }.mc-model-row.disabled { background: #f8f9fb; }
+.mc-model-name { display: grid; gap: 6px; min-width: 0; }.mc-model-name strong { font-size: 13px; overflow-wrap: anywhere; }.mc-model-name code { font-size: 11px; color: #536176; overflow-wrap: anywhere; }.mc-model-name small { font-size: 11px; color: #516478; }
+.mc-row-actions { display: flex; gap: 5px; flex-shrink: 0; }.mc-row-actions button { font-size: 11px; padding: 6px 8px; }.mc-dialog .mc-default:disabled { opacity: 1; background: #edf3fa; color: #254e7c; border-color: transparent; }
+.mc-empty, .mc-loading { padding: 36px 12px; text-align: center; color: #536176; }.mc-empty strong { color: #34465b; }.mc-empty p { font-size: 12px; line-height: 1.7; }
+.mc-feedback { padding: 11px 13px; border: 1px solid #d8e2ec; border-radius: 8px; font-size: 12px; line-height: 1.7; margin: 0 0 18px; overflow-wrap: anywhere; }.mc-feedback.error { background: #fff4f2; border-color: #f0c8c2; color: #9b3025; }.mc-feedback.success { background: #eef7f1; border-color: #c5dece; color: #245e40; }.mc-busy { position: sticky; bottom: 0; padding: 10px; border: 1px solid #c9d8e9; background: #edf3fa; color: #284f79; border-radius: 7px; font-size: 12px; }
+.model-selector-popover.mc-picker { width: min(344px, calc(100vw - 16px)); max-height: min(520px, 70dvh); display: flex; flex-direction: column; overflow: hidden; background: #fff; border-color: #d3dde8; border-radius: 12px; padding: 10px; }
+.mc-picker-results { overflow: auto; min-height: 0; margin-top: 8px; }.mc-picker-results h4 { margin: 14px 10px 5px; font-size: 11px; color: #536176; }.mc-picker-results button small { overflow-wrap: anywhere; }.mc-picker-results button > span { min-width: 0; }.mc-picker-results button strong { overflow-wrap: anywhere; }.mc-picker-results button[aria-pressed=true] { background: #edf3fa; color: #244e7d; }.mc-picker .manage-models-button { color: #284f79; }.mc-picker .model-selector-heading small { color: #5b697a; }
+@media (max-width: 760px) { .mc-backdrop { padding: 8px; }.mc-dialog { height: calc(100dvh - 16px); }.mc-header { padding: 16px; }.mc-body { grid-template-columns: 170px minmax(0, 1fr); }.mc-main { padding: 20px 16px; }.mc-model-row { align-items: flex-start; flex-direction: column; gap: 12px; }.mc-sidebar { padding: 14px 8px; }.mc-connection .mc-provider-mark { display: none; } }
+@media (max-width: 480px) { .mc-body { display: flex; flex-direction: column; }.mc-sidebar { max-height: 175px; flex-shrink: 0; border-right: 0; border-bottom: 1px solid #e2e7ee; }.mc-sidebar-heading { padding-bottom: 7px; }.mc-sidebar nav { display: flex; gap: 6px; padding-top: 8px; flex-shrink: 0; }.mc-dialog .mc-connection { width: auto; min-width: 125px; margin: 0; }.mc-sidebar-note { display: none; }.mc-main { flex: 1; }.mc-row-actions { flex-wrap: wrap; }.mc-header h2 { font-size: 19px; } }
+@media (prefers-reduced-motion: reduce) { .mc-dialog button, .mc-picker button { transition: none; }.model-selector-popover.mc-picker { animation: none; } }

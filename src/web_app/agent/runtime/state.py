@@ -180,6 +180,10 @@ class AgentRuntimeState(TypedDict, total=False):
     dispatch_warnings: list[str]
 
     # ── Event sequencing ───────────────────────────────────────────
+    interaction_version: int
+    chat_entry_route: str
+    conversation_files: list[dict[str, Any]]
+    file_context: dict[str, Any]
     _event_seq: int
     message_id: str
 

@@ -27,7 +27,7 @@ def build_chat_model(context: ModelExecutionContext, *, temperature: float | Non
     config = context.config
     api_key = str(context.secrets.get("api_key") or "")
     base_url = normalize_model_endpoint(str(config.get("base_url") or ""), protocol)
-    headers = dict(config.get("custom_headers") or {})
+    headers = {**dict(config.get("custom_headers") or {}), **dict(context.secrets.get("custom_headers") or {})}
     if context.provider == "custom" and api_key and config.get("auth_header") not in (None, "", "Authorization"):
         headers[str(config["auth_header"])] = api_key
         api_key = "not-required"
@@ -87,10 +87,10 @@ def _supports_temperature(model: str) -> bool:
 
 
 def normalize_model_endpoint(value: str, protocol: str) -> str:
-    base_url = value.rstrip("/")
+    base_url = value.strip().rstrip("/")
     suffixes = {
-        "openai_chat_completions": ("/chat/completions",),
-        "openai_responses": ("/responses",),
+        "openai_chat_completions": ("/chat/completions", "/responses"),
+        "openai_responses": ("/responses", "/chat/completions"),
         "anthropic_messages": ("/v1/messages", "/messages"),
         "ollama_chat": ("/api/chat", "/chat/completions"),
     }.get(protocol, ())

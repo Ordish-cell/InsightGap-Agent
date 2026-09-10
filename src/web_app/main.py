@@ -8,6 +8,19 @@ from src.web_app.api.v1.router import api_router
 from src.web_app.core.config import settings
 
 app = FastAPI(title="Open Deep Research Agent OS API")
+from fastapi.responses import JSONResponse
+from src.web_app.services.conversation_deletion import DeletionError
+from src.web_app.services.deletion_guard import ConversationDeletingError
+
+
+@app.exception_handler(DeletionError)
+async def deletion_error_handler(request, exc):
+    return JSONResponse(status_code=exc.status, content={"error": {"code": exc.code, "message": exc.message}})
+
+
+@app.exception_handler(ConversationDeletingError)
+async def deleting_error_handler(request, exc):
+    return JSONResponse(status_code=409, content={"error": {"code": "CONVERSATION_DELETING", "message": str(exc)}})
 
 _log_main = logging.getLogger(__name__)
 
@@ -59,6 +72,23 @@ async def startup_health_checks():
         _log_main.error("[STARTUP] checkpointer health check error (non-fatal): %s", exc)
 
     # ── Background checkpoint / approval cleanup ──────────────────
+    from src.web_app.services.chat_control_service import recover_chat_controls
+    from src.web_app.db.session import SessionLocal
+    recover_chat_controls(SessionLocal)
+    from src.web_app.services.conversation_deletion import require_schema, Job, deletion_manager
+    from sqlalchemy import select
+    with SessionLocal() as db:
+        try:
+            require_schema(db)
+            for job in db.scalars(select(Job).where(Job.status.in_(["pending", "running", "failed"]))):
+                if job.attempts < 4:
+                    deletion_manager.start(job.id)
+                elif job.status != "failed":
+                    job.status = "failed"
+                    job.error_message = "服务重启前删除未完成，自动重试次数已用尽，请手动重试。"
+            db.commit()
+        except DeletionError:
+            _log_main.warning("Deletion task migration 20260909_0015 is not applied; hard deletion is unavailable.")
     _launch_cleanup_scheduler()
 
 
@@ -68,6 +98,10 @@ async def shutdown_agent_runs():
     from src.web_app.services.document_ingest_task_manager import document_ingest_task_manager
 
     await asyncio.gather(agent_run_task_manager.shutdown(), document_ingest_task_manager.shutdown())
+    from src.web_app.services.summary_tasks import summary_tasks
+    await summary_tasks.shutdown()
+    from src.web_app.services.conversation_deletion import deletion_manager
+    await deletion_manager.shutdown()
 
 
 def _launch_cleanup_scheduler() -> None:

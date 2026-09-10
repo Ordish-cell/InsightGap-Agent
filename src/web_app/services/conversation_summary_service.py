@@ -129,7 +129,7 @@ def _parse_json(text: str) -> dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        logger.warning("conversation_summary.parse_json_failed raw_preview=%s", text[:200])
+        logger.warning("conversation_summary.parse_json_failed output_chars=%s", len(text))
         return {}
 
 
@@ -139,13 +139,8 @@ def _llm_call(prompt: str) -> str:
 
     model = get_chat_model("memory", complexity="low", temperature=0.15)
     message = model.invoke(prompt)
-    content = getattr(message, "content", str(message))
-    if isinstance(content, list):
-        content = "\n".join(
-            str(item.get("text", item)) if isinstance(item, dict) else str(item)
-            for item in content
-        )
-    return str(content)
+    from src.web_app.agent.llm.content import message_text
+    return message_text(message)
 
 
 def _count_tokens(text: str) -> int:
@@ -217,6 +212,7 @@ class ConversationSummaryService:
         new_messages: list[dict[str, str]],
         *,
         db: Session | None = None,
+        last_message_id: int | None = None,
     ) -> dict[str, Any] | None:
         """Update the running summary after one or more new messages.
 
@@ -267,7 +263,7 @@ class ConversationSummaryService:
         open_threads = list(parsed.get("open_threads") or [])[:15]
         entities = list(parsed.get("entities") or [])[:30]
 
-        last_message_id = existing.last_message_id if existing else None
+        last_message_id = last_message_id or (existing.last_message_id if existing else None)
         new_count = (existing.covered_message_count if existing else 0) + len(new_messages)
 
         values = {
@@ -284,7 +280,9 @@ class ConversationSummaryService:
             values["summary_version"] = existing.summary_version + 1
 
         try:
-            repo.upsert(user_id, conversation_id, **values)
+            from src.web_app.services.deletion_guard import conversation_write
+            with conversation_write(db, user_id, conversation_id):
+                repo.upsert(user_id, conversation_id, **values)
         except Exception as exc:
             logger.exception("conversation_summary.db_write_failed error=%s", exc)
 
@@ -363,6 +361,8 @@ class ConversationSummaryService:
             user_id=user_id,
             after_message_id=latest_segment.end_message_id if latest_segment else None,
         )
+        # Failed/interrupted assistant text must not become settled long-term memory.
+        pending_messages = [m for m in pending_messages if m.status == "completed"]
 
         if len(pending_messages) < segment_size:
             logger.debug(
@@ -430,6 +430,8 @@ class ConversationSummaryService:
             end_ts = getattr(last_msg, "created_at", None)
 
             try:
+                from src.web_app.services.deletion_guard import check_conversation
+                check_conversation(db, user_id, conversation_id)
                 segment = segment_repo.create_segment(
                     conversation_id=conversation_id,
                     user_id=user_id,
@@ -459,6 +461,7 @@ class ConversationSummaryService:
             # 6. Try indexing into Qdrant (best-effort, must not fail)
             qdrant_id = ""
             try:
+                check_conversation(db, user_id, conversation_id)
                 qdrant_id = self._index_segment_to_qdrant(
                     segment_id=segment.id,
                     conversation_id=conversation_id,
@@ -899,6 +902,8 @@ def _format_messages_for_segment(messages: list[Any]) -> list[dict[str, str]]:
     for m in messages:
         role = getattr(m, "role", "unknown")
         content = (getattr(m, "content", "") or "")[:800]
+        if getattr(m, "status", "") == "interrupted":
+            content = "[未完成的回复，不作为已确认结论] " + content
         formatted.append({"role": role, "content": content})
     return formatted
 
@@ -916,6 +921,8 @@ def _fallback_segment_summary(messages: list[Any]) -> str:
         for m in messages[:8]:
             role = getattr(m, "role", "")
             content = (getattr(m, "content", "") or "")[:120]
+            if getattr(m, "status", "") == "interrupted":
+                content = "[未完成] " + content
             if content:
                 lines.append(f"- [{role}] {content}")
     return "\n".join(lines)

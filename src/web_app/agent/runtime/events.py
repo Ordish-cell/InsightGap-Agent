@@ -26,6 +26,13 @@ VISIBILITY_INTERNAL = "internal"
 # Map event_type → (visibility, display_channel).  Everything not listed
 # defaults to ("trace", "status").
 _EVENT_DISPLAY: dict[str, tuple[str, str]] = {
+    "interaction_mode": (VISIBILITY_USER, DISPLAY_CHANNEL_STATUS),
+    "progress_delta": (VISIBILITY_USER, DISPLAY_CHANNEL_THINKING),
+    "progress_completed": (VISIBILITY_USER, DISPLAY_CHANNEL_THINKING),
+    "run_capabilities": (VISIBILITY_USER, DISPLAY_CHANNEL_STATUS),
+    "control_accepted": (VISIBILITY_USER, DISPLAY_CHANNEL_STATUS),
+    "control_applied": (VISIBILITY_USER, DISPLAY_CHANNEL_STATUS),
+    "control_failed": (VISIBILITY_USER, DISPLAY_CHANNEL_STATUS),
     "visible_thought_delta": (VISIBILITY_USER, DISPLAY_CHANNEL_THINKING),
     "visible_progress_delta": (VISIBILITY_USER, DISPLAY_CHANNEL_THINKING),
     "answer_started": (VISIBILITY_USER, DISPLAY_CHANNEL_ANSWER),
@@ -86,6 +93,8 @@ class ProgressPayload(AgentEventPayload):
 
 
 _PAYLOAD_SCHEMAS: dict[str, type[AgentEventPayload]] = {
+    "progress_delta": ProgressPayload,
+    "progress_completed": ProgressPayload,
     "run_created": RunEventPayload,
     "run_paused": RunEventPayload,
     "run_resumed": RunEventPayload,

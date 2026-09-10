@@ -6,6 +6,7 @@ from sqlalchemy import delete as sa_delete
 
 from src.web_app.db.repositories.base_repository import BaseRepository
 from src.web_app.models.orm import AgentChatMessage, AgentConversation, AgentConversationSummary, AgentConversationSummarySegment, AgentEvent, AgentRun, AgentStep, Approval, Artifact, Document, DocumentChunk, LLMCall, Memory, ResearchRun, ToolCall
+from src.web_app.models.orm import AgentRunControl
 
 
 class AgentRunRepository(BaseRepository[AgentRun]):
@@ -21,6 +22,9 @@ class AgentRunRepository(BaseRepository[AgentRun]):
     def hard_delete_cascade(self, run: AgentRun) -> None:
         """Delete a run and all its child records (steps, events, llm_calls, tool_calls)."""
         run_id = run.id
+        self.db.execute(delete(AgentRunControl).where(AgentRunControl.run_id == run_id))
+        self.db.execute(update(AgentRunControl).where(AgentRunControl.successor_run_id == run_id).values(successor_run_id=None))
+        self.db.execute(update(AgentRun).where(AgentRun.supersedes_run_id == run_id).values(supersedes_run_id=None))
         # Use core-level bulk deletes for children — they execute immediately
         # so FK constraints are resolved before the parent is removed.
         self.db.execute(delete(AgentStep).where(AgentStep.run_id == run_id))
@@ -132,92 +136,7 @@ class AgentConversationRepository(BaseRepository[AgentConversation]):
         return int(self.db.execute(stmt).scalar() or 0)
 
     def hard_delete(self, user_id: int, conversation_id: str) -> int:
-        """Hard-delete a conversation and all associated records.
-
-        Cascade includes: messages, runs, steps, events, llm_calls, tool_calls,
-        documents (and chunks), and working conversations memories.
-        Returns total count of deleted records.
-        """
-        deleted = 0
-        conversation = self.db.execute(
-            select(AgentConversation).where(
-                AgentConversation.user_id == user_id,
-                AgentConversation.conversation_id == conversation_id,
-            )
-        ).scalar_one_or_none()
-        if not conversation:
-            return 0
-
-        run_repo = AgentRunRepository(self.db)
-        msg_repo = AgentChatMessageRepository(self.db)
-        runs = run_repo.list_by_conversation(user_id, conversation_id)
-        run_ids = [run.id for run in runs]
-
-        # ── 0) Collect document IDs from chat attachments ──────────────
-        doc_ids: set[int] = set()
-        messages = msg_repo.list_by_conversation(user_id, conversation_id)
-        for msg in messages:
-            meta = msg.metadata_json or {}
-            attachments = meta.get("attachments") or []
-            for att in attachments:
-                did = att.get("document_id") if isinstance(att, dict) else None
-                if did:
-                    try:
-                        doc_ids.add(int(did))
-                    except (TypeError, ValueError):
-                        pass
-
-        # 1) Delete chat messages first — they have FK run_id → agent_runs
-        deleted += msg_repo.hard_delete_by_conversation(user_id, conversation_id)
-
-        # 2) NULL out FK references from tables we're NOT deleting
-        if run_ids:
-            self.db.execute(update(Approval).where(Approval.run_id.in_(run_ids)).values(run_id=None))
-            self.db.execute(update(Artifact).where(Artifact.run_id.in_(run_ids)).values(run_id=None))
-            self.db.execute(update(ResearchRun).where(ResearchRun.agent_run_id.in_(run_ids)).values(agent_run_id=None))
-            self.db.execute(
-                update(AgentConversation)
-                .where(AgentConversation.id == conversation.id, AgentConversation.last_run_id.in_(run_ids))
-                .values(last_run_id=None)
-            )
-
-        # 3) Cascade-delete each run (steps, events, llm_calls, tool_calls → run)
-        for run_id in run_ids:
-            run = run_repo.get_by_id(run_id)
-            if run:
-                run_repo.hard_delete_cascade(run)
-                deleted += 1
-
-        # 4) Delete documents and chunks for this conversation
-        if doc_ids:
-            doc_list = list(doc_ids)
-            self.db.execute(
-                sa_delete(DocumentChunk).where(
-                    DocumentChunk.user_id == user_id,
-                    DocumentChunk.document_id.in_(doc_list),
-                )
-            )
-            self.db.execute(
-                sa_delete(Document).where(
-                    Document.user_id == user_id,
-                    Document.id.in_(doc_list),
-                )
-            )
-            deleted += len(doc_ids)
-
-        # 5) Delete working / conversation-scoped episodic memories
-        mem_stmt = sa_delete(Memory).where(
-            Memory.user_id == user_id,
-            Memory.memory_type.in_(["working"]),
-        )
-        result = self.db.execute(mem_stmt)
-        deleted += result.rowcount or 0
-
-        # 6) Delete the conversation itself
-        self.db.delete(conversation)
-        self._commit()
-        deleted += 1
-        return deleted
+        raise RuntimeError("Use the durable conversation deletion task; direct repository deletion is disabled.")
 
     def get_conversation_document_ids(self, user_id: int, conversation_id: str) -> set[int]:
         """Return document IDs from chat attachment metadata."""

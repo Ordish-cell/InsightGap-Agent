@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from time import perf_counter
+from urllib.parse import urlsplit
 
 import httpx
 from sqlalchemy import select
@@ -9,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from src.web_app.agent.llm.context import ModelExecutionContext
 from src.web_app.agent.llm.crypto import decrypt_secrets, encrypt_secrets, masked_secret
+from src.web_app.agent.llm.factory import build_chat_model, normalize_model_endpoint
 from src.web_app.agent.llm.registry import DEFAULT_CAPABILITIES, SECRET_FIELD_KEYS, catalog, get_provider
 from src.web_app.core.config import get_settings
 from src.web_app.models.orm import AgentConversation, LLMConnection, LLMModel, UserProfile
@@ -37,8 +40,6 @@ def create_connection(db: Session, user_id: int, payload: dict[str, Any]) -> dic
     _validate_fields(provider, fields)
     secrets, config = _split_fields(fields)
     model_id = str(payload.get("model_id") or fields.get("deployment") or "").strip()
-    if provider.key == "custom" and not model_id:
-        raise ModelSetupError("model_id_required")
     row = LLMConnection(
         user_id=user_id,
         provider=provider.key,
@@ -69,9 +70,17 @@ def update_connection(db: Session, user_id: int, connection_id: int, payload: di
     for key in SECRET_FIELD_KEYS:
         fields.pop(key, None)
     _apply_field_defaults(provider, fields)
-    _validate_fields(provider, {**fields, **old_secrets, **incoming_secrets})
+    validated = {**fields, **old_secrets, **incoming_secrets}
+    _validate_fields(provider, validated)
+    fields = {key: value for key, value in validated.items() if key not in SECRET_FIELD_KEYS}
+    next_secrets = {**old_secrets, **incoming_secrets}
+    protocol = str(payload.get("protocol") or row.protocol)
+    if protocol not in (provider.protocols or (provider.protocol,)):
+        raise ModelSetupError("protocol_not_supported")
+    changed = fields != (row.config_json or {}) or next_secrets != old_secrets or protocol != row.protocol
     row.config_json = fields
-    row.encrypted_secrets = encrypt_secrets({**old_secrets, **incoming_secrets})
+    if next_secrets != old_secrets:
+        row.encrypted_secrets = encrypt_secrets(next_secrets)
     if payload.get("display_name") is not None:
         row.display_name = str(payload["display_name"]).strip()
     if payload.get("protocol") is not None:
@@ -79,10 +88,12 @@ def update_connection(db: Session, user_id: int, connection_id: int, payload: di
         if protocol not in (provider.protocols or (provider.protocol,)):
             raise ModelSetupError("protocol_not_supported")
         row.protocol = protocol
-    row.revision += 1
-    row.status = "draft"
-    row.last_test_status = "untested"
-    row.last_test_error = ""
+    if changed:
+        row.revision += 1
+        row.status = "draft"
+        row.last_test_status = "untested"
+        row.last_test_error = ""
+        row.last_tested_at = None
     db.commit()
     db.refresh(row)
     return _connection_response(db, row)
@@ -145,59 +156,72 @@ def delete_model(db: Session, user_id: int, connection_id: int, model_pk: int) -
 
 
 def test_connection(db: Session, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """Test the chosen generation protocol; a model listing is not a generation test."""
     connection_id = payload.get("connection_id")
-    if connection_id:
-        row = _connection(db, user_id, int(connection_id))
-        provider_key, protocol = row.provider, row.protocol
-        fields = {**(row.config_json or {}), **decrypt_secrets(row.encrypted_secrets)}
-        supplied = dict(payload.get("fields") or {})
-        fields.update({key: value for key, value in supplied.items() if value not in (None, "")})
-    else:
-        row = None
-        provider_key = str(payload.get("provider") or "")
-        provider = get_provider(provider_key)
-        protocol = str(payload.get("protocol") or provider.protocol)
-        fields = dict(payload.get("fields") or {})
-        _apply_field_defaults(provider, fields)
+    row = _connection(db, user_id, int(connection_id)) if connection_id else None
+    provider_key = row.provider if row else str(payload.get("provider") or "")
     provider = get_provider(provider_key)
+    protocol = str(payload.get("protocol") or (row.protocol if row else provider.protocol))
+    stored_fields = {**(row.config_json or {}), **decrypt_secrets(row.encrypted_secrets)} if row else {}
+    fields = {**stored_fields, **{k: v for k, v in dict(payload.get("fields") or {}).items() if v not in (None, "")}}
+    _apply_field_defaults(provider, fields)
     if protocol not in (provider.protocols or (provider.protocol,)):
         raise ModelSetupError("protocol_not_supported")
     _validate_fields(provider, fields)
+    selected_model = str(payload.get("model_id") or fields.get("deployment") or "").strip()
+    if not selected_model and row:
+        selected_model = db.scalar(select(LLMModel.model_id).where(LLMModel.connection_id == row.id, LLMModel.enabled.is_(True)).order_by(LLMModel.id)) or ""
+    if not selected_model:
+        raise ModelSetupError("model_id_required")
+    # Testing edited, unsaved fields is a preview and must never activate saved credentials.
+    persist = bool(row and fields == stored_fields and protocol == row.protocol)
+    revision = row.revision if row else 0
+    db.rollback()  # Release the read transaction before calling the provider.
+    secrets, config = _split_fields(fields)
+    temporary = ModelExecutionContext(0, int(connection_id or 0), revision, provider_key, protocol, selected_model, "Connection test", config, secrets, dict(DEFAULT_CAPABILITIES))
+    started = perf_counter()
+    failure = None
     try:
-        models = _discover(provider.discovery, fields)
-        if provider.discovery == "none":
-            selected_model = str(payload.get("model_id") or fields.get("deployment") or "").strip()
-            if not selected_model:
-                raise ModelSetupError("model_id_required")
-            from src.web_app.agent.llm.factory import build_chat_model
-            temporary = ModelExecutionContext(0, 0, 0, provider_key, protocol, selected_model, "Connection test", {key: value for key, value in fields.items() if key not in SECRET_FIELD_KEYS}, {key: value for key, value in fields.items() if key in SECRET_FIELD_KEYS}, dict(DEFAULT_CAPABILITIES))
-            build_chat_model(temporary, temperature=None).invoke("Reply with OK")
-        result = {"status": "ok", "models": models}
-        if row:
-            row.status = "active"
-            row.last_test_status = "passed"
-            row.last_test_error = ""
-            row.last_tested_at = datetime.now(UTC).replace(tzinfo=None)
-            _upsert_discovered_models(db, row, models)
-            _ensure_default(db, user_id, row)
-            db.commit()
-        return result
+        reply = build_chat_model(temporary, temperature=None, timeout_seconds=20).invoke("Reply with OK. Do not use tools.")
+        if not getattr(reply, "content", None):
+            raise ModelSetupError("empty_model_response")
     except Exception as exc:
-        if row:
-            row.status = "draft"
-            row.last_test_status = "failed"
-            row.last_test_error = _safe_error(exc, [str(fields.get(key) or "") for key in SECRET_FIELD_KEYS])
-            row.last_tested_at = datetime.now(UTC).replace(tzinfo=None)
-            db.commit()
-        raise ModelSetupError(_classify_error(exc)) from exc
+        failure = _classify_error(exc)
+    if persist:
+        row = db.scalar(select(LLMConnection).where(LLMConnection.id == connection_id, LLMConnection.user_id == user_id, LLMConnection.deleted_at.is_(None)).with_for_update().execution_options(populate_existing=True))
+        if not row or row.revision != revision:
+            db.rollback()
+            raise ModelSetupError("connection_changed_during_test")
+        row.last_test_status = "failed" if failure else "passed"
+        row.last_test_error = failure or ""
+        row.last_tested_at = datetime.now(UTC).replace(tzinfo=None)
+        if not failure:
+            row.status = "active"
+            tested_model = _add_model_row(db, row, {"model_id": selected_model, "source": "manual"})
+            _ensure_default(db, user_id, row, tested_model.id)
+        db.commit()
+    if failure:
+        raise ModelSetupError(failure)
+    return {"status": "ok", "model_id": selected_model, "models": [], "persisted": persist,
+            "latency_ms": round((perf_counter() - started) * 1000)}
 
 
 def discover_models(db: Session, user_id: int, connection_id: int) -> list[dict[str, Any]]:
     row = _connection(db, user_id, connection_id)
-    if row.status != "active":
-        raise ModelSetupError("connection_not_verified")
     fields = {**(row.config_json or {}), **decrypt_secrets(row.encrypted_secrets)}
-    models = _discover(get_provider(row.provider).discovery, fields)
+    kind = _discovery_kind(row.provider, row.protocol)
+    if kind == "none":
+        raise ModelSetupError("model_discovery_unavailable")
+    revision = row.revision
+    db.rollback()
+    try:
+        models = _discover(kind, fields)
+    except Exception as exc:
+        raise ModelSetupError(_classify_error(exc)) from exc
+    row = db.scalar(select(LLMConnection).where(LLMConnection.id == connection_id, LLMConnection.user_id == user_id, LLMConnection.deleted_at.is_(None)).with_for_update().execution_options(populate_existing=True))
+    if not row or row.revision != revision:
+        db.rollback()
+        raise ModelSetupError("connection_changed_during_test")
     _upsert_discovered_models(db, row, models)
     db.commit()
     return [_model_response(item) for item in db.scalars(select(LLMModel).where(LLMModel.connection_id == row.id, LLMModel.enabled.is_(True))).all()]
@@ -357,6 +381,21 @@ def _validate_fields(provider: Any, fields: dict[str, Any]) -> None:
         raise ModelSetupError(f"missing_required_fields:{','.join(missing)}")
     if "custom_headers" in fields and not isinstance(fields["custom_headers"], dict):
         raise ModelSetupError("custom_headers_must_be_an_object")
+    if any(not isinstance(k, str) or not isinstance(v, str) or any(c in k + v for c in "\r\n") for k, v in (fields.get("custom_headers") or {}).items()):
+        raise ModelSetupError("invalid_custom_headers")
+    for definition in provider.fields:
+        if definition.kind == "url" and fields.get(definition.key):
+            parsed = urlsplit(str(fields[definition.key]).strip())
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise ModelSetupError(f"invalid_url:{definition.key}")
+            fields[definition.key] = str(fields[definition.key]).strip().rstrip("/")
+
+
+def _discovery_kind(provider_key: str, protocol: str) -> str:
+    if provider_key != "custom":
+        return get_provider(provider_key).discovery
+    return {"openai_chat_completions": "openai_models", "openai_responses": "openai_models",
+            "anthropic_messages": "anthropic_models", "ollama_chat": "ollama_tags"}.get(protocol, "none")
 
 
 def _split_fields(fields: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -366,14 +405,12 @@ def _split_fields(fields: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any
 def _discover(kind: str, fields: dict[str, Any]) -> list[dict[str, Any]]:
     timeout = float(get_settings().llm_timeout_seconds)
     api_key = str(fields.get("api_key") or "")
-    base_url = str(fields.get("base_url") or "").rstrip("/")
-    for suffix in ("/chat/completions", "/responses"):
-        if base_url.endswith(suffix):
-            base_url = base_url[:-len(suffix)]
+    protocol = "anthropic_messages" if kind == "anthropic_models" else "ollama_chat" if kind == "ollama_tags" else "openai_chat_completions"
+    base_url = normalize_model_endpoint(str(fields.get("base_url") or ""), protocol)
     if kind == "none":
         return []
     if kind == "ollama_tags":
-        response = httpx.get(f"{base_url}/api/tags", timeout=timeout)
+        response = httpx.get(f"{base_url.removesuffix('/v1')}/api/tags", headers=dict(fields.get("custom_headers") or {}), timeout=timeout)
         response.raise_for_status()
         return [{"model_id": item.get("model") or item.get("name"), "display_name": item.get("name") or item.get("model")} for item in response.json().get("models", []) if item.get("model") or item.get("name")]
     if kind == "gemini_models":
@@ -392,9 +429,14 @@ def _discover(kind: str, fields: dict[str, Any]) -> list[dict[str, Any]]:
     headers = {"Authorization": f"Bearer {api_key}"}
     if kind == "anthropic_models":
         headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01"}
-        url = f"{base_url}/v1/models"
+        url = f"{base_url.removesuffix('/v1')}/v1/models"
     else:
         url = f"{base_url}/models"
+    if fields.get("auth_header") not in (None, "", "Authorization"):
+        headers.pop("Authorization", None)
+        if api_key:
+            headers[str(fields["auth_header"])] = api_key
+    headers.update(dict(fields.get("custom_headers") or {}))
     items = []
     after = ""
     for _ in range(20):
@@ -413,36 +455,42 @@ def _discover(kind: str, fields: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _upsert_discovered_models(db: Session, connection: LLMConnection, models: list[dict[str, Any]]) -> None:
     for model in models:
-        _add_model_row(db, connection, {**model, "source": "discovered"})
+        # Refresh must not silently re-enable models explicitly disabled by the user.
+        existing = db.scalar(select(LLMModel.id).where(LLMModel.connection_id == connection.id, LLMModel.model_id == model["model_id"]))
+        if not existing:
+            _add_model_row(db, connection, {**model, "source": "discovered"})
 
 
-def _ensure_default(db: Session, user_id: int, connection: LLMConnection) -> None:
+def _ensure_default(db: Session, user_id: int, connection: LLMConnection, tested_model_id: int | None = None) -> None:
     profile = db.scalar(select(UserProfile).where(UserProfile.user_id == user_id))
     if not profile:
         profile = UserProfile(user_id=user_id)
         db.add(profile)
         db.flush()
     if profile.default_llm_model_id is None:
+        if tested_model_id:
+            profile.default_llm_model_id = tested_model_id
+            return
         first_model = db.scalar(select(LLMModel).where(LLMModel.connection_id == connection.id, LLMModel.enabled.is_(True)).order_by(LLMModel.id))
         if first_model:
             profile.default_llm_model_id = first_model.id
 
 
-def _safe_error(exc: Exception, secret_values: list[str] | None = None) -> str:
-    message = str(exc).replace("\n", " ")
-    for value in secret_values or []:
-        if value:
-            message = message.replace(value, "***")
-    return message[:500]
-
-
 def _classify_error(exc: Exception) -> str:
+    if isinstance(exc, ModelSetupError):
+        return str(exc)
+    if isinstance(exc, httpx.ConnectError):
+        return "connection_unreachable"
     if isinstance(exc, httpx.TimeoutException):
         return "connection_timeout"
-    if isinstance(exc, httpx.HTTPStatusError):
-        code = exc.response.status_code
+    if isinstance(exc, httpx.HTTPStatusError) or getattr(exc, "status_code", None):
+        code = exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else exc.status_code
         if code in (401, 403): return "authentication_failed"
         if code == 404: return "endpoint_or_model_not_found"
         if code == 429: return "rate_limited"
         return f"provider_http_error:{code}"
+    if "timeout" in type(exc).__name__.lower():
+        return "connection_timeout"
+    if type(exc).__name__ in {"APIConnectionError", "ConnectError"}:
+        return "connection_unreachable"
     return f"connection_failed:{type(exc).__name__}"

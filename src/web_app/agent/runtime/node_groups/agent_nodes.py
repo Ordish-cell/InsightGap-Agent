@@ -276,18 +276,20 @@ class AgentNodesMixin:
                 and not overview
                 and not doc_ids_raw
             )
-            if prepared_evidence:
+            if prepared_evidence and not (intent == "document_qa" and overview and doc_ids_raw):
                 from src.web_app.context.builder import ContextBuilder as _RagContextBuilder
                 context = _RagContextBuilder().build({
                     "task": user_input_str,
                     "evidence": prepared_evidence,
                     "output_contract": "Answer only from evidence and cite chunk_id/source_title.",
                 })
+                evidence = rag_service._evidence_from_results(prepared_evidence)
                 result = {
-                    "answer": rag_service._extractive_answer(user_input_str, prepared_evidence),
-                    "answer_mode": "extractive_fallback",
-                    "evidence": prepared_evidence,
+                    "answer": "[document_qa_context]",
+                    "answer_mode": "retrieval_context",
+                    "evidence": evidence,
                     "context": {
+                        "document_context_block": rag_service._document_context_block(evidence),
                         "gssc_used": True,
                         "selected_chunks": len(prepared_evidence),
                         "token_estimate": max(1, len(context) // 4),

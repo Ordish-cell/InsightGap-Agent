@@ -1,7 +1,7 @@
 from cryptography.fernet import Fernet
 import pytest
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 from src.web_app.agent.llm.context import ModelExecutionContext
 from src.web_app.agent.llm.factory import build_chat_model, normalize_model_endpoint
@@ -40,6 +40,7 @@ def _active_connection(db, user_id: int, monkeypatch):
         "fields": {"api_key": "sk-secret-value"}, "model_id": "gpt-5.4-mini",
     })
     monkeypatch.setattr("src.web_app.services.llm_registry_service._discover", lambda *_: [{"model_id": "gpt-5.4-mini", "display_name": "GPT-5.4 mini"}])
+    monkeypatch.setattr("src.web_app.services.llm_registry_service.build_chat_model", lambda *a, **k: SimpleNamespace(invoke=lambda *_: SimpleNamespace(content="OK")))
     verify_connection(db, user_id, {"connection_id": created["id"]})
     return list_connections(db, user_id)[0]
 
@@ -157,11 +158,13 @@ def test_factory_normalizes_all_supported_providers(monkeypatch, provider, proto
         assert result.kwargs["default_headers"]["X-Token"] == "secret"
 
 
-def test_custom_requires_model_and_azure_uses_deployment():
+def test_custom_can_save_before_model_selection_and_azure_uses_deployment():
     db = make_test_session()
     user = _user(db, "required@example.com")
+    custom = create_connection(db, user.id, {"provider": "custom", "fields": {"base_url": "https://custom.test", "api_key": "secret"}})
+    assert custom["status"] == "draft" and custom["models"] == []
     with pytest.raises(ModelSetupError, match="model_id_required"):
-        create_connection(db, user.id, {"provider": "custom", "fields": {"base_url": "https://custom.test", "api_key": "secret"}})
+        verify_connection(db, user.id, {"connection_id": custom["id"]})
     azure = create_connection(db, user.id, {
         "provider": "azure_openai",
         "fields": {"api_key": "secret", "endpoint": "https://azure.test", "deployment": "production-chat", "api_version": "2025-04-01-preview"},
@@ -227,6 +230,125 @@ def test_deep_research_stages_receive_run_scoped_connection_options():
         "base_url": "https://provider.test/v1",
         "use_responses_api": True,
     }
+
+
+def test_rename_and_identical_save_keep_verification(monkeypatch):
+    db = make_test_session()
+    user = _user(db, "rename@example.test")
+    connection = _active_connection(db, user.id, monkeypatch)
+    changed = update_connection(db, user.id, connection["id"], {"display_name": "Personal", "fields": connection["fields"], "protocol": connection["protocol"]})
+    assert changed["revision"] == connection["revision"]
+    assert changed["status"] == "active" and changed["last_test_status"] == "passed"
+    changed = update_connection(db, user.id, connection["id"], {"fields": {"base_url": "https://other.test/v1"}})
+    assert changed["revision"] == connection["revision"] + 1
+    assert changed["status"] == "draft"
+
+
+def test_generation_test_uses_selected_protocol_and_never_requires_catalog(monkeypatch):
+    db = make_test_session()
+    user = _user(db, "generate@example.test")
+    connection = create_connection(db, user.id, {"provider": "openai", "protocol": "openai_responses", "fields": {"api_key": "secret"}})
+    captured = []
+    def factory(context, **kwargs):
+        captured.append(context)
+        return SimpleNamespace(invoke=lambda *_: SimpleNamespace(content="OK"))
+    monkeypatch.setattr("src.web_app.services.llm_registry_service.build_chat_model", factory)
+    monkeypatch.setattr("src.web_app.services.llm_registry_service._discover", lambda *_: pytest.fail("Generation test must not require /models"))
+    result = verify_connection(db, user.id, {"connection_id": connection["id"], "model_id": "my-text-model"})
+    assert result["persisted"] and result["latency_ms"] >= 0
+    assert captured[0].protocol == "openai_responses" and captured[0].model == "my-text-model"
+    assert list_connections(db, user.id)[0]["models"][0]["model_id"] == "my-text-model"
+
+
+def test_preview_never_verifies_unsaved_credentials(monkeypatch):
+    db = make_test_session()
+    user = _user(db, "preview@example.test")
+    connection = create_connection(db, user.id, {"provider": "openai", "fields": {"api_key": "saved"}, "model_id": "test"})
+    monkeypatch.setattr("src.web_app.services.llm_registry_service.build_chat_model", lambda *a, **k: SimpleNamespace(invoke=lambda *_: SimpleNamespace(content="OK")))
+    result = verify_connection(db, user.id, {"connection_id": connection["id"], "fields": {"api_key": "different"}})
+    assert result["persisted"] is False
+    assert list_connections(db, user.id)[0]["status"] == "draft"
+
+
+def test_stale_generation_test_cannot_activate_changed_connection(monkeypatch):
+    db = make_test_session()
+    user = _user(db, "stale@example.test")
+    connection = create_connection(db, user.id, {"provider": "openai", "fields": {"api_key": "saved"}, "model_id": "test"})
+    def invoke(*_):
+        update_connection(db, user.id, connection["id"], {"fields": {"api_key": "changed"}})
+        return SimpleNamespace(content="OK")
+    monkeypatch.setattr("src.web_app.services.llm_registry_service.build_chat_model", lambda *a, **k: SimpleNamespace(invoke=invoke))
+    with pytest.raises(ModelSetupError, match="connection_changed_during_test"):
+        verify_connection(db, user.id, {"connection_id": connection["id"]})
+    assert list_connections(db, user.id)[0]["status"] == "draft"
+
+
+def test_discovery_works_before_verification_and_preserves_disabled_models(monkeypatch):
+    from src.web_app.services.llm_registry_service import discover_models, delete_model
+    db = make_test_session()
+    user = _user(db, "discover@example.test")
+    connection = create_connection(db, user.id, {"provider": "custom", "fields": {"base_url": "https://custom.test/v1"}, "model_id": "old"})
+    delete_model(db, user.id, connection["id"], connection["models"][0]["id"])
+    monkeypatch.setattr("src.web_app.services.llm_registry_service._discover", lambda *_: [{"model_id": "old"}, {"model_id": "new"}])
+    result = discover_models(db, user.id, connection["id"])
+    assert [item["model_id"] for item in result] == ["new"]
+    assert list_connections(db, user.id)[0]["status"] == "draft"
+
+
+def test_encrypted_custom_headers_reach_model_factory(monkeypatch):
+    module = ModuleType("langchain_openai")
+    module.ChatOpenAI = lambda **kwargs: SimpleNamespace(kwargs=kwargs)
+    monkeypatch.setitem(sys.modules, "langchain_openai", module)
+    context = ModelExecutionContext(1, 1, 1, "custom", "openai_chat_completions", "m", "m", {"base_url": "https://gateway.test/v1"}, {"custom_headers": {"X-Private": "encrypted-value"}})
+    assert build_chat_model(context).kwargs["default_headers"]["X-Private"] == "encrypted-value"
+
+
+@pytest.mark.parametrize("url", ["ftp://example.test", "http://user:secret@example.test", "https://example.test?key=secret", "not-a-url"])
+def test_invalid_urls_rejected_before_network(url):
+    db = make_test_session()
+    user = _user(db, "url@example.test")
+    with pytest.raises(ModelSetupError, match="invalid_url"):
+        create_connection(db, user.id, {"provider": "custom", "fields": {"base_url": url}})
+
+
+def test_discovery_respects_custom_auth_and_full_endpoint(monkeypatch):
+    def get(url, **kwargs):
+        assert url == "https://gateway.test/v1/models"
+        assert kwargs["headers"] == {"X-Key": "secret", "X-Project": "personal"}
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"data": [{"id": "m"}]})
+    monkeypatch.setattr("src.web_app.services.llm_registry_service.httpx.get", get)
+    assert _discover("openai_models", {"base_url": "https://gateway.test/v1/responses", "api_key": "secret", "auth_header": "X-Key", "custom_headers": {"X-Project": "personal"}})[0]["model_id"] == "m"
+
+
+def test_first_default_is_model_actually_tested(monkeypatch):
+    from src.web_app.services.llm_registry_service import add_model, get_preferences
+    db = make_test_session()
+    user = _user(db, "default-tested@example.test")
+    connection = create_connection(db, user.id, {"provider": "openai", "fields": {"api_key": "secret"}, "model_id": "not-tested"})
+    tested = add_model(db, user.id, connection["id"], {"model_id": "tested"})
+    monkeypatch.setattr("src.web_app.services.llm_registry_service.build_chat_model", lambda *a, **k: SimpleNamespace(invoke=lambda *_: SimpleNamespace(content="OK")))
+    verify_connection(db, user.id, {"connection_id": connection["id"], "model_id": "tested"})
+    assert get_preferences(db, user.id)["default_model_config_id"] == tested["id"]
+
+
+@pytest.mark.asyncio
+async def test_research_model_transport_receives_encrypted_headers(monkeypatch):
+    from src.web_app.agent.llm.context import use_model_context
+    from src.web_app.research.open_deep_research_adapter import OpenDeepResearchAdapter
+    seen = {}
+    async def invoke(state, config):
+        seen.update(config["configurable"])
+        return {}
+    module = ModuleType("open_deep_research.deep_researcher")
+    module.deep_researcher = SimpleNamespace(ainvoke=invoke)
+    monkeypatch.setitem(sys.modules, "open_deep_research.deep_researcher", module)
+    adapter = OpenDeepResearchAdapter()
+    monkeypatch.setattr(adapter, "_parse_output", lambda *args: "parsed")
+    context = ModelExecutionContext(1, 1, 1, "custom", "ollama_chat", "model", "Model", {"base_url": "http://localhost:11434/v1"}, {"custom_headers": {"X-Private": "secret"}})
+    with use_model_context(context):
+        assert await adapter._invoke_graph("question", 1, "test", {}, [], "shallow") == "parsed"
+    assert seen["model_extra"]["base_url"] == "http://localhost:11434/v1"
+    assert seen["model_extra"]["default_headers"] == {"X-Private": "secret"}
 
 
 @pytest.mark.parametrize("protocol,endpoint,expected", [

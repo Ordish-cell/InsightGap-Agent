@@ -31,16 +31,24 @@ def build_agent_runtime_graph(
     workflow = StateGraph(AgentRuntimeState)
 
     for name, node_callable in build_runtime_node_registry(nodes).items():
-        workflow.add_node(name, node_callable)
+        from src.web_app.agent.runtime.chat_control import controlled_node
+        workflow.add_node(name, controlled_node(name, node_callable, getattr(nodes, "db", None)))
 
     route_dests = {name: name for name in ROUTE_DESTINATION_NODE_NAMES}
     route_dests[END_SENTINEL] = END
+
+    from src.web_app.agent.runtime.chat_fast_path import chat_entry
+    async def entry(state):
+        return await chat_entry(nodes, state)
+    workflow.add_node("chat_entry", controlled_node("chat_entry", entry, getattr(nodes, "db", None)))
+    workflow.add_conditional_edges("chat_entry", lambda state: state.get("chat_entry_route", "workflow"),
+                                   {"chat": END, "workflow": "home_intent_react"})
 
     workflow.set_entry_point("permission_guard")
     workflow.add_conditional_edges(
         "permission_guard",
         after_permission,
-        {"continue": "home_intent_react", "done": "final_response"},
+        {"continue": "chat_entry", "done": "final_response"},
     )
 
     # Planner -> parallel_prefetch -> parallel_read_stage -> supervisor_observer

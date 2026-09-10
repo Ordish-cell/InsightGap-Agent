@@ -479,7 +479,7 @@ class ReadNodesMixin:
             if role == "user":
                 label = "User"
             elif role == "assistant":
-                label = "Assistant"
+                label = "Assistant (unfinished)" if getattr(msg, "status", "") == "interrupted" else "Assistant"
             else:
                 label = role.capitalize() or "Message"
             max_len = 1200 if role == "assistant" else 600
@@ -502,7 +502,7 @@ class ReadNodesMixin:
             content = (getattr(msg, "content", "") or "").strip()
             if not content:
                 continue
-            rows.append({"role": role, "content": content})
+            rows.append({"role": role, "content": ("[未完成] " if getattr(msg, "status", "") == "interrupted" else "") + content})
             if role == "user" and self._normalize_recall_text(content) != current_normalized:
                 previous_user_messages.append(content)
         return {

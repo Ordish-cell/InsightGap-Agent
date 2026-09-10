@@ -46,6 +46,7 @@ class AgentRuntime:
         _run_log = logging.getLogger(__name__)
         # Remove non-serializable objects before LangGraph sees the state.
         state.pop("_stream_queue", None)
+        state.setdefault("interaction_version", 2)
         # Set module-level queue so append_status_step can push SSE events in real-time.
         set_status_stream_queue(self._stream_queue)
         try:
@@ -57,6 +58,8 @@ class AgentRuntime:
             )
             if graph:
                 return await graph.ainvoke(state, config=cfg)
+            from src.web_app.agent.runtime.chat_control import disable_control
+            disable_control(self.db, state["run_id"])
             return await run_fallback(self._fallback_nodes(), state)
         finally:
             clear_status_stream_queue()

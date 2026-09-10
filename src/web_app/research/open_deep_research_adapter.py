@@ -150,8 +150,8 @@ class OpenDeepResearchAdapter:
         model_api_key = str(model_context.secrets.get("api_key") or "not-required")
         model_base_url = normalize_model_endpoint(str(model_context.config.get("base_url") or ""), model_context.protocol)
         if model_context.protocol == "ollama_chat" and model_base_url:
-            model_base_url = model_base_url.rstrip("/") + "/v1"
-        headers = dict(model_context.config.get("custom_headers") or {})
+            model_base_url = model_base_url.rstrip("/").removesuffix("/v1") + "/v1"
+        headers = {**dict(model_context.config.get("custom_headers") or {}), **dict(model_context.secrets.get("custom_headers") or {})}
         auth_header = str(model_context.config.get("auth_header") or "Authorization")
         if model_context.provider == "custom" and auth_header != "Authorization" and model_api_key != "not-required":
             headers[auth_header] = model_api_key

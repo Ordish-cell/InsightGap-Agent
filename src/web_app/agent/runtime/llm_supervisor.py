@@ -472,8 +472,8 @@ async def _invoke_llm_supervisor(
             return LLMSupervisorRouteDecision.model_validate(result)
 
         message = await model.ainvoke(prompt) if hasattr(model, "ainvoke") else model.invoke(prompt)
-        content = getattr(message, "content", message)
-        payload = _parse_json(str(content))
+        from src.web_app.agent.llm.content import message_text
+        payload = _parse_json(message_text(message))
         return LLMSupervisorRouteDecision.model_validate(payload)
 
     return await asyncio.wait_for(_call(), timeout=settings.timeout_seconds)
@@ -698,7 +698,7 @@ def _intent_for_decision(state: AgentRuntimeState, decision: NormalizedSuperviso
     if "skill_agent" in decision.route:
         return "skill"
     if "rag_agent" in decision.route:
-        return "rag"
+        return current if current == "document_qa" else "rag"
     return "chat"
 
 

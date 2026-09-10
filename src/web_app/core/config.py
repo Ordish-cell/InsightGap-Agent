@@ -5,6 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    chat_fast_path_enabled: bool = True
+    chat_document_path_enabled: bool = True
     app_env: str = "local"
     secret_key: str = "change-me"
     access_token_expire_minutes: int = 10080

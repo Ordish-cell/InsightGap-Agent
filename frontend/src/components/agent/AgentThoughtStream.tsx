@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 
 import type { AgentChatMessage, AgentEvent, UnknownRecord } from '../../api/types'
 import { ApprovalCard, type ApprovalCardData } from './ApprovalCard'
+import { collectLiveProgress } from './liveProgress'
 
 type AgentThoughtStreamProps = {
   message: AgentChatMessage & { trace_events?: AgentEvent[] }
@@ -453,7 +454,7 @@ function ActivityRow({ item, locale }: { item: ActivityItem; locale: 'en' | 'zh'
   )
 }
 
-export function AgentThoughtStream({ message, locale, onApprove, onReject }: AgentThoughtStreamProps) {
+function LegacyThoughtStream({ message, locale, onApprove, onReject }: AgentThoughtStreamProps) {
   const trace = useMemo(() => collectActivityTrace(message, locale), [message, locale])
   const status = String(message.status || 'completed')
   const running = ['thinking', 'running', 'created', 'queued', 'streaming'].includes(status)
@@ -526,4 +527,34 @@ export function AgentThoughtStream({ message, locale, onApprove, onReject }: Age
       ) : null}
     </div>
   )
+}
+
+export function AgentThoughtStream(props: AgentThoughtStreamProps) {
+  const { message, locale, onApprove, onReject } = props
+  const events = message.trace_events || []
+  const modern = message.metadata?.interaction_version === 2 || events.some((e) => e.payload?.interaction_version === 2)
+  if (!modern) return <LegacyThoughtStream {...props} />
+  const trace = collectLiveProgress(events, message.run_id)
+  const active = ['thinking', 'running', 'created', 'queued', 'streaming', 'resuming'].includes(String(message.status)) && !trace.stopped
+  const { approvalId, cardData } = approvalFrom(message, locale)
+  const workflow = trace.mode === 'workflow' || !!approvalId
+  const current = trace.steps.filter((s) => s.status === 'running').at(-1)
+  return <div className="live-progress">
+    {active && (!message.content || workflow) ? <div className="live-progress-current" role="status">
+      <span className="thinking-dot active" />
+      {workflow && current ? current.name : text(locale, '正在生成回复…', 'Generating a reply…')}
+    </div> : null}
+    {workflow ? trace.blocks.map((block) => <div key={block.id} className="live-progress-finding">
+      <p>{block.text}</p>
+      {block.references.length ? <div className="live-progress-sources">{block.references.map((ref, i) =>
+        <a key={`${ref.url}:${i}`} href={ref.url} target="_blank" rel="noopener noreferrer">{ref.title}</a>)}</div> : null}
+    </div>) : null}
+    {workflow && trace.steps.length ? <details className="live-progress-details">
+      <summary>{text(locale, '执行详情', 'Execution details')}</summary>
+      <ul>{trace.steps.map((step) => <li key={step.id}>{step.name} · {text(locale,
+        ({ running: active ? '进行中' : '已结束', completed: '完成', failed: '失败', cancelled: '已停止', waiting_approval: '等待确认' } as Record<string, string>)[step.status] || step.status,
+        step.status)}</li>)}</ul>
+    </details> : null}
+    {approvalId ? <ApprovalCard data={cardData} locale={locale} onApprove={onApprove} onReject={onReject} /> : null}
+  </div>
 }

@@ -252,6 +252,8 @@ class ParentChildRetriever:
         return results
 
     def _enrich_parent_context(self, user_id: int, child_hits: list[dict[str, Any]], analysis: QueryAnalysis) -> list[dict[str, Any]]:
+        deleting = set(self.db.scalars(select(Document.id).where(Document.user_id == user_id, Document.status == "deleting")))
+        child_hits = [hit for hit in child_hits if _as_int(hit.get("document_id")) not in deleting]
         parent_lookup_request: dict[int, list[str]] = defaultdict(list)
         for hit in child_hits:
             document_id = _as_int(hit.get("document_id"))

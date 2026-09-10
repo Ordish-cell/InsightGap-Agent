@@ -25,7 +25,7 @@ export function SettingsPage() {
       <div className="settings-layout">
         <div className="stack">
           <section className="settings-section model-settings-summary">
-            <div><h2>模型与提供商</h2><p>密钥加密保存在当前账号下。只有验证通过的模型会出现在输入栏。</p></div>
+            <div><h2>模型连接</h2><p>管理多个供应商、测试模型，并选择新会话默认使用的模型。</p></div>
             <div className="model-connection-summary"><strong>{activeCount}</strong><span>个可用连接</span><small>{connections.length} 个连接已保存</small></div>
             <button className="button" type="button" onClick={() => setManagerOpen(true)}>管理模型连接</button>
           </section>

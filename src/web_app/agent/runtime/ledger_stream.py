@@ -27,10 +27,17 @@ async def stream_ledger_events(
 ) -> AsyncIterator[str]:
     """Catch up from PostgreSQL, then tail until a terminal event is drained."""
     cursor = after_seq
+    from src.web_app.agent.runtime.event_notify import subscribe
+    with subscribe(run_id) as signal:
+        async for item in _tail(session_factory, user_id, run_id, cursor, poll_interval, heartbeat_interval, signal):
+            yield item
+
+
+async def _tail(session_factory, user_id, run_id, cursor, poll_interval, heartbeat_interval, signal):
     last_output = monotonic()
     terminal_seen = False
-
     while True:
+        signal.clear()
         with session_factory() as db:
             rows = AgentEventRepository(db).list_replay(
                 user_id,
@@ -54,4 +61,9 @@ async def stream_ledger_events(
             yield ": heartbeat\n\n"
             last_output = monotonic()
 
-        await asyncio.sleep(poll_interval)
+        if len(rows) >= 200:
+            continue
+        try:
+            await asyncio.wait_for(signal.wait(), timeout=poll_interval)
+        except asyncio.TimeoutError:
+            pass

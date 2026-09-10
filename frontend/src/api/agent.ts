@@ -1,6 +1,11 @@
 import { apiBaseUrl, apiRequest } from './client'
 import { normalizeAgentStep } from './normalizers'
-import type { AgentConversation, AgentReplayPage, AgentRun, AgentStep } from './types'
+import type { AgentConversation, AgentReplayPage, AgentRun, AgentStep, ChatControlResult } from './types'
+
+export const controlChat = (runId: number, kind: 'interrupt' | 'steer', clientCommandId: string, text?: string) =>
+  apiRequest<ChatControlResult>(`/agent/runs/${runId}/${kind}`, {
+    method: 'POST', body: { client_command_id: clientCommandId, ...(kind === 'steer' ? { text } : {}) },
+  })
 
 export const createRun = (payload: Record<string, unknown>) => apiRequest<AgentRun>('/agent/runs', { method: 'POST', body: payload })
 export const getRun = (runId: number | string) => apiRequest<AgentRun>(`/agent/runs/${runId}`)
@@ -13,9 +18,9 @@ export const updateConversation = (conversationId: string, payload: Record<strin
 export const archiveConversation = (conversationId: string) => apiRequest<AgentConversation>(`/agent/conversations/${conversationId}/archive`, { method: 'POST' })
 export const deleteConversation = (conversationId: string) => apiRequest<AgentConversation>(`/agent/conversations/${conversationId}`, { method: 'DELETE' })
 export const clearConversation = (conversationId: string) => apiRequest<{ conversation: AgentConversation; cleared_messages: number }>(`/agent/conversations/${conversationId}/clear`, { method: 'POST' })
-export const hardDeleteConversation = (conversationId: string) => apiRequest<{ conversation_id: string; deleted_records: number }>(`/agent/conversations/${conversationId}/hard`, { method: 'DELETE' })
+export const hardDeleteConversation = (conversationId: string) => apiRequest<DeletionTask>(`/agent/conversations/${conversationId}/hard`, { method: 'DELETE' })
 export const hardDeleteConversationCancelPending = (conversationId: string) =>
-  apiRequest<{ conversation_id: string; deleted_records: number; cancelled_approvals?: number; cancelled_runs?: number }>(
+  apiRequest<DeletionTask>(
     `/agent/conversations/${conversationId}/hard?cancel_pending=true`,
     { method: 'DELETE' }
   )
@@ -113,18 +118,21 @@ export class AgentLedgerClient {
   }
 
   private async tail(runId: number, afterSeq: number, handlers: LedgerHandlers, signal: AbortSignal) {
-    let cursor = Math.max(afterSeq, this.lastSeq.get(runId) || 0)
+    // The caller's snapshot/replay cursor is authoritative, including on refresh.
+    let cursor = afterSeq
     const delays = [500, 1000, 2000, 4000, 8000]
     let attempts = 0
     while (!signal.aborted) {
       try {
         if (attempts > 0) handlers.onNetworkStatus?.('recovering')
         const terminal = await this.readStream(runId, cursor, signal, async (envelope) => {
+          if (signal.aborted) return true
           const seq = Number(envelope.event_seq ?? envelope.id ?? 0)
           if (!seq || seq <= cursor) return false
           cursor = seq
           this.lastSeq.set(runId, seq)
-          if (['run_completed', 'run_failed', 'run_interrupted'].includes(String(envelope.event_type))) {
+          const terminalPayload = (envelope.payload || {}) as Record<string, unknown>
+          if (['run_completed', 'run_failed', 'run_interrupted'].includes(String(envelope.event_type)) && !terminalPayload.response) {
             try {
               const response = await getRun(runId)
               envelope.payload = { ...(envelope.payload || {}), response }
@@ -132,6 +140,7 @@ export class AgentLedgerClient {
               // The terminal ledger event remains authoritative if canonical refresh fails.
             }
           }
+          if (signal.aborted) return true
           handlers.onMessage?.({ data: JSON.stringify(envelope) } as MessageEvent)
           return ['run_completed', 'run_failed', 'run_interrupted', 'run_paused'].includes(String(envelope.event_type))
         })
@@ -199,3 +208,7 @@ export function extractRunAnswer(response: AgentRun) {
       ''
   )
 }
+
+export interface DeletionTask { id: number; conversation_id: string; status: string; phase: string; attempts: number; error_message: string; result?: { warnings?: { kind: string; id: string | number }[] } }
+export const listDeletionTasks = () => apiRequest<DeletionTask[]>('/agent/deletion-tasks')
+export const retryDeletionTask = (id: number) => apiRequest<DeletionTask>(`/agent/deletion-tasks/${id}/retry`, { method: 'POST' })

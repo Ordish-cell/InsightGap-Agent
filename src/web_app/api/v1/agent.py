@@ -31,6 +31,34 @@ from src.web_app.services.llm_registry_service import ModelSetupError
 
 router = APIRouter()
 
+from pydantic import BaseModel, Field, ConfigDict
+from src.web_app.services.chat_control_service import ChatControlError, request_control
+
+
+class ChatControlRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    client_command_id: str = Field(min_length=1, max_length=128)
+
+
+class ChatSteerRequest(ChatControlRequest):
+    text: str = Field(min_length=1, max_length=32000)
+
+
+@router.post("/runs/{run_id}/interrupt", status_code=202)
+async def interrupt_chat(run_id: int, payload: ChatControlRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    try:
+        return ok(request_control(db, user_id, run_id, "interrupt", payload.client_command_id))
+    except ChatControlError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+
+
+@router.post("/runs/{run_id}/steer", status_code=202)
+async def steer_chat(run_id: int, payload: ChatSteerRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    try:
+        return ok(request_control(db, user_id, run_id, "steer", payload.client_command_id, payload.text))
+    except ChatControlError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+
 
 @router.post("/runs")
 async def create_run(payload: AgentRunRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
@@ -38,15 +66,20 @@ async def create_run(payload: AgentRunRequest, user_id: int = Depends(get_curren
         return ok(await run_agent_async(db, user_id, payload.model_dump()))
     except ModelSetupError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ChatControlError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
 
 
 @router.post("/runs/start", status_code=202)
 async def start_run(payload: AgentRunRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     request_payload = payload.model_dump()
+    request_payload["_chat_managed"] = True
     try:
         prepared = prepare_agent_run(db, user_id, request_payload)
     except ModelSetupError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ChatControlError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
     agent_run_task_manager.start(prepared["run_id"], user_id, payload=request_payload)
     return ok(prepared)
 
@@ -85,7 +118,7 @@ def archive_agent_conversation(conversation_id: str, user_id: int = Depends(get_
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.delete("/conversations/{conversation_id}")
+@router.delete("/conversations/{conversation_id}", deprecated=True)
 def delete_agent_conversation(conversation_id: str, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     try:
         return ok(delete_conversation(db, user_id, conversation_id))
@@ -101,15 +134,20 @@ def clear_agent_conversation(conversation_id: str, user_id: int = Depends(get_cu
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-@router.delete("/conversations/{conversation_id}/hard")
-def hard_delete_agent_conversation(
+@router.delete("/conversations/{conversation_id}/hard", status_code=202)
+async def hard_delete_agent_conversation(
     conversation_id: str,
     cancel_pending: bool = False,
     user_id: int = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
     try:
-        return ok(hard_delete_conversation(db, user_id, conversation_id, cancel_pending=cancel_pending))
+        import asyncio
+        from src.web_app.services.conversation_deletion import request_deletion, deletion_manager
+        result = await asyncio.to_thread(request_deletion, db, user_id, conversation_id, cancel_pending)
+        if result["status"] == "pending":
+            deletion_manager.start(result["id"])
+        return ok(result)
     except PendingApprovalExistsError as exc:
         raise HTTPException(
             status_code=409,
@@ -117,6 +155,42 @@ def hard_delete_agent_conversation(
         ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/deletion-tasks")
+def list_deletion_tasks(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    from sqlalchemy import select
+    from src.web_app.services.conversation_deletion import Job, public, require_schema
+    require_schema(db)
+    return ok([public(j) for j in db.scalars(select(Job).where(Job.user_id == user_id).order_by(Job.id.desc()).limit(100))])
+
+
+@router.get("/deletion-tasks/{job_id}")
+def get_deletion_task(job_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    from sqlalchemy import select
+    from src.web_app.services.conversation_deletion import Job, public, require_schema
+    require_schema(db)
+    job = db.scalar(select(Job).where(Job.id == job_id, Job.user_id == user_id))
+    if not job:
+        raise HTTPException(404, "Deletion task not found")
+    return ok(public(job))
+
+
+@router.post("/deletion-tasks/{job_id}/retry", status_code=202)
+async def retry_deletion_task(job_id: int, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    from sqlalchemy import select
+    from src.web_app.services.conversation_deletion import Job, public, require_schema, deletion_manager
+    require_schema(db)
+    job = db.scalar(select(Job).where(Job.id == job_id, Job.user_id == user_id))
+    if not job:
+        raise HTTPException(404, "Deletion task not found")
+    if job.status == "failed" and job_id not in deletion_manager.tasks:
+        job.status, job.error_message = "pending", ""
+        job.progress = {**(job.progress or {}), "previous_attempts": (job.progress or {}).get("previous_attempts", 0) + job.attempts}
+        job.attempts = 0
+        db.commit()
+        deletion_manager.start(job_id)
+    return ok(public(job))
 
 
 @router.get("/runs/{run_id}")

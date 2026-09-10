@@ -1,4 +1,4 @@
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, or_
 
 from src.web_app.db.repositories.base_repository import BaseRepository
 from src.web_app.models.orm import Memory
@@ -11,7 +11,8 @@ class MemoryRepository(BaseRepository[Memory]):
         return list(self.db.execute(select(Memory).where(Memory.user_id == user_id).order_by(Memory.created_at.desc())).scalars())
 
     def search(self, user_id: int, query: str = "", memory_type: str | None = None, min_importance: float = 0.0) -> list[Memory]:
-        stmt = select(Memory).where(Memory.user_id == user_id, Memory.importance >= min_importance).order_by(Memory.importance.desc(), Memory.created_at.desc())
+        stmt = select(Memory).where(Memory.user_id == user_id, Memory.importance >= min_importance,
+            or_(Memory.metadata_json["status"].as_string().is_(None), Memory.metadata_json["status"].as_string() != "deleting")).order_by(Memory.importance.desc(), Memory.created_at.desc())
         if query:
             stmt = stmt.where(Memory.content.like(f"%{query}%"))
         if memory_type:

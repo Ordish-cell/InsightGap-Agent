@@ -97,6 +97,17 @@ async def parallel_read_stage(
 
 
 async def _context_skill_branch(
+    state: AgentRuntimeState, nodes: Any, payload: dict[str, Any],
+) -> dict[str, Any]:
+    from src.web_app.agent.runtime.chat_control import execution
+    if execution.get():
+        # This branch includes blocking reads. Its DB session is created in the
+        # thread; the inherited cancellation token fences its late audit writes.
+        return await asyncio.to_thread(lambda: asyncio.run(_context_skill_branch_inline(state, nodes, payload)))
+    return await _context_skill_branch_inline(state, nodes, payload)
+
+
+async def _context_skill_branch_inline(
     state: AgentRuntimeState,
     nodes: Any,
     payload: dict[str, Any],
@@ -104,8 +115,9 @@ async def _context_skill_branch(
     branch_state = _copy_state(state)
     with SessionLocal() as branch_db:
         branch_nodes = nodes.__class__(branch_db, dict(payload or {}))
-        branch_state = await branch_nodes.context_builder(branch_state)
-        branch_state = await branch_nodes.skill_matcher(branch_state)
+        from src.web_app.agent.runtime.chat_control import controlled_node
+        branch_state = await controlled_node("context_builder", branch_nodes.context_builder, branch_db)(branch_state)
+        branch_state = await controlled_node("skill_matcher", branch_nodes.skill_matcher, branch_db)(branch_state)
     return branch_state
 
 

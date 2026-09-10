@@ -30,6 +30,22 @@ export function Sidebar() {
   const [conversations, setConversations] = useState<AgentConversation[]>([])
   const [deleteTarget, setDeleteTarget] = useState<AgentConversation | null>(null)
 
+  const [deletions, setDeletions] = useState<agent.DeletionTask[]>([])
+  const [deletionError, setDeletionError] = useState('')
+  async function loadDeletions() {
+    try {
+      const jobs = await agent.listDeletionTasks()
+      setDeletions(jobs)
+      const current = sessionStorage.getItem('agentOpenConversationId')
+      if (jobs.some(j => j.conversation_id === current && j.status.startsWith('completed'))) newConversation()
+    } catch { /* Migration errors are shown when an explicit delete is attempted. */ }
+  }
+  useEffect(() => {
+    void loadDeletions()
+    const timer = window.setInterval(() => void loadDeletions(), 2000)
+    return () => window.clearInterval(timer)
+  }, [])
+
   useEffect(() => {
     localStorage.setItem('sidebarExpanded', String(expanded))
   }, [expanded])
@@ -78,37 +94,28 @@ export function Sidebar() {
     const item = deleteTarget
     if (!item) return
     setDeleteTarget(null)
-    const openId = sessionStorage.getItem('agentOpenConversationId')
-    const isCurrentConversation = openId === item.conversation_id
-
-    // Optimistic: remove from list immediately
-    setConversations((prev) => prev.filter((c) => c.conversation_id !== item.conversation_id))
-
-    if (isCurrentConversation) {
-      sessionStorage.removeItem('agentOpenConversationId')
-      navigate('/', { replace: true })
-      // Small delay so navigation commits before the custom event fires
-      setTimeout(() => {
-        window.dispatchEvent(new CustomEvent('agent:new-conversation'))
-      }, 80)
-    }
+    setDeletionError('')
 
     try {
       await agent.hardDeleteConversation(item.conversation_id)
+      await loadDeletions()
       await loadConversations()
     } catch (exc) {
       const status = (exc as { status?: number }).status
       const msg = exc instanceof Error ? exc.message : String(exc)
+      const code = (exc as { details?: { error?: { code?: string } } }).details?.error?.code
       // CONVERSATION_HAS_PENDING_APPROVAL: prompt user to cancel+delete
-      if (status === 409 && msg.includes('CONVERSATION_HAS_PENDING_APPROVAL')) {
+      if (status === 409 && (code === 'CONVERSATION_HAS_PENDING_APPROVAL' || msg.includes('CONVERSATION_HAS_PENDING_APPROVAL'))) {
         const confirmed = window.confirm(
           '这个会话还有等待审批的操作。要取消这些操作并删除会话吗？\n\n注意：这会取消所有待审批操作，工具不会执行。'
         )
         if (confirmed) {
           try {
             await agent.hardDeleteConversationCancelPending(item.conversation_id)
+            await loadDeletions()
             await loadConversations()
-          } catch {
+          } catch (error) {
+            setDeletionError(error instanceof Error ? error.message : String(error))
             void loadConversations()
           }
         } else {
@@ -117,7 +124,8 @@ export function Sidebar() {
         }
         return
       }
-      // Other errors: refresh list to undo optimistic removal
+      setDeletionError(msg)
+      // Retain the conversation until the server accepts deletion.
       void loadConversations()
     }
   }
@@ -129,6 +137,15 @@ export function Sidebar() {
 
   return (
     <aside className={expanded ? 'sidebar expanded' : 'sidebar collapsed'}>
+      {expanded && (deletionError || deletions.some(j => j.status === 'failed')) && <div aria-live="polite">
+        {deletionError && <p role="alert">{deletionError}</p>}
+        {deletions.filter(j => j.status === 'failed').map(j => <div key={j.id}>
+          <small>会话 {j.conversation_id.slice(0, 8)} · </small>
+          <span>删除失败，可重试</span>
+          {j.error_message && <p>{j.error_message}</p>}
+          <button onClick={() => void agent.retryDeletionTask(j.id).then(loadDeletions).catch(e => setDeletionError(String(e)))}>重试删除</button>
+        </div>)}
+      </div>}
       <div className="sidebar-top">
         <button className="sidebar-toggle" onClick={() => setExpanded((value) => !value)} aria-label="展开或收起侧边栏">
           <span className="sidebar-toggle-icon">{expanded ? '‹' : '›'}</span>
@@ -241,7 +258,7 @@ export function Sidebar() {
       <ConfirmModal
         open={Boolean(deleteTarget)}
         title="删除会话"
-        message={`确定要彻底删除「${deleteTarget?.title || '未命名会话'}」吗？所有对话记录和 Agent 运行数据都会被永久删除，无法恢复。`}
+        message={`确定要彻底删除「${deleteTarget?.title || '未命名会话'}」吗？将永久清理对话、临时记忆、独占附件与对应向量。长期记忆、共享文件和已独立保存的 Skill 保留。`}
         confirmLabel="彻底删除"
         danger
         onConfirm={confirmDeleteConversation}

@@ -110,6 +110,8 @@ class DocumentService:
         document = doc_repo.get_by_id_for_user(user_id, document_id)
         if not document:
             raise ValueError("Document not found")
+        if document.status == "deleting":
+            raise ValueError("Document is being deleted")
         try:
             doc_repo.update_status(document, "ingesting", {"failed_stage": None, "error": None, "error_message": None})
             doc_repo.update_status(document, "ingesting", {"failed_stage": "qdrant_delete"})
@@ -467,6 +469,8 @@ class DocumentService:
         document = repo.get_by_id_for_user(user_id, document_id)
         if not document:
             raise ValueError("Document not found")
+        if document.status == "deleting":
+            raise ValueError("Document is being deleted")
         if (document.metadata_json or {}).get("kind") != "document":
             raise ValueError("Only chat documents can be processed in background")
         metadata = {

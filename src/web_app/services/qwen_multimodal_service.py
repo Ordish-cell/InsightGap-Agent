@@ -6,6 +6,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.web_app.core.config import settings
+from src.web_app.agent.prompts import gap_system_message
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10MB per image for base64 encoding
 MAX_VISION_IMAGES_PER_MESSAGE = 5
@@ -112,7 +113,7 @@ class QwenMultimodalService:
             logger.exception("Failed to create vision chat model")
             return f"视觉模型不可用：{exc}"
 
-        messages = [HumanMessage(content=message_content)]
+        messages = [gap_system_message(), HumanMessage(content=message_content)]
 
         try:
             response = await chat_model.ainvoke(messages)

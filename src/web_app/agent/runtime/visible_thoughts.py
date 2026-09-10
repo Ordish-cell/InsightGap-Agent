@@ -65,6 +65,8 @@ def build_visible_thought_step(step: str | dict[str, Any], state: dict[str, Any]
 
 
 def emit_visible_thought(db: Session, state: dict[str, Any], step: str | dict[str, Any], *, status: str = "completed", stream_queue: Any = None) -> str:
+    if state.get("interaction_version") == 2:
+        return ""
     text = build_visible_thought_step(step, state).strip()
     if not text:
         return ""

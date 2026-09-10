@@ -2,6 +2,8 @@ import { FormEvent, useEffect, useRef, useState } from 'react'
 
 import type { AgentChatMessage, AgentEvent, AgentRun, AgentRunStep, ChatAttachment, UnknownRecord } from '../../api/types'
 import * as agent from '../../api/agent'
+import { ApiError } from '../../api/client'
+import { projectChatEvent, restoreChatMessage } from './chatStream'
 import { fetchDocumentBlobUrl, retryDocumentIngest, toApiUrl, uploadChatAttachment, waitForDocumentReady } from '../../api/documents'
 import { JsonBlock } from '../common/JsonBlock'
 import { MarkdownRenderer } from '../common/MarkdownRenderer'
@@ -528,10 +530,12 @@ function AgentMessageItem({
         <div className="message-bubble answer-content">
           {visibleContent && !isApprovalPlaceholder(visibleContent) ? (
             <MarkdownRenderer content={visibleContent} />
-          ) : message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running' || message.status === 'waiting_approval' ? null : (
+          ) : message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running' || message.status === 'queued' || message.status === 'interrupted' || message.status === 'waiting_approval' ? null : (
             text(locale, zh.noAnswer, 'No answer to display.')
           )}
         </div>
+        {message.status === 'interrupted' ? <small>{text(locale, '已中断 · 已保留部分回复', 'Interrupted · partial reply saved')}</small> : null}
+        {message.status === 'queued' ? <small>{text(locale, '已接收，等待旧回复结束', 'Accepted, waiting for the previous reply to stop')}</small> : null}
       </div>
     </article>
   )
@@ -547,6 +551,11 @@ export function AgentChatPanel({
 }: AgentChatPanelProps) {
   const bottomRef = useRef<HTMLDivElement | null>(null)
   const streamRef = useRef<{ close: () => void } | null>(null)
+  const viewEpoch = useRef(0)
+  const [controlBusy, setControlBusy] = useState(false)
+  const controlFlight = useRef(false)
+  const [controlNotice, setControlNotice] = useState('')
+  const [retryControl, setRetryControl] = useState<{ runId: number; kind: 'interrupt' | 'steer'; id: string; input: string } | null>(null)
   const [userInput, setUserInput] = useState('')
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [activeConversationId, setActiveConversationId] = useState('')
@@ -787,6 +796,7 @@ export function AgentChatPanel({
     window.addEventListener('agent:open-conversation', openConversation as EventListener)
     window.addEventListener('agent:new-conversation', newConversation)
     return () => {
+      viewEpoch.current += 1
       streamRef.current?.close()
       window.removeEventListener('agent:open-conversation', openConversation as EventListener)
       window.removeEventListener('agent:new-conversation', newConversation)
@@ -808,12 +818,15 @@ export function AgentChatPanel({
   }
 
   async function loadConversation(conversationId: string) {
+    const epoch = ++viewEpoch.current
+    if (conversationId !== activeConversationId) setRetryControl(null)
     streamRef.current?.close()
     setError('')
     setReplayError('')
     setReplayLoading(true)
     try {
       const item = await agent.getConversation(conversationId)
+      if (epoch !== viewEpoch.current) return
       setActiveConversationId(item.conversation_id)
       const rememberedModelId = Number((item.metadata as UnknownRecord | undefined)?.model_config_id || 0)
       setSelectedModelConfigId(rememberedModelId > 0 ? rememberedModelId : null)
@@ -824,6 +837,7 @@ export function AgentChatPanel({
           .map((message) => Number(message.run_id)),
       ))
       const replayResults = await Promise.allSettled(runIds.map(async (runId) => [runId, await loadRunReplay(runId)] as const))
+      if (epoch !== viewEpoch.current) return
       const replayByRun = new Map<number, AgentEvent[]>()
       let failedRuns = 0
       replayResults.forEach((result) => {
@@ -832,45 +846,54 @@ export function AgentChatPanel({
       })
       const restoredMessages = conversationMessages.map((message) => {
         const replay = replayByRun.get(Number(message.run_id))
-        return replay ? { ...message, trace_events: replay } : message
+        return replay ? { ...restoreChatMessage(message, replay), trace_events: replay } : message
       })
       setMessages(restoredMessages)
       const activeMessage = [...restoredMessages].reverse().find((message) =>
         message.role === 'assistant' &&
         Number(message.run_id) > 0 &&
-        ['created', 'thinking', 'running', 'streaming', 'resuming'].includes(String(message.status)),
+        ['queued', 'created', 'thinking', 'running', 'streaming', 'resuming'].includes(String(message.status)),
       )
+      setRunning(Boolean(activeMessage))
+      setCurrentRun(null)
+      const latestRunId = Number(activeMessage?.run_id || item.last_run_id || 0)
+      if (latestRunId) {
+        const latest = await agent.getRun(latestRunId)
+        if (epoch !== viewEpoch.current) return
+        setCurrentRun(latest)
+        const control = latest.controls?.at(-1)
+        setControlNotice(control?.status === 'accepted' ? '已接收，正在停止旧回复…' : control?.status === 'failed' ? (control.error || '控制未完成，请重试。') : control?.status === 'applied' && control.kind === 'interrupt' && latest.status === 'interrupted' ? '已停止。' : '')
+      }
       if (activeMessage?.run_id) {
         const activeRunId = Number(activeMessage.run_id)
         setRunning(true)
-        streamRef.current = agent.agentLedgerClient.tailRun(activeRunId, 0, {
+        const cursor = Math.max(0, ...(replayByRun.get(activeRunId) || []).map((event) => Number(event.event_seq || event.id || 0)))
+        streamRef.current = agent.agentLedgerClient.tailRun(activeRunId, cursor, {
           onNetworkStatus: handleNetworkStatus,
           onMessage: (message) => {
             const parsed = parseEvent(message.data)
-            if (!parsed) return
+            if (!parsed || epoch !== viewEpoch.current) return
             const payload = asRecord(parsed.payload)
             setMessages((items) => items.map((item) => {
               if (item.role !== 'assistant' || Number(item.run_id) !== activeRunId) return item
               const trace_events = appendTraceEvent(item.trace_events, parsed)
-              if (parsed.event_type === 'answer_delta') {
-                return { ...item, status: 'streaming', content: `${item.content || ''}${String(payload.text || '')}`, trace_events }
-              }
-              if (parsed.event_type === 'answer_completed') {
-                return { ...item, status: 'completed', content: String(payload.answer || item.content || ''), trace_events }
-              }
-              if (parsed.event_type === 'approval_required' || parsed.event_type === 'run_paused') {
-                return { ...item, status: 'waiting_approval', trace_events }
-              }
-              if (parsed.event_type === 'run_completed') {
-                const response = asRecord(payload.response) as AgentRun
-                return { ...item, status: 'completed', content: agent.extractRunAnswer(response) || String(payload.answer || item.content || ''), trace_events }
-              }
-              if (parsed.event_type === 'run_failed' || parsed.event_type === 'run_interrupted') {
-                return { ...item, status: 'failed', content: String(payload.error || item.content || ''), trace_events }
-              }
-              return { ...item, trace_events }
+              return { ...projectChatEvent(item, parsed), trace_events }
             }))
-            if (['run_completed', 'run_failed', 'run_interrupted', 'run_paused'].includes(String(parsed.event_type))) setRunning(false)
+            if (parsed.event_type === 'run_capabilities') setCurrentRun((run) => run ? { ...run, ...payload } : run)
+            if (parsed.event_type === 'control_accepted') {
+              setCurrentRun((run) => run ? { ...run, can_interrupt: false, can_steer: false } : run)
+              setControlNotice('已接收，正在停止旧回复…')
+            }
+            if (parsed.event_type === 'control_applied') {
+              setControlNotice('已生效，正在按新要求回复。')
+              void agent.getRun(activeRunId).then((run) => { if (epoch === viewEpoch.current) setCurrentRun(run) })
+            }
+            if (parsed.event_type === 'control_failed') setControlNotice(String(payload.error || '控制未完成，请重试。'))
+            if (['run_completed', 'run_failed', 'run_interrupted', 'run_paused'].includes(String(parsed.event_type))) {
+              setRunning(false)
+              setCurrentRun((run) => run ? { ...run, can_interrupt: false, can_steer: false } : run)
+              if (parsed.event_type === 'run_interrupted') setControlNotice('已停止。')
+            }
           },
         })
       }
@@ -878,13 +901,18 @@ export function AgentChatPanel({
         setReplayError(text(locale, `有 ${failedRuns} 条运行记录未能恢复，可重新打开会话重试。`, `${failedRuns} run timeline(s) could not be restored. Reopen the conversation to retry.`))
       }
     } catch (exc) {
+      if (epoch !== viewEpoch.current) return
       setError(exc instanceof Error ? exc.message : text(locale, '会话加载失败。', 'Failed to load conversation.'))
     } finally {
-      setReplayLoading(false)
+      if (epoch === viewEpoch.current) setReplayLoading(false)
     }
   }
 
   function startNewConversation() {
+    viewEpoch.current += 1
+    setControlNotice('')
+    setRetryControl(null)
+    setRunning(false)
     streamRef.current?.close()
     setActiveConversationId('')
     setMessages([])
@@ -1056,15 +1084,50 @@ export function AgentChatPanel({
     }
   }
 
+  async function sendChatControl(kind: 'interrupt' | 'steer', input = '') {
+    if (controlFlight.current) return
+    const request = retryControl || { runId: Number(currentRun?.run_id || currentRun?.id || 0), kind, input, id: crypto.randomUUID() }
+    if (!request.runId) return
+    const epoch = viewEpoch.current
+    controlFlight.current = true
+    setControlBusy(true)
+    setControlNotice(kind === 'steer' ? '正在提交补充要求…' : '正在请求停止…')
+    try {
+      const result = await agent.controlChat(request.runId, request.kind, request.id, request.input)
+      if (epoch !== viewEpoch.current) return
+      setRetryControl(null)
+      if (request.kind === 'steer') setUserInput((value) => value.trim() === request.input ? '' : value)
+      setControlNotice(result.status === 'failed' ? (result.error || '控制未完成，消息已保留。') : '已接收，正在调整回复…')
+      await loadConversation(activeConversationId)
+    } catch (exc) {
+      if (epoch !== viewEpoch.current) return
+      // Unknown outcomes must retry with the same ID, never create another input.
+      const uncertain = !(exc instanceof ApiError) || exc.status >= 500
+      setRetryControl(uncertain ? request : null)
+      setControlNotice(uncertain ? '尚未确认是否接收，请点击“重试确认”；不会重复发送。' : '')
+      setError(exc instanceof Error ? exc.message : '控制请求失败，输入已保留。')
+    } finally {
+      controlFlight.current = false
+      setControlBusy(false)
+    }
+  }
+
   async function submit(event: FormEvent) {
     event.preventDefault()
     const input = userInput.trim()
+    if (running) {
+      if (currentRun?.can_steer && input && !attachments.length && !controlBusy && !retryControl) await sendChatControl('steer', input)
+      return
+    }
     const uploadedAttachments = attachments.filter(
       (item) => item.uploadStatus === 'uploaded' && item.document_id > 0,
     )
     const hasUploading = attachments.some((item) => item.uploadStatus === 'uploading' || item.uploadStatus === 'processing')
     if ((!input && uploadedAttachments.length === 0) || running || hasUploading) return
 
+    if (controlBusy || retryControl) return
+    const epoch = ++viewEpoch.current
+    setControlNotice('')
     streamRef.current?.close()
     setUserInput('')
     setAttachments([])
@@ -1104,29 +1167,18 @@ export function AgentChatPanel({
       content: '',
       conversation_id: localConversationId,
       status: 'thinking',
-      trace_events: [
-        {
-          event_type: 'visible_progress_delta',
-          visibility: 'user',
-          display_channel: 'thinking',
-          payload: {
-            id: `local-start-${now}`,
-            text: text(locale, '我开始处理了，会把执行过程按步骤展示在这里。', 'I started working and will show the process here step by step.'),
-            status: 'streaming',
-          },
-          created_at: new Date(now).toISOString(),
-        },
-      ],
+      metadata: { interaction_version: 2 },
+      trace_events: [],
       local_id: `local-assistant-${now}`,
     }
     setMessages((items) => [...items, localUser, localAssistant])
 
     let liveRunId: number | undefined
     let liveAssistantMessageId = localAssistant.message_id
+    let liveInterrupted = false
 
     streamRef.current = agent.agentLedgerClient.startAndTail(
       {
-        onNetworkStatus: handleNetworkStatus,
         user_input: effectiveInput,
         input: effectiveInput,
         conversation_id: activeConversationId || undefined,
@@ -1139,10 +1191,39 @@ export function AgentChatPanel({
         attachment_ids: attachmentIds,
       },
       {
+        onNetworkStatus: handleNetworkStatus,
+        onStarted: (run) => { if (epoch === viewEpoch.current) setCurrentRun(run) },
         onMessage: (message) => {
           const parsed = parseEvent(message.data)
-          if (!parsed) return
+          if (!parsed || epoch !== viewEpoch.current) return
           const payload = asRecord(parsed.payload)
+
+          if (liveRunId && Number(parsed.run_id) !== liveRunId) return
+          if (payload.message_id && String(payload.message_id) !== liveAssistantMessageId) return
+          if (liveInterrupted) return
+
+          if (parsed.event_type === 'run_capabilities') {
+            setCurrentRun((run) => run ? { ...run, ...payload } : run)
+            return
+          }
+          if (parsed.event_type === 'control_accepted') {
+            setCurrentRun((run) => run ? { ...run, can_interrupt: false, can_steer: false } : run)
+            return
+          }
+          if (parsed.event_type === 'control_failed') {
+            setControlNotice(String(payload.error || '控制未完成，请重试。'))
+            return
+          }
+          if (parsed.event_type === 'run_interrupted') {
+            liveInterrupted = true
+            setMessages((items) => items.map((item) => item.role === 'assistant' && Number(item.run_id) === Number(parsed.run_id)
+              ? { ...item, status: 'interrupted', content: String(payload.answer ?? item.content ?? ''), trace_events: appendTraceEvent(item.trace_events, parsed) }
+              : item))
+            setRunning(false)
+            setCurrentRun((run) => run ? { ...run, can_interrupt: false, can_steer: false } : run)
+            setControlNotice('已停止。')
+            return
+          }
 
           if (parsed.event_type === 'run_created') {
             const userMessage = asRecord(payload.user_message) as UiMessage
@@ -1362,6 +1443,7 @@ export function AgentChatPanel({
           )
         },
         onError: () => {
+          if (epoch !== viewEpoch.current) return
           const failedText = text(locale, zh.agentFailed, 'Agent run failed. Please try again.')
           setMessages((items) =>
             items.map((message) =>
@@ -1387,7 +1469,8 @@ export function AgentChatPanel({
     attachments.length > 0 && uploadedAttachmentsForSend.length === 0 && !hasText
 
   const canSend =
-    !running && !hasUploading && Boolean(selectedModelConfigId) && (hasText || hasUploadedForSend) && !hasFailedOnly
+    !controlBusy && !retryControl && !replayLoading && !hasUploading && Boolean(selectedModelConfigId) &&
+    (running ? Boolean(currentRun?.can_steer) && hasText && attachments.length === 0 : (hasText || hasUploadedForSend) && !hasFailedOnly)
 
   const composer = (
     <form
@@ -1508,6 +1591,11 @@ export function AgentChatPanel({
       />
 
       <div className="composer-footer">
+        {controlNotice ? <span role="status" aria-live="polite">{controlNotice}</span> : null}
+        {retryControl ? <button type="button" disabled={controlBusy} onClick={() => void sendChatControl(retryControl.kind, retryControl.input)}>重试确认</button> : null}
+        {running && currentRun?.can_interrupt ? (
+          <button type="button" disabled={controlBusy || Boolean(retryControl)} onClick={() => void sendChatControl('interrupt')} aria-label="停止生成">停止</button>
+        ) : null}
         <div className="composer-tools">
           <button
             type="button"

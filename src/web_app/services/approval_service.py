@@ -133,7 +133,7 @@ def update_approval_status(
         raise ValueError("APPROVAL_CONTEXT_GONE: 这个审批所属的会话已经不存在。")
 
     conversation = conv_repo.get_by_conversation_id(user_id, conversation_id)
-    if not conversation or conversation.status == "deleted":
+    if not conversation or conversation.status in {"deleted", "deleting"}:
         raise ValueError("APPROVAL_CONTEXT_GONE: 这个审批所属的会话已被删除。")
 
     # Verify assistant message exists and is waiting

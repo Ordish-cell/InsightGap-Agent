@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from src.web_app.db.repositories.memory_repository import MemoryRepository
 from src.web_app.memory.extractor import memory_extractor
+from src.web_app.services.deletion_guard import guarded_transition
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ class MemoryService:
             logger.warning("memory.vector_cleanup_failed memory_id=%s error=%s", memory_id, exc, exc_info=True)
             return warning
 
+    @guarded_transition
     def add_memory(
         self,
         user_id: int,
@@ -83,6 +85,17 @@ class MemoryService:
             source_type = ""
 
         if db:
+            from src.web_app.services.deletion_guard import check_conversation
+            from src.web_app.agent.runtime.chat_control import execution
+            from src.web_app.models.orm import AgentRun
+            metadata = dict(metadata or {})
+            token = execution.get()
+            source_run = metadata.get("run_id") or (token.run_id if token else None)
+            if source_run and str(source_run).isdigit():
+                owner_run = db.get(AgentRun, int(source_run))
+                if owner_run and owner_run.user_id == user_id:
+                    metadata.update(run_id=owner_run.id, conversation_id=owner_run.conversation_id)
+            check_conversation(db, user_id, metadata.get("conversation_id"), require_exists=bool(metadata.get("conversation_id")))
             item = MemoryRepository(db).create(
                 user_id=user_id,
                 content=content,
@@ -658,7 +671,7 @@ class MemoryService:
         for mem in extraction.get("working_memories", []):
             result = self.add_memory(user_id, mem["content"], memory_type="working",
                 importance=mem.get("importance", 0.3),
-                metadata={"category": mem.get("category", ""), "source": mem.get("source", ""),
+                metadata={"run_id": run_id, "category": mem.get("category", ""), "source": mem.get("source", ""),
                           "visible_in_long_term_memory": False, "stability": "temporary",
                           "status": "active", "confidence": mem.get("confidence", 0.95)}, db=db)
             saved["working"].append(result)

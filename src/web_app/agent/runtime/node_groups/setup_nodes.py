@@ -40,15 +40,21 @@ class SetupNodesMixin:
         llm_settings = get_llm_settings()
         if llm_settings.enabled and llm_settings.intent_llm_enabled:
             try:
-                llm_intent = infer_home_intent_with_llm(
-                    self.db,
+                from src.web_app.agent.runtime.chat_control import execution
+                from src.web_app.agent.runtime.intent_llm import infer_home_intent_async
+                intent_args = dict(
                     run_id=state["run_id"],
                     thread_id=thread_id,
                     user_id=state["user_id"],
                     user_input=user_input,
                     page_context=page_context,
                     selected_feed_card_id=feed_card_id,
+                    memory_summary=self.payload.get("chat_continuation", ""),
                 )
+                if execution.get():
+                    llm_intent = await infer_home_intent_async(self.db, **intent_args)
+                else:
+                    llm_intent = infer_home_intent_with_llm(self.db, **intent_args)
                 home_intent = self._apply_rule_risk_floor(llm_intent, home_intent)
             except (LLMUnavailableError, LLMInvocationError, LLMParseError) as exc:
                 fallback_reason = str(exc)
@@ -127,6 +133,11 @@ class SetupNodesMixin:
         state["route_plan"] = route_plan
         state["execution_plan"] = execution_plan_from_route_plan(route_plan, state)
         route_intent = route_plan.get("intent", "chat")
+        if state.get("interaction_version") == 2:
+            from src.web_app.agent.runtime.event_ledger import publish_event
+            publish_event(self.db, self._stream_queue, state["run_id"], "interaction_mode",
+                          {"mode": "chat" if route_intent == "chat" else "workflow", "interaction_version": 2},
+                          user_id=state.get("user_id"), thread_id=state.get("thread_id"))
         state["route"] = "tool" if str(route_intent).startswith("tool.") else route_intent  # legacy compat
         state["approval_required"] = route_plan.get("needs_approval", False)
         state["answer_mode"] = route_plan.get("answer_mode", "chat")

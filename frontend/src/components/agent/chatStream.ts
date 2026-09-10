@@ -1,0 +1,43 @@
+import type { AgentChatMessage, AgentEvent } from '../../api/types'
+
+/** Shared live/replay projection. Never apply an old run to another bubble. */
+export function projectChatEvent(message: AgentChatMessage, event: AgentEvent): AgentChatMessage {
+  if (message.role !== 'assistant' || Number(message.run_id) !== Number(event.run_id)) return message
+  const payload = (event.payload || {}) as Record<string, unknown>
+  if (payload.message_id && payload.message_id !== message.message_id) return message
+  if (['interrupted', 'failed'].includes(String(message.status))) return message
+  switch (event.event_type) {
+    case 'answer_delta':
+      if (['interrupted', 'failed', 'completed'].includes(String(message.status))) return message
+      return { ...message, status: 'streaming', content: (message.content || '') + String(payload.text || '') }
+    case 'answer_completed':
+      return { ...message, content: String(payload.answer ?? message.content ?? '') }
+    case 'run_interrupted':
+      return { ...message, status: 'interrupted', content: String(payload.answer ?? message.content ?? ''), error_message: String(payload.error || '') }
+    case 'run_failed':
+      return { ...message, status: 'failed', error_message: String(payload.error || ''), content: String(payload.answer ?? message.content ?? '') }
+    case 'run_completed':
+      return { ...message, status: 'completed', content: String(payload.answer ?? message.content ?? '') }
+    case 'run_paused':
+    case 'approval_required':
+      return { ...message, status: 'waiting_approval' }
+    default:
+      return message
+  }
+}
+
+export function restoreChatMessage(message: AgentChatMessage, events: AgentEvent[]): AgentChatMessage {
+  if (message.role !== 'assistant') return message
+  // Final database snapshots already contain all text. Replay is only needed
+  // for an unfinished snapshot (the service persists its body at completion).
+  if (['completed', 'interrupted', 'failed', 'waiting_approval'].includes(String(message.status))) return message
+  let restored = { ...message, content: '' }
+  const seen = new Set<number>()
+  for (const event of events) {
+    const seq = Number(event.event_seq || event.id || 0)
+    if (!seq || seen.has(seq)) continue
+    seen.add(seq)
+    restored = projectChatEvent(restored, event) as typeof restored
+  }
+  return restored
+}
