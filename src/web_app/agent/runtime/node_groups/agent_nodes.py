@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 
 from src.web_app.agent.runtime.event_ledger import publish_event
 from src.web_app.agent.runtime.node_groups.base import *
@@ -241,6 +242,7 @@ class AgentNodesMixin:
 
     async def rag_agent(self, state: AgentRuntimeState) -> AgentRuntimeState:
         """RAG Agent: retrieve from user's knowledge base."""
+        from src.web_app.services.rag_service import _model_name
         if state.get("route") in {"approval", "blocked"}:
             mark_completed(state, "rag_agent")
             record_agent_node_result(
@@ -272,9 +274,10 @@ class AgentNodesMixin:
                 prepared_rag.get("status") == "ok"
                 and bool(prepared_rag.get("search_attempted"))
                 and not prepared_evidence
-                and intent not in ("document_qa",)
                 and not overview
-                and not doc_ids_raw
+                and ((not doc_ids_raw and intent != "document_qa") or (
+                    prepared_rag.get("query") == user_input_str
+                    and sorted(map(str, prepared_rag.get("document_ids") or [])) == sorted(map(str, doc_ids_raw or []))))
             )
             if prepared_evidence and not (intent == "document_qa" and overview and doc_ids_raw):
                 from src.web_app.context.builder import ContextBuilder as _RagContextBuilder
@@ -283,7 +286,7 @@ class AgentNodesMixin:
                     "evidence": prepared_evidence,
                     "output_contract": "Answer only from evidence and cite chunk_id/source_title.",
                 })
-                evidence = rag_service._evidence_from_results(prepared_evidence)
+                evidence = rag_service._evidence_from_results(prepared_evidence, query=user_input_str)
                 result = {
                     "answer": "[document_qa_context]",
                     "answer_mode": "retrieval_context",
@@ -293,8 +296,8 @@ class AgentNodesMixin:
                         "gssc_used": True,
                         "selected_chunks": len(prepared_evidence),
                         "token_estimate": max(1, len(context) // 4),
-                        "embedding_model": resolve_model_name("embedding").model,
-                        "answer_model": resolve_model_name("rag").model,
+                        "embedding_model": _model_name("embedding"),
+                        "answer_model": _model_name("rag"),
                         "prepared_evidence_used": True,
                     },
                     "_parallel_read_evidence_used": True,
@@ -302,15 +305,16 @@ class AgentNodesMixin:
             elif can_reuse_empty_prepare:
                 prepare_no_evidence_used = True
                 result = {
-                    "answer": "",
+                    "answer": "检索失败，请稍后重试。" if prepared_rag.get("retrieval_status") == "failed" else "没有找到足够证据来回答这个问题。",
                     "answer_mode": "no_evidence_from_prepare",
                     "evidence": [],
-                    "needs_general_fallback": True,
+                    "retrieval_status": prepared_rag.get("retrieval_status", "empty"),
+                    "needs_general_fallback": not doc_ids_raw and intent != "document_qa" and prepared_rag.get("retrieval_status") != "failed",
                     "context": {
                         "gssc_used": False,
                         "selected_chunks": 0,
-                        "embedding_model": resolve_model_name("embedding").model,
-                        "answer_model": resolve_model_name("rag").model,
+                        "embedding_model": _model_name("embedding"),
+                        "answer_model": _model_name("rag"),
                         "prepared_evidence_used": True,
                         "prepared_no_evidence_used": True,
                     },
@@ -321,7 +325,7 @@ class AgentNodesMixin:
                     doc_ids = [int(d) for d in doc_ids_raw]
                 except (TypeError, ValueError):
                     doc_ids = None
-                result = rag_service.ask_document(
+                result = await asyncio.to_thread(rag_service.ask_document,
                     state["user_id"],
                     user_input_str,
                     document_ids=doc_ids,
@@ -335,7 +339,7 @@ class AgentNodesMixin:
                         doc_ids_for_search = [int(d) for d in doc_ids_raw]
                     except (TypeError, ValueError):
                         pass
-                result = rag_service.ask(
+                result = await asyncio.to_thread(rag_service.ask,
                     state["user_id"], user_input_str,
                     top_k=int(self.payload.get("top_k", 5)),
                     document_ids=doc_ids_for_search,
@@ -349,7 +353,7 @@ class AgentNodesMixin:
                     result["_fallback_used"] = True
                 except Exception: pass
             prefetched_evidence = (((state.get("prefetch_results") or {}).get("rag") or {}).get("evidence") or [])
-            if prefetched_evidence and not result.get("evidence"):
+            if prefetched_evidence and not result.get("evidence") and not doc_ids_raw and result.get("retrieval_status") != "failed":
                 result["evidence"] = list(prefetched_evidence)
                 result["_prefetch_evidence_used"] = True
             state["rag"] = result
@@ -377,11 +381,11 @@ class AgentNodesMixin:
                 key="rag_agent",
                 node_name="rag_agent",
                 detail=f"检索到 {len(result.get('evidence', []))} 条证据",
-                model=resolve_model_name("rag").model,
+                model=_model_name("rag"),
                 extra={
                     "evidence_count": len(result.get("evidence", [])),
-                    "embedding_model": resolve_model_name("embedding").model,
-                    "answer_model": resolve_model_name("rag").model,
+                    "embedding_model": _model_name("embedding"),
+                    "answer_model": _model_name("rag"),
                 },
             )
         except Exception as exc:

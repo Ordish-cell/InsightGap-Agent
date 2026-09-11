@@ -351,7 +351,7 @@ def test_ask_evidence_uses_parent_context_and_dedupes_same_parent(client):
         user_id=client.user_id,
         document_id=document.id,
         chunk_index=1,
-        content="# Parent\n\nfull parent context with two children",
+        content="# Parent\n\nfull parent context with two children\nfirst child quote\nsecond child quote",
         token_count=10,
         qdrant_point_id="",
         metadata_json={"chunk_role": "parent", "chunk_id": "p-shared"},
@@ -409,10 +409,9 @@ def test_parent_lookup_is_limited_by_user_and_document(client):
         "parent_id": "p-leak",
     })
 
-    result = rag_service.search(client.user_id, "leak", top_k=3, min_score=0.1, db=db)["results"][0]
-    assert result["parent_context_available"] is False
-    assert result["parent_context"] == "safe child fallback"
-    assert "other user's parent" not in result["parent_context"]
+    results = rag_service.search(client.user_id, "leak", top_k=3, min_score=0.1, db=db)["results"]
+    # Neither an unauthorized parent nor a forged child of that document is evidence.
+    assert results == []
 
 
 def test_rag_ask_returns_answer_with_evidence(client):

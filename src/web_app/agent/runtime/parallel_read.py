@@ -124,11 +124,14 @@ async def _context_skill_branch_inline(
 async def _rag_prepare_branch(state: AgentRuntimeState, payload: dict[str, Any]) -> dict[str, Any]:
     branch_started = time.perf_counter()
     prefetch_rag = (state.get("prefetch_results") or {}).get("rag") or {}
-    evidence = list(prefetch_rag.get("evidence") or []) if isinstance(prefetch_rag, dict) else []
-    from_prefetch = bool(evidence)
+    scope = _document_ids_for_search(state, payload)
+    prefetch_matches = not scope and (not prefetch_rag.get("query") or prefetch_rag["query"] == (state.get("user_input", "") or state.get("query", "")))
+    evidence = list(prefetch_rag.get("evidence") or []) if prefetch_matches else []
+    from_prefetch = prefetch_matches and (bool(evidence) or bool(prefetch_rag.get("search_attempted")))
     search_attempted = from_prefetch
+    retrieval_status = prefetch_rag.get("retrieval_status", "ok")
 
-    if not evidence:
+    if not from_prefetch:
         user_id = state.get("user_id")
         if user_id is None:
             evidence = []
@@ -142,6 +145,7 @@ async def _rag_prepare_branch(state: AgentRuntimeState, payload: dict[str, Any])
                 0.3,
                 _document_ids_for_search(state, payload),
             )
+            retrieval_status = getattr(evidence, "retrieval_status", "ok" if evidence else "empty")
             evidence = list(evidence or [])
 
     elapsed_ms = int((time.perf_counter() - branch_started) * 1000)
@@ -154,6 +158,9 @@ async def _rag_prepare_branch(state: AgentRuntimeState, payload: dict[str, Any])
         "elapsed_ms": elapsed_ms,
         "from_prefetch": from_prefetch,
         "search_attempted": search_attempted,
+        "retrieval_status": retrieval_status,
+        "document_ids": _document_ids_for_search(state, payload),
+        "query": state.get("user_input", "") or state.get("query", ""),
         "summary": "Prepared RAG evidence for downstream rag_agent.",
     }
 

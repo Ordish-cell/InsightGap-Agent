@@ -100,7 +100,9 @@ async def _rag_prefetch(user_id: int | None, query: str) -> dict[str, Any]:
         limit=5,
         score_threshold=0.3,
     )
-    return {"evidence": evidence or [], "count": len(evidence or [])}
+    return {"evidence": list(evidence or []), "count": len(evidence or []),
+            "retrieval_status": getattr(evidence, "retrieval_status", "ok" if evidence else "empty"),
+            "query": query, "document_ids": None, "search_attempted": True}
 
 
 async def _memory_prefetch(user_id: int | None, query: str, db: Session, *, answer_mode: str = "") -> dict[str, Any]:

@@ -1,5 +1,0 @@
-product_model,price,quantity,owner,email,status,warehouse
-NX-100,8999,18,Alice,alice.north@example.com,in_stock,North
-NX-200,12999,7,Bob,bob.north@example.com,low_stock,North
-NX-300,15999,0,Carol,carol.north@example.com,out_of_stock,North
-AX-9,6999,31,Dylan,dylan.north@example.com,in_stock,North

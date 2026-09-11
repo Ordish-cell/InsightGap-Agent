@@ -669,7 +669,23 @@ class EvalFinalNodesMixin:
             return self._fallback_final_answer(state, draft_answer)
 
         resolution = resolve_model_name("final")
+        rag_result = state.get("rag_result") or state.get("rag") or {}
+        if rag_result.get("evidence"):
+            from src.web_app.rag.evidence import fit_evidence
+            from src.web_app.context.builder import ContextBuilder
+            used = len(str((state.get("context") or {}).get("gssc_context", "")).encode("utf-8"))
+            budget = max(0, min(8000, ContextBuilder().config.max_tokens - used - len(user_input.encode("utf-8")) - 1024))
+            selected, block = fit_evidence(rag_result["evidence"], user_input, budget)
+            rag_result["evidence"] = selected
+            rag_result.setdefault("context", {})["document_context_block"] = block
+            if not selected:
+                rag_result["answer"] = "本次上下文预算不足，未能载入文档证据。"
+            state["rag_result"] = rag_result
         prompt = self._build_final_answer_prompt(state, draft_answer)
+        from src.web_app.rag.evidence import ANSWER_CONTRACT, validate_citations
+        rag_evidence = list((state.get("rag_result") or state.get("rag") or {}).get("evidence") or [])
+        if state.get("rag_result") or state.get("rag"):
+            prompt += "\n\n" + ANSWER_CONTRACT
         if self.payload.get("chat_continuation"):
             prompt += "\n\n" + self.payload["chat_continuation"]
         from langchain_core.messages import HumanMessage
@@ -728,6 +744,16 @@ class EvalFinalNodesMixin:
                     full_answer = extracted
             if not full_answer:
                 raise LLMInvocationError("Final LLM returned empty output")
+            if rag_evidence:
+                validation = validate_citations(full_answer, [f"E{i}" for i in range(1, len(rag_evidence) + 1)])
+                (state.get("rag_result") or state.get("rag"))["citation_validation"] = validation
+                publish_event(self.db, queue, run_id, "citation_validation", validation,
+                              node_name="final_response", user_id=user_id, thread_id=thread_id)
+                if validation["invalid_ids"]:
+                    correction = "\n\n引用校验提示：" + "、".join(validation["invalid_ids"]) + "未对应本次检索证据，相关结论尚需核对。"
+                    full_answer += correction
+                    publish_event(self.db, queue, run_id, "answer_delta", {"text": correction},
+                                  node_name="final_response", user_id=user_id, thread_id=thread_id)
 
             latency_ms = int((time.perf_counter() - started) * 1000)
             record_llm_call(
@@ -904,15 +930,10 @@ class EvalFinalNodesMixin:
             rag_answer_text = rag_result.get("answer", "")
             rag_ctx = rag_result.get("context") or {}
             doc_block = rag_ctx.get("document_context_block", "")
-            if doc_block and rag_answer_text == "[document_qa_context]":
-                # Document Q&A mode: inject structured document context directly
+            if doc_block:
+                # Only the selected, citation-mapped evidence is authoritative.
+                # The extractive draft can still contain discarded candidates.
                 extra_blocks.append(doc_block)
-            elif doc_block and rag_answer_text != "[document_qa_context]":
-                extra_blocks.append(doc_block)
-                extra_blocks.append(
-                    f"[RAG Agent Result]\n{rag_answer_text}\n"
-                    f"Evidence count: {len(rag_result.get('evidence', []))}"
-                )
             else:
                 extra_blocks.append(
                     f"[RAG Agent Result]\n{rag_answer_text}\n"

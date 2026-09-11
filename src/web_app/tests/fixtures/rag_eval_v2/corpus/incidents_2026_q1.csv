@@ -1,5 +1,0 @@
-incident_id,service,severity,duration_minutes,status,owner
-INC-2026-021,qdrant,SEV-2,47,resolved,Li Ming
-INC-2026-034,postgres,SEV-1,83,resolved,Wang Lei
-INC-2026-052,embedding-api,SEV-2,36,resolved,Zhao Xin
-INC-2026-067,frontend-sse,SEV-3,19,resolved,Chen Yu

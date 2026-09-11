@@ -134,7 +134,8 @@ def test_same_parent_multiple_children_get_parent_boost(hybrid_env):
     doc, _ = _add_document_with_child(db, user.id, "parent.md", "alpha keyword first child", chunk_id="c-parent-1", parent_id="p-shared")
     _add_child(db, user.id, doc.id, "alpha keyword second child", chunk_id="c-parent-2", parent_id="p-shared")
     results = rag_service.search(user.id, "alpha keyword", top_k=5, min_score=0.1, db=db)["results"]
-    assert len([item for item in results if item["parent_id"] == "p-shared"]) == 2
+    assert len([item for item in results if item["parent_id"] == "p-shared"]) == 1
+    assert len(results[0]["matched_children"]) == 2
     assert all(item["final_score"] > 0 for item in results if item["parent_id"] == "p-shared")
 
 

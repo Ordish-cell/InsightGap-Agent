@@ -1,6 +1,6 @@
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,6 +26,18 @@ class Settings(BaseSettings):
     qdrant_distance: str = "cosine"
     qdrant_timeout: int = 30
     rag_hybrid_backend: str = "python_bm25"
+    rag_dense_candidates: int = Field(40, ge=1, le=200)
+    rag_sparse_candidates: int = Field(40, ge=1, le=200)
+    rag_fusion_candidates: int = Field(20, ge=1, le=100)
+    rag_rerank_mode: str = "off"
+    rag_rerank_model: str = Field("jina-reranker-v3.5", validation_alias=AliasChoices("JINA_RERANK_MODEL", "RAG_RERANK_MODEL"))
+    rag_rerank_endpoint: str = Field("https://api.jina.ai/v1/rerank", validation_alias=AliasChoices("JINA_RERANK_URL", "RAG_RERANK_ENDPOINT"))
+    rag_rerank_api_key: str = Field("", repr=False, validation_alias=AliasChoices("JINA_API_KEY", "RAG_RERANK_API_KEY"))
+    rag_rerank_timeout_ms: int = Field(900, ge=1, le=900)
+    rag_rerank_connect_timeout_ms: int = Field(600, ge=1, le=900)
+    rag_rerank_keepalive_seconds: int = Field(120, ge=5, le=600)
+    rag_rerank_user_ids: str = ""
+    rag_index_context_mode: str = "raw"
     qdrant_dense_vector_name: str = "dense"
     qdrant_sparse_vector_name: str = "bm25"
     qdrant_fusion_method: str = "rrf"

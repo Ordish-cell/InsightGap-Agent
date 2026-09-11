@@ -156,7 +156,7 @@ class QdrantVectorStore:
         point_ids: list[str] = []
         points: list[PointStruct] = []
         for chunk, vector in zip(chunks, vectors, strict=True):
-            point_id = str(uuid4())
+            point_id = str(chunk.get("point_id") or uuid4())
             point_ids.append(point_id)
             content = chunk["content"]
             metadata = dict(chunk.get("metadata", {}))
@@ -188,10 +188,11 @@ class QdrantVectorStore:
                 "row_end": metadata.get("row_end"),
                 "created_at": datetime.now(UTC).isoformat(),
                 "metadata": metadata,
+                "index_context_version": metadata.get("index_context_version", "raw-v1"),
             }
             point_vector: Any = vector
             if self.hybrid_enabled:
-                sparse = build_sparse_document_input(content)
+                sparse = build_sparse_document_input(chunk.get("retrieval_text", content))
                 point_vector = {self.dense_vector_name: vector}
                 if not is_sparse_input_empty(sparse):
                     point_vector[self.sparse_vector_name] = sparse
@@ -273,8 +274,8 @@ class QdrantVectorStore:
         response = self.client.query_points(
             collection_name=self.collection,
             prefetch=[
-                Prefetch(query=query_vector, using=self.dense_vector_name, filter=query_filter, limit=max(top_k * 3, top_k), score_threshold=min_score),
-                Prefetch(query=sparse, using=self.sparse_vector_name, filter=query_filter, limit=max(top_k * 3, top_k)),
+                Prefetch(query=query_vector, using=self.dense_vector_name, filter=query_filter, limit=max(settings.rag_dense_candidates, top_k), score_threshold=min_score),
+                Prefetch(query=sparse, using=self.sparse_vector_name, filter=query_filter, limit=max(settings.rag_sparse_candidates, top_k)),
             ],
             query=FusionQuery(fusion=Fusion.RRF),
             limit=top_k,
@@ -287,6 +288,8 @@ class QdrantVectorStore:
             item["bm25_score"] = 0.0
             item["sparse_score"] = 0.0
             item["final_score"] = item.get("score", 0.0)
+            item["fusion_score"] = item.get("score", 0.0)
+            item["ranking_method"] = "rrf"
         return results
 
     def _hits_to_results(self, hits: list[Any]) -> list[dict[str, Any]]:

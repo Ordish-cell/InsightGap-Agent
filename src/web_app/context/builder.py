@@ -132,6 +132,11 @@ class ContextBuilder:
             if content in (None, "", [], {}):
                 continue
             text = content if isinstance(content, str) else str(content)
+            if source == "evidence" and isinstance(content, list) and content and all(
+                isinstance(item, dict) and item.get("evidence_assembled") for item in content
+            ):
+                from src.web_app.rag.evidence import evidence_block
+                text = evidence_block(content)
             # Route-aware relevance: use route-specific weight if defined,
             # fall back to default heuristics
             relevance = weights.get(source, 0.35)

@@ -2,16 +2,19 @@ from __future__ import annotations
 
 from collections import defaultdict
 import logging
+from time import perf_counter
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.web_app.models.orm import Document
+from src.web_app.core.config import settings
 from src.web_app.db.repositories.document_repository import DocumentChunkRepository
 from src.web_app.rag.bm25 import BM25Document, bm25_search
 from src.web_app.rag.query_analyzer import QueryAnalysis, analyze_query
 from src.web_app.rag.reranker import rerank_results
+from src.web_app.rag.model_reranker import rerank_candidates
 from src.web_app.rag.vector_store import QdrantVectorStore
 
 logger = logging.getLogger(__name__)
@@ -23,6 +26,7 @@ class ParentChildRetriever:
     def __init__(self, db: Session, vector_store: QdrantVectorStore | None = None):
         self.db = db
         self.vector_store = vector_store
+        self.diagnostics: dict[str, Any] = {}
 
     def search(
         self,
@@ -36,19 +40,25 @@ class ParentChildRetriever:
         bm25_candidate_limit: int = 1000,
         backend: str = "python_bm25",
         allow_fallback: bool = True,
+        trace: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
+        self.diagnostics = trace if trace is not None else {}
+        self.diagnostics.update(timings={}, failures=[], successful_backends=[], backend=backend)
+        if top_k <= 0 or document_ids == []:
+            return []
         analysis = analyze_query(query)
         chunk_roles = ["overview", "section_summary"] if analysis.is_summary else ["child"]
         if backend == "qdrant_hybrid":
             try:
                 return self._qdrant_hybrid_search(user_id, query, query_vector, top_k, min_score, document_ids, analysis, chunk_roles)
             except Exception as exc:
+                self.diagnostics["failures"].append("qdrant_hybrid_failed")
                 logger.warning("qdrant_hybrid_failed fallback_to_python_bm25 user_id=%s error=%s", user_id, exc, exc_info=True)
                 if not allow_fallback:
                     raise
                 fallback_results = self._python_bm25_hybrid_search(user_id, query, query_vector, top_k, min_score, document_ids, bm25_candidate_limit, analysis, chunk_roles)
                 for item in fallback_results:
-                    item["retrieval_warning"] = f"qdrant_hybrid_failed: {exc}"
+                    item["retrieval_warning"] = "qdrant_hybrid_failed: Sparse query vector is empty" if str(exc) == "Sparse query vector is empty" else "qdrant_hybrid_failed"
                 return fallback_results
         return self._python_bm25_hybrid_search(user_id, query, query_vector, top_k, min_score, document_ids, bm25_candidate_limit, analysis, chunk_roles)
 
@@ -65,7 +75,10 @@ class ParentChildRetriever:
     ) -> list[dict[str, Any]]:
         if not self.vector_store or not query_vector:
             raise RuntimeError("Qdrant hybrid requires vector store and dense query vector")
-        hits = self._vector_store_search_hybrid(user_id, query_vector, query, max(top_k * 2, top_k), min_score, document_ids, chunk_roles)
+        started = perf_counter()
+        hits = self._vector_store_search_hybrid(user_id, query_vector, query, max(settings.rag_fusion_candidates, top_k), min_score, document_ids, chunk_roles)
+        self.diagnostics["timings"]["recall_ms"] = (perf_counter() - started) * 1000
+        self.diagnostics["successful_backends"].append("qdrant_hybrid")
         if not hits:
             return []
         for hit in hits:
@@ -73,10 +86,14 @@ class ParentChildRetriever:
             hit.setdefault("query_type", analysis.query_type)
             hit.setdefault("final_score", hit.get("score", 0.0))
             hit.setdefault("matched_terms", [])
-        ranked = rerank_results(hits, analysis, document_ids=document_ids, top_k=top_k)
+            hit.setdefault("fusion_score", hit.get("score", 0.0))
+            hit["ranking_method"] = "rrf"
+            hit.setdefault("keyword_score", 0.0)
+        self.diagnostics["candidates"] = [dict(h) for h in hits]
+        ranked = hits
         for item in ranked:
             item["retrieval_source"] = "qdrant_hybrid"
-        return self._enrich_parent_context(user_id, ranked, analysis)
+        return self._finish(user_id, ranked, analysis, top_k)
 
     def _python_bm25_hybrid_search(
         self,
@@ -90,13 +107,42 @@ class ParentChildRetriever:
         analysis: QueryAnalysis,
         chunk_roles: list[str],
     ) -> list[dict[str, Any]]:
-        vector_hits = self._vector_search(user_id, query_vector, top_k, min_score, document_ids, chunk_roles)
-        bm25_hits = self._bm25_search(user_id, query, max(top_k * 4, top_k), document_ids, bm25_candidate_limit, chunk_roles)
+        started = perf_counter()
+        vector_hits = self._vector_search(user_id, query_vector, max(settings.rag_dense_candidates, top_k), min_score, document_ids, chunk_roles)
+        bm25_hits = self._bm25_search(user_id, query, max(settings.rag_sparse_candidates, top_k), document_ids, bm25_candidate_limit, chunk_roles)
         merged = self._merge_hits(vector_hits, bm25_hits, analysis)
+        self.diagnostics["timings"]["recall_ms"] = (perf_counter() - started) * 1000
         if not merged:
             return []
-        ranked = rerank_results(merged, analysis, document_ids=document_ids, top_k=top_k)
-        return self._enrich_parent_context(user_id, ranked, analysis)
+        ranked = rerank_results(merged, analysis, document_ids=document_ids, top_k=max(settings.rag_fusion_candidates, top_k))
+        for hit in ranked:
+            hit["ranking_method"] = "rules"
+        self.diagnostics["candidates"] = [dict(h) for h in ranked]
+        return self._finish(user_id, ranked, analysis, top_k)
+
+    def _finish(self, user_id, ranked, analysis, top_k):
+        permitted = set(self.db.scalars(select(Document.id).where(Document.user_id == user_id,
+                         Document.id.in_([_as_int(h.get("document_id")) for h in ranked]), Document.status != "deleting")))
+        ranked = [h for h in ranked if _as_int(h.get("document_id")) in permitted]
+        ranked, rerank_info = rerank_candidates(analysis.query, ranked, user_id)
+        self.diagnostics["rerank"] = rerank_info
+        self.diagnostics["timings"]["rerank_ms"] = rerank_info.get("elapsed_ms", 0)
+        if rerank_info["status"] == "fallback":
+            self.diagnostics["failures"].append("rerank_" + rerank_info["reason"])
+        started = perf_counter()
+        enriched = self._enrich_parent_context(user_id, ranked, analysis)
+        self.diagnostics["timings"]["parent_ms"] = (perf_counter() - started) * 1000
+        groups = {}
+        for hit in enriched:
+            key = (str(hit.get("document_id")), str(hit.get("parent_id") or hit.get("chunk_id")))
+            child = {k: hit.get(k) for k in ("document_id", "chunk_id", "content", "metadata", "citation", "score", "final_score")}
+            if key not in groups:
+                groups[key] = {**hit, "matched_children": []}
+            groups[key]["matched_children"].append(child)
+        results = list(groups.values())[:top_k]
+        self.diagnostics["ranked"] = [dict(h) for h in ranked]
+        self.diagnostics["parent_groups"] = len(groups)
+        return results
 
     def _vector_search(
         self,
@@ -110,8 +156,10 @@ class ParentChildRetriever:
         if not self.vector_store or not query_vector:
             return []
         try:
-            hits = self._vector_store_search(user_id, query_vector, max(top_k * 3, top_k), min_score, document_ids, chunk_roles)
+            hits = self._vector_store_search(user_id, query_vector, top_k, min_score, document_ids, chunk_roles)
+            self.diagnostics["successful_backends"].append("vector")
         except Exception as exc:
+            self.diagnostics["failures"].append("vector_search_failed")
             logger.warning("vector_search_failed fallback_to_bm25 user_id=%s error=%s", user_id, exc, exc_info=True)
             return []
         normalized = _normalize_scores([float(hit.get("score", 0.0)) for hit in hits])
@@ -136,8 +184,12 @@ class ParentChildRetriever:
             return []
         try:
             chunk_repo = DocumentChunkRepository(self.db)
-            chunks = chunk_repo.list_role_candidates(user_id, chunk_roles, document_ids=document_ids, limit=candidate_limit)
+            chunks = chunk_repo.list_role_candidates(user_id, chunk_roles, document_ids=document_ids, limit=candidate_limit + 1 if candidate_limit > 0 else 0)
+            self.diagnostics["candidate_truncated"] = candidate_limit > 0 and len(chunks) > candidate_limit
+            if candidate_limit > 0:
+                chunks = chunks[:candidate_limit]
             if not chunks:
+                self.diagnostics["successful_backends"].append("bm25")
                 return []
             docs_by_id = self._documents_by_id(user_id, [chunk.document_id for chunk in chunks])
             documents = []
@@ -146,7 +198,9 @@ class ParentChildRetriever:
                 chunk_id = str(metadata.get("chunk_id") or chunk.qdrant_point_id or chunk.id)
                 documents.append(BM25Document(id=chunk_id, content=chunk.content, payload={"chunk": chunk, "document": docs_by_id.get(chunk.document_id)}))
             hits = bm25_search(query, documents, top_k=top_k)
+            self.diagnostics["successful_backends"].append("bm25")
         except Exception as exc:
+            self.diagnostics["failures"].append("bm25_search_failed")
             logger.warning("bm25_search_failed fallback_to_vector user_id=%s error=%s", user_id, exc, exc_info=True)
             return []
 
@@ -280,6 +334,7 @@ class ParentChildRetriever:
                 "parent_chunk_index": parent.chunk_index if parent else None,
                 "parent_context": parent_context,
                 "parent_context_available": parent is not None,
+                "parent_char_start": (parent_metadata or {}).get("char_start"),
                 "citation": {
                     "document_id": hit.get("document_id"),
                     "chunk_id": hit.get("chunk_id", ""),
@@ -328,7 +383,8 @@ def _as_int(value: Any) -> int | None:
 
 def _hit_key(hit: dict[str, Any]) -> str:
     metadata = hit.get("metadata", {}) or {}
-    return str(hit.get("child_chunk_id") or hit.get("chunk_id") or metadata.get("chunk_id") or hit.get("qdrant_point_id") or "")
+    chunk_id = str(hit.get("child_chunk_id") or hit.get("chunk_id") or metadata.get("chunk_id") or hit.get("qdrant_point_id") or "")
+    return f"{hit.get('document_id')}:{chunk_id}"
 
 
 def _normalize_scores(scores: list[float]) -> list[float]:

@@ -1,4 +1,4 @@
-from sqlalchemy import delete, select
+from sqlalchemy import and_, delete, or_, select
 
 from src.web_app.db.repositories.base_repository import BaseRepository
 from src.web_app.models.orm import Document, DocumentChunk
@@ -73,6 +73,10 @@ class DocumentChunkRepository(BaseRepository[DocumentChunk]):
         stmt = select(DocumentChunk).where(
             DocumentChunk.user_id == user_id,
             DocumentChunk.document_id.in_(document_ids),
+            DocumentChunk.metadata_json["chunk_role"].as_string() == "parent",
+            or_(*(and_(DocumentChunk.document_id == int(doc_id),
+                       DocumentChunk.metadata_json["chunk_id"].as_string().in_(parent_ids))
+                  for doc_id, parent_ids in document_parent_ids.items() if parent_ids)),
         )
         parents: dict[tuple[int, str], DocumentChunk] = {}
         wanted = {
@@ -96,6 +100,8 @@ class DocumentChunkRepository(BaseRepository[DocumentChunk]):
         stmt = select(DocumentChunk).where(
             DocumentChunk.user_id == user_id,
             DocumentChunk.metadata_json["chunk_role"].as_string().in_(roles),
+            DocumentChunk.document_id.in_(select(Document.id).where(
+                Document.user_id == user_id, Document.status != "deleting")),
         ).order_by(DocumentChunk.created_at.desc(), DocumentChunk.id.desc())
         if document_ids:
             stmt = stmt.where(DocumentChunk.document_id.in_([int(item) for item in document_ids]))

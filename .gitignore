@@ -69,4 +69,45 @@ temp/
 # Experiment results
 tests/expt_results/
 
+# Local RAG evaluation artifacts (do not publish)
+/docs/evaluations/
+/docs/rag_ai_answer_results_*.md
+/docs/rag_baseline.md
+/docs/rag_evaluation_protocol.md
+/docs/rag_results_*.md
+/docs/rag_rollout.md
+/docs/rag_transport_and_review_*.md
+/scripts/build_rag_review_dataset.py
+/scripts/build_rag_eval_v2_dataset.py
+/scripts/compare_rag_quality.py
+/scripts/compare_rag_rollout.py
+/scripts/diagnose_jina_transport.py
+/scripts/freeze_rag_project_dataset.py
+/scripts/package_rag_evaluation.py
+/scripts/rag_blind_review.py
+/scripts/rag_eval_answers.py
+/scripts/rag_eval_metrics.py
+/scripts/rag_project_cases.py
+/scripts/run_rag_eval_v2.py
+/scripts/run_rag_hybrid_eval.py
+/scripts/score_rag_ai_review.py
+/scripts/verify_rag_evaluation.py
+/src/web_app/tests/fixtures/rag_eval_project/
+/src/web_app/tests/fixtures/rag_eval_review_v2/
+/src/web_app/tests/fixtures/rag_eval_v2/
+/src/web_app/tests/fixtures/rag_eval_expected.json
+/src/web_app/tests/fixtures/rag_eval_queries.txt
+/src/web_app/tests/test_rag_ai_review_score.py
+/src/web_app/tests/test_rag_blind_review.py
+/src/web_app/tests/test_rag_eval_audit.py
+/src/web_app/tests/test_rag_project_eval.py
+/src/web_app/tests/test_rag_eval_v2_dataset.py
+/src/web_app/tests/test_rag_hybrid_eval_runner.py
+/tests/evaluators.py
+/tests/pairwise_evaluation.py
+/tests/run_evaluate.py
+/tests/supervisor_parallel_evaluation.py
+/uploads/artifacts/rag_eval*/
+/uploads/artifacts/rag_review*/
+
 .langgraph_api

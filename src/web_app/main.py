@@ -42,6 +42,8 @@ async def add_request_id(request: Request, call_next):
 @app.on_event("startup")
 async def startup_health_checks():
     """Verify production dependencies before accepting traffic."""
+    from src.web_app.rag.model_reranker import prepare_reranker_transport
+    prepare_reranker_transport()
     # ── Checkpointer health ──────────────────────────────────────
     try:
         from src.web_app.agent.runtime.checkpointers import check_checkpointer_health

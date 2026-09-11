@@ -58,9 +58,13 @@ def read_documents_in_session(db, user_id, conversation_id, decision, token_budg
             try:
                 from src.web_app.services.rag_service import rag_service
                 found = rag_service.search(user_id, decision["query"], top_k=5, document_ids=[document_id], db=db)
-                evidence = rag_service._evidence_from_results(found.get("results", []))
+                evidence = rag_service._evidence_from_results(found.get("results", []), query=decision["query"], byte_budget=max(0, allocation - 2 * len(found.get("results", []))))
                 item.update(text="\n\n".join(e["quote"] for e in evidence), coverage="retrieved", references=[
-                    {k: e[k] for k in ("document_id", "chunk_id", "source_title")} for e in evidence])
+                    {**e["citation"], "quote": e["quote"], "source_title": e["source_title"]} for e in evidence],
+                    retrieval_status=found.get("retrieval_status", "ok"),
+                    context_truncated=any(e["context_truncated"] for e in evidence))
+                if found.get("retrieval_status") == "failed":
+                    item["status"] = "retrieval_failed"
             except Exception:
                 item.update(status="retrieval_failed")
         raw = item["text"].encode("utf-8")

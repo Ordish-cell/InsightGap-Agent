@@ -13,6 +13,7 @@ from src.web_app.models.orm import Document
 from src.web_app.rag.document_parser import ALLOWED_EXTENSIONS, parse_document
 from src.web_app.rag.document_summarizer import build_document_summary, summary_chunks
 from src.web_app.rag.embeddings import MAX_EMBED_CHARS, embed_texts
+from src.web_app.rag.index_text import indexed_chunk
 from src.web_app.rag.structured_chunker import build_structured_chunks, fallback_structured_chunks
 from src.web_app.rag.vector_store import QdrantVectorStore
 
@@ -301,10 +302,10 @@ class DocumentService:
             vector_store = QdrantVectorStore()
             total = len(vector_chunks)
             for batch_start in range(0, total, EMBED_BATCH_SIZE):
-                batch = vector_chunks[batch_start:batch_start + EMBED_BATCH_SIZE]
+                batch = [indexed_chunk(c, document.filename, document.metadata_json) for c in vector_chunks[batch_start:batch_start + EMBED_BATCH_SIZE]]
                 progress = 40 + int(50 * batch_start / max(1, total))
                 self._update_ingest_progress(doc_repo, document, "embed", progress, processed_chunks=batch_start, total_chunks=total)
-                vectors = embed_texts([chunk["content"] for chunk in batch])
+                vectors = embed_texts([chunk["retrieval_text"] for chunk in batch])
                 self._update_ingest_progress(doc_repo, document, "qdrant_upsert", progress, processed_chunks=batch_start, total_chunks=total)
                 point_ids.extend(vector_store.upsert_chunks(user_id, document.id, batch, vectors, document))
         except Exception:

@@ -65,10 +65,17 @@ def build_document_summary(
 
 
 def summary_chunks(summary: dict[str, Any], start_index: int) -> list[dict[str, Any]]:
+    from src.web_app.rag.embeddings import MAX_EMBED_CHARS
     chunks: list[dict[str, Any]] = []
+    def append_parts(content, role, identifier, metadata):
+        parts = [content[start:start + MAX_EMBED_CHARS] for start in range(0, len(content), MAX_EMBED_CHARS)]
+        for number, part in enumerate(parts, 1):
+            chunk_id = identifier if len(parts) == 1 else f'{identifier}-part-{number:04d}'
+            chunks.append(_chunk(start_index + len(chunks), part, role, chunk_id,
+                {**metadata, 'summary_part': number, 'summary_part_count': len(parts)}))
     overview = str(summary.get("summary_text") or "").strip()
     if overview:
-        chunks.append(_chunk(start_index, overview, "overview", "overview-0000", summary))
+        append_parts(overview, "overview", "overview-0000", summary)
     for number, item in enumerate(summary.get("section_summaries") or [], 1):
         content = str(item.get("summary_text") or "").strip()
         if not content:
@@ -79,7 +86,7 @@ def summary_chunks(summary: dict[str, Any], start_index: int) -> list[dict[str, 
             "page_end": item.get("page_end"),
             "heading_path": item.get("heading_path", []),
         }
-        chunks.append(_chunk(start_index + len(chunks), content, "section_summary", f"summary-{number:04d}", metadata))
+        append_parts(content, "section_summary", f"summary-{number:04d}", metadata)
     return chunks
 
 
@@ -92,7 +99,7 @@ def _chunk(index: int, content: str, role: str, chunk_id: str, extra: dict[str, 
         "chunk_id": chunk_id,
         "parent_id": None,
         "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        **{key: value for key, value in extra.items() if key in {"parent_ids", "page_start", "page_end", "heading_path"}},
+        **{key: value for key, value in extra.items() if key in {"parent_ids", "page_start", "page_end", "heading_path", "summary_part", "summary_part_count"}},
     }
     return {
         "chunk_index": index,

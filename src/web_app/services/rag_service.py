@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from contextlib import contextmanager
 from typing import Any
 
@@ -14,11 +15,19 @@ from src.web_app.db.repositories.document_repository import DocumentRepository
 from src.web_app.db.session import SessionLocal
 from src.web_app.models.orm import Document, DocumentChunk
 from src.web_app.rag.embeddings import embed_text
+from src.web_app.rag.evidence import assemble_evidence, evidence_block
 from src.web_app.rag.query_analyzer import analyze_query
 from src.web_app.rag.retriever import ParentChildRetriever
 from src.web_app.rag.vector_store import QdrantVectorStore
 
 logger = logging.getLogger(__name__)
+
+
+class EvidenceBatch(list):
+    """List-compatible evidence carrying empty/failure status to prefetch callers."""
+    def __init__(self, items=(), *, retrieval_status="ok"):
+        super().__init__(items)
+        self.retrieval_status = retrieval_status
 
 
 def is_document_overview_query(query: str) -> bool:
@@ -65,7 +74,11 @@ class RAGService:
     def ingest_text(self, user_id: int, document_id: int, text: str) -> dict[str, Any]:
         return {"status": "deprecated", "reason": "Use DocumentService.ingest_document for persisted RAG ingestion", "user_id": user_id, "document_id": document_id}
 
-    def search(self, user_id: int, query: str, top_k: int = 5, min_score: float = 0.2, document_ids: list[int] | None = None, db: Session | None = None) -> dict[str, Any]:
+    def search(self, user_id: int, query: str, top_k: int = 5, min_score: float = 0.2, document_ids: list[int] | None = None, db: Session | None = None, *, trace: dict[str, Any] | None = None) -> dict[str, Any]:
+        started = perf_counter()
+        from src.web_app.rag.model_reranker import prepare_reranker_transport
+        prepare_reranker_transport(user_id)
+        diagnostics: dict[str, Any] = {}
         vector = None
         vector_store = None
         warning = None
@@ -78,6 +91,7 @@ class RAGService:
                 logger.warning("rag.vector_unavailable fallback_to_bm25 user_id=%s error=%s", user_id, exc, exc_info=True)
         else:
             warning = "Qdrant is not configured; using BM25 fallback"
+        embedding_ms = (perf_counter() - started) * 1000
 
         with _db_scope(db) as session:
             results = ParentChildRetriever(session, vector_store).search(
@@ -89,9 +103,24 @@ class RAGService:
                 document_ids=document_ids,
                 backend=settings.rag_hybrid_backend,
                 allow_fallback=settings.qdrant_hybrid_fallback,
+                trace=diagnostics,
             )
 
         response: dict[str, Any] = {"query": query, "results": results}
+        failures = diagnostics.get("failures", [])
+        status = "degraded" if results and (warning or failures or diagnostics.get("candidate_truncated")) else "ok" if results else "empty" if diagnostics.get("successful_backends") or document_ids == [] else "failed" if failures or warning else "empty"
+        response["retrieval_status"] = status
+        response["candidate_truncated"] = bool(diagnostics.get("candidate_truncated"))
+        if failures:
+            response["retrieval_warning"] = ",".join(failures)
+        for item in results:
+            item["retrieval_status"] = status
+        diagnostics.setdefault("timings", {})["embedding_ms"] = embedding_ms
+        diagnostics["timings"]["total_ms"] = (perf_counter() - started) * 1000
+        if trace is not None:
+            trace.update(diagnostics)
+        logger.info("rag.search status=%s candidates=%s groups=%s timings=%s", status,
+                    len(diagnostics.get("candidates", [])), len(results), diagnostics["timings"])
         result_warning = next((item.get("retrieval_warning") for item in results if item.get("retrieval_warning")), None)
         if result_warning:
             response["retrieval_warning"] = result_warning
@@ -106,12 +135,14 @@ class RAGService:
             search_result = self.search(user_id, query, top_k=limit, min_score=score_threshold, document_ids=document_ids)
         except Exception as exc:
             logger.warning("RAG search_evidence failed (non-blocking): %s", exc)
-            return []
+            return EvidenceBatch(retrieval_status="failed")
         results = search_result.get("results", [])
-        return [
+        evidence = self._evidence_from_results(results, query=query)
+        return EvidenceBatch([
             {
+                **item,
                 "id": item.get("chunk_id", ""),
-                "content": (item.get("parent_context") or item.get("content", ""))[:800],
+                "content": item["quote"],
                 "score": item.get("score", 0.0),
                 "document_id": item.get("document_id", ""),
                 "chunk_id": item.get("chunk_id", ""),
@@ -122,8 +153,8 @@ class RAGService:
                 "source_url": item.get("source_url", ""),
                 "metadata": item.get("metadata", {}),
             }
-            for item in results
-        ]
+            for item in evidence
+        ], retrieval_status=search_result.get("retrieval_status", "ok"))
 
     def ask(self, user_id: int, question: str, top_k: int = 5, min_score: float = 0.2, document_ids: list[int] | None = None, answer_mode: str = "auto", db: Session | None = None) -> dict[str, Any]:
         if is_document_overview_query(question) and document_ids:
@@ -139,22 +170,25 @@ class RAGService:
         results = search_result.get("results", [])
         if not results:
             is_general = is_general_knowledge_question(question)
-            is_doc_specific = is_document_specific_question(question)
+            is_doc_specific = bool(document_ids) or is_document_specific_question(question)
+            failed = search_result.get("retrieval_status") == "failed"
             return {
-                "answer": "没有找到足够证据来回答这个问题。",
-                "answer_mode": "general_knowledge_fallback" if (is_general and not is_doc_specific) else "no_evidence",
+                "answer": "检索失败，暂时无法确认文档中的答案，请稍后重试。" if failed else "没有找到足够证据来回答这个问题。",
+                "answer_mode": "retrieval_failed" if failed else "general_knowledge_fallback" if (is_general and not is_doc_specific) else "no_evidence",
+                "retrieval_status": search_result.get("retrieval_status", "empty"),
                 "evidence": [],
-                "needs_general_fallback": is_general and not is_doc_specific,
+                "needs_general_fallback": is_general and not is_doc_specific and not failed,
                 "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0, "embedding_model": _model_name("embedding"), "answer_model": _model_name("rag")},
             }
 
-        evidence = self._evidence_from_results(results)
+        evidence = self._evidence_from_results(results, query=question)
         context = ContextBuilder().build({"task": question, "evidence": evidence, "output_contract": "Answer only from evidence and cite chunk_id/source_title."})
         return {
             "answer": self._extractive_answer(question, evidence),
             "answer_mode": "extractive_fallback",
             "evidence": evidence,
-            "context": {"gssc_used": True, "selected_chunks": len(evidence), "token_estimate": max(1, len(context) // 4), "embedding_model": _model_name("embedding"), "answer_model": _model_name("rag")},
+            "retrieval_status": search_result.get("retrieval_status", "ok"),
+            "context": {"document_context_block": self._document_context_block(evidence), "gssc_used": True, "selected_chunks": len(evidence), "token_estimate": max(1, len(context) // 4), "embedding_model": _model_name("embedding"), "answer_model": _model_name("rag")},
         }
 
     def stats(self, db: Session, user_id: int) -> dict[str, Any]:
@@ -197,6 +231,9 @@ class RAGService:
         search_result = self.search(user_id, question, top_k=top_k, min_score=0.1, document_ids=document_ids, db=db)
         results = search_result.get("results", [])
         if not results and not evidence:
+            if search_result.get("retrieval_status") == "failed":
+                return {"answer": "检索失败，暂时无法确认文档中的答案，请稍后重试。", "answer_mode": "retrieval_failed",
+                        "retrieval_status": "failed", "evidence": [], "context": {}}
             if overview_mode or is_document_overview_query(question):
                 return {
                     "answer": "全文摘要尚未生成或生成失败，请重新处理文档后再试。",
@@ -211,7 +248,7 @@ class RAGService:
                 "context": {"gssc_used": True, "selected_chunks": 0, "token_estimate": 0, "embedding_model": _model_name("embedding"), "answer_model": _model_name("rag")},
             }
 
-        evidence.extend(self._evidence_from_results(results, existing=evidence))
+        evidence.extend(self._evidence_from_results(results, existing=evidence, query=question))
         context_text = self._document_context_block(evidence)
         return {
             "answer": "[document_qa_context]",
@@ -227,45 +264,17 @@ class RAGService:
             },
         }
 
-    def _evidence_from_results(self, results: list[dict[str, Any]], existing: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-        evidence: list[dict[str, Any]] = []
-        seen = {(str(item.get("document_id", "")), str(item.get("parent_id") or item.get("chunk_id") or "")) for item in existing or []}
-        for item in results:
-            parent_id = str(item.get("parent_id") or "")
-            child_chunk_id = str(item.get("child_chunk_id") or item.get("chunk_id") or "")
-            key = (str(item.get("document_id", "")), parent_id or child_chunk_id)
-            if key in seen:
-                continue
-            seen.add(key)
-            evidence.append({
-                "document_id": item["document_id"],
-                "chunk_id": item["chunk_id"],
-                "child_chunk_id": child_chunk_id,
-                "parent_id": item.get("parent_id"),
-                "parent_chunk_id": item.get("parent_chunk_id"),
-                "parent_context_available": item.get("parent_context_available", False),
-                "score": item["score"],
-                "quote": (item.get("parent_context") or item.get("quote") or item.get("content") or "")[:1200],
-                "child_quote": (item.get("content") or item.get("quote") or "")[:800],
-                "source_title": item.get("source_title") or item.get("source_name") or "document",
-                "source_url": item.get("source_url", ""),
-                "citation": item.get("citation", {}),
-                "metadata": item["metadata"],
-            })
-        return evidence
+    def _evidence_from_results(self, results: list[dict[str, Any]], existing: list[dict[str, Any]] | None = None, *, query: str = "", byte_budget: int = 8000) -> list[dict[str, Any]]:
+        return assemble_evidence(results, existing=existing, query=query, byte_budget=byte_budget)
 
     def _document_context_block(self, evidence: list[dict[str, Any]]) -> str:
-        doc_names = {str(item.get("source_title", "document")) for item in evidence}
-        parts = [f"[Document QA context: {', '.join(sorted(doc_names))}]"]
-        for index, item in enumerate(evidence[:12], 1):
-            parts.append(f"Chunk {index}:\n{item.get('quote', '')}")
-        return "\n\n".join(parts)
+        return evidence_block(evidence)
 
     def _extractive_answer(self, question: str, evidence: list[dict[str, Any]]) -> str:
         lines = []
         for item in evidence[:8]:
             if item.get("quote"):
-                lines.append(f"[{item.get('source_title', 'document')} #{item.get('chunk_id', '')}] {item['quote'].strip()[:800]}")
+                lines.append(f"[{item.get('source_title', 'document')} #{item.get('chunk_id', '')}] {item['quote'].strip()}")
         return "以下是从当前上传文档中检索到的相关内容，请基于这些内容回答：\n\n" + "\n\n".join(lines)
 
 
