@@ -4,6 +4,9 @@ from pydantic import BaseModel, Field
 
 
 class AgentRunRequest(BaseModel):
+    def runtime_payload(self) -> dict[str, Any]:
+        return {**self.model_dump(), "_explicit_fields": sorted(self.model_fields_set)}
+
     user_input: str = ""
     input: str | None = None
     conversation_id: str | None = None

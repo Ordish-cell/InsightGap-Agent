@@ -26,6 +26,9 @@ VISIBILITY_INTERNAL = "internal"
 # Map event_type → (visibility, display_channel).  Everything not listed
 # defaults to ("trace", "status").
 _EVENT_DISPLAY: dict[str, tuple[str, str]] = {
+    "agent_text_started": (VISIBILITY_USER, DISPLAY_CHANNEL_STATUS),
+    "agent_text_delta": (VISIBILITY_USER, DISPLAY_CHANNEL_STATUS),
+    "agent_text_completed": (VISIBILITY_USER, DISPLAY_CHANNEL_STATUS),
     "interaction_mode": (VISIBILITY_USER, DISPLAY_CHANNEL_STATUS),
     "progress_delta": (VISIBILITY_USER, DISPLAY_CHANNEL_THINKING),
     "progress_completed": (VISIBILITY_USER, DISPLAY_CHANNEL_THINKING),

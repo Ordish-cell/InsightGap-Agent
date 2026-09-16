@@ -8,7 +8,7 @@ from src.web_app.core.config import get_settings
 ModelPurpose = Literal[
     "intent",
     "safety",
-    "planner",
+    "supervisor",
     "rag",
     "research",
     "artifact",
@@ -37,7 +37,7 @@ DEFAULT_TIER_BY_PURPOSE: dict[ModelPurpose, ModelTier] = {
     "safety": "fast",
     "memory": "fast",
     "skill": "fast",
-    "planner": "balanced",
+    "supervisor": "balanced",
     "rag": "balanced",
     "artifact": "balanced",
     "final": "balanced",

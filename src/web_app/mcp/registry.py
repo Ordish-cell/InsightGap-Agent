@@ -133,7 +133,7 @@ BUILTIN_TOOLS = [
         description="Create a local text artifact.",
         category="artifact",
         safety_level=L2_LOCAL_WRITE,
-        input_schema={"type": "object", "properties": {"title": {"type": "string"}, "content": {"type": "string"}, "artifact_type": {"type": "string"}}},
+        input_schema={"type": "object", "required": ["title", "content"], "properties": {"title": {"type": "string", "minLength": 1}, "content": {"type": "string", "minLength": 1}, "artifact_type": {"type": "string"}}},
         output_schema={"type": "object", "properties": {"artifact_id": {"type": "integer"}}},
     ),
     MCPToolSpec(
@@ -149,7 +149,7 @@ BUILTIN_TOOLS = [
         description="Add user-owned memory.",
         category="memory",
         safety_level=L2_LOCAL_WRITE,
-        input_schema={"type": "object", "properties": {"content": {"type": "string"}, "memory_type": {"type": "string"}, "importance": {"type": "number"}}},
+        input_schema={"type": "object", "required": ["content"], "properties": {"content": {"type": "string", "minLength": 1}, "memory_type": {"type": "string"}, "importance": {"type": "number"}}},
         output_schema={"type": "object", "properties": {"memory_id": {"type": "integer"}}},
     ),
     MCPToolSpec(
@@ -157,8 +157,18 @@ BUILTIN_TOOLS = [
         description="Create a local skill draft.",
         category="skill",
         safety_level=L2_LOCAL_WRITE,
-        input_schema={"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "trigger_text": {"type": "string"}, "tool_plan": {"type": "array"}}},
+        input_schema={"type": "object", "required": ["name"], "properties": {"name": {"type": "string", "minLength": 1}, "description": {"type": "string"}, "trigger_text": {"type": "string"}, "tool_plan": {"type": "array"}}},
         output_schema={"type": "object", "properties": {"skill_id": {"type": "integer"}}},
+    ),
+    MCPToolSpec(
+        name="memory_mcp.extract",
+        description="Extract and save explicitly authorized high-confidence memories from this conversation.",
+        category="memory",
+        safety_level=L2_LOCAL_WRITE,
+        input_schema={"type": "object", "required": ["user_input"], "properties": {
+            "user_input": {"type": "string"}, "agent_output": {"type": "string"},
+            "page_context": {"type": "object"}, "thread_id": {"type": "string"}}},
+        output_schema={"type": "object", "properties": {"save_results": {"type": "array"}}},
     ),
     MCPToolSpec(
         name="email_mcp.create_draft",
@@ -258,7 +268,11 @@ class MCPRegistry:
                 "enabled": spec.enabled,
             }
             if existing:
-                tool_repo.update(existing, **values)
+                # Discovery must not re-enable an administrator-disabled tool.
+                # Avoid committing every unchanged tool on every invocation.
+                values.pop("enabled")
+                if any(getattr(existing, key) != value for key, value in values.items()):
+                    tool_repo.update(existing, **values)
             else:
                 tool_repo.create(**values)
 

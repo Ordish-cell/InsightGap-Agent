@@ -80,6 +80,8 @@ def client(monkeypatch, tmp_path):
     db.commit()
     db.refresh(user)
     db.refresh(other)
+    from src.web_app.core.config import settings
+    monkeypatch.setattr(settings, "qdrant_url", "http://vector.invalid:6333")
     FakeVectorStore.points = []
     monkeypatch.setattr(embeddings, "embed_texts", lambda texts: [[0.1] * 384 for _ in texts])
     monkeypatch.setattr(embeddings, "embed_text", lambda text: [0.1] * 384)
@@ -219,6 +221,7 @@ def test_structured_csv_ingest_uses_row_blocks(client):
     ingest = client.post(f"/api/v1/documents/{upload['id']}/ingest")
     assert ingest.status_code == 200
 
+
     db = next(app.dependency_overrides[get_db]())
     document = db.get(Document, upload["id"])
     chunks = db.query(DocumentChunk).filter(DocumentChunk.document_id == upload["id"]).order_by(DocumentChunk.chunk_index).all()
@@ -231,6 +234,23 @@ def test_structured_csv_ingest_uses_row_blocks(client):
     assert document.metadata_json["chunk_count"] == len(child_chunks)
     assert len([point for point in FakeVectorStore.points if point["chunk_role"] == "child"]) == len(child_chunks)
     assert any(point["chunk_role"] == "overview" for point in FakeVectorStore.points)
+
+
+def test_long_chat_document_indexes_without_summary_model(client, monkeypatch):
+    content = ("# Daily report\n\n" + "Source evidence for the document. " * 200).encode()
+    upload = client.post("/api/v1/documents/upload", files={"file": ("daily.md", content, "text/markdown")}).json()["data"]
+    db = next(app.dependency_overrides[get_db]())
+    document = db.get(Document, upload["id"])
+    document.metadata_json = {**document.metadata_json, "upload_type": "chat"}
+    db.commit()
+    monkeypatch.setattr("src.web_app.services.llm_registry_service.resolve_model_context", lambda *a, **k: pytest.fail("Optional summary blocked ingestion"))
+    response = client.post(f"/api/v1/documents/{document.id}/ingest").json()
+    assert response["success"]
+    status = client.get(f"/api/v1/documents/{document.id}/status").json()["data"]
+    assert status["status"] == "ready" and status["chunks_count"] > 0
+    assert status["summary_status"] == "skipped"
+    assert any(point["chunk_role"] == "child" for point in FakeVectorStore.points)
+
 
 
 def test_structured_xlsx_text_uses_sheet_row_blocks():
@@ -583,8 +603,31 @@ def test_hard_delete_conversation_cleans_document_vectors_not_memory_vectors(cli
     monkeypatch.setattr(agent_service_module, "QdrantVectorStore", FakeVectorStore)
     monkeypatch.setattr("src.web_app.memory.qdrant_memory_store.QdrantMemoryStore", MemoryStoreShouldNotBeUsed)
 
+    from types import SimpleNamespace
+    from sqlalchemy.orm import sessionmaker
+    from src.web_app.services import conversation_deletion
+    from src.web_app.core.config import settings
+    from src.web_app.models.orm import ConversationDeletionTask
+    deleted_scopes = []
+    class DeletionVectors:
+        def __init__(self, **kwargs): pass
+        def get_collections(self):
+            return SimpleNamespace(collections=[SimpleNamespace(name=settings.qdrant_collection)])
+        def delete(self, collection_name, points_selector, wait):
+            deleted_scopes.append(points_selector.model_dump())
+            FakeVectorStore().delete_document(client.user_id, doc.id)
+        def count(self, **kwargs): return SimpleNamespace(count=len(FakeVectorStore.points))
+        def close(self): pass
+    monkeypatch.setattr("qdrant_client.QdrantClient", DeletionVectors)
+    monkeypatch.setattr(conversation_deletion, "SessionLocal", sessionmaker(bind=db.get_bind()))
     result = hard_delete_conversation(db, client.user_id, conversation_id)
-    assert result["deleted_records"] >= 1
+    assert result["status"] == "pending"
+    conversation_deletion.perform(result["id"])
+    db.expire_all()
+    job = db.get(ConversationDeletionTask, result["id"])
+    assert job.status in {"completed", "completed_with_warnings"}, job.error_message
+    assert job.result["counts"]["document_ids"] == 1
+    assert deleted_scopes and "document_id" in str(deleted_scopes) and "memory_id" not in str(deleted_scopes)
     assert FakeVectorStore.points == []
     assert memory_delete_calls == []
 

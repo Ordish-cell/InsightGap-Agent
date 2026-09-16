@@ -30,7 +30,7 @@ def dependencies():
             "embedding_dimension": get_embedding_dimension(),
             "feed_sources": source_health(),
             "open_deep_research": OpenDeepResearchAdapter().health(),
-            "agent_runtime": {"status": "ok", "adapter": "langgraph", "fallback_enabled": True, "available": bool(AgentRuntime)},
+            "agent_runtime": {"status": "ok", "adapter": "langgraph", "fallback_enabled": False, "available": bool(AgentRuntime)},
             "mcp": mcp_service.health(),
             "neo4j": {
                 "enabled": settings.enable_neo4j,

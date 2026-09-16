@@ -639,7 +639,7 @@ export function AgentChatPanel({
             item.localId === localId ? { ...item, uploadProgress: progress } : item,
           ),
         )
-      })
+      }, selectedModelConfigId)
         .then(async (uploaded) => {
           if (uploaded.kind === 'document' && uploaded.status === 'processing') {
             setAttachments((prev) => prev.map((item) => item.localId === localId ? {
@@ -956,6 +956,10 @@ export function AgentChatPanel({
                    item.run_id === runId)
 
                 if (!isTargetAssistant) return item
+
+                if (parsed.event_type?.startsWith('agent_text_') || (parsed.event_type === 'answer_delta' && payload.text_id)) {
+                  return { ...projectChatEvent({ ...item, run_id: runId }, parsed), trace_events: appendTraceEvent(item.trace_events, parsed) }
+                }
 
                 if (parsed.event_type === 'answer_delta') {
                   const delta = typeof payload.text === 'string' ? payload.text : String(payload.text || '')
@@ -1289,6 +1293,14 @@ export function AgentChatPanel({
             setRunning(false)
             streamRef.current?.close()
             streamRef.current = null
+            return
+          }
+
+          if (parsed.event_type?.startsWith('agent_text_') || (parsed.event_type === 'answer_delta' && payload.text_id)) {
+            setMessages((items) => items.map((item) =>
+              item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
+                ? { ...projectChatEvent({ ...item, run_id: liveRunId || item.run_id }, parsed), trace_events: appendTraceEvent(item.trace_events, parsed) }
+                : item))
             return
           }
 

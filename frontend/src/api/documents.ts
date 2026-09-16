@@ -6,10 +6,12 @@ export type { ChatAttachment } from './types'
 export function uploadChatAttachment(
   file: File,
   onProgress?: (progress: number) => void,
+  modelConfigId?: number | null,
 ): Promise<ChatAttachment> {
   return new Promise((resolve, reject) => {
     const formData = new FormData()
     formData.append('file', file)
+    if (modelConfigId != null) formData.append('model_config_id', String(modelConfigId))
 
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `${apiBaseUrl()}/documents/chat-upload`, true)

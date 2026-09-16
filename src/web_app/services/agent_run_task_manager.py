@@ -76,11 +76,20 @@ class AgentRunTaskManager:
             return
         event_type = "run_interrupted" if status == "interrupted" else "run_failed"
         chunks = db.execute(select(AgentEvent).where(AgentEvent.run_id == run_id, AgentEvent.user_id == user_id,
-                                                     AgentEvent.event_type.in_({"answer_delta", "answer_completed"})).order_by(AgentEvent.id)).scalars()
+                                                     AgentEvent.event_type.in_({"answer_delta", "answer_completed", "agent_text_started", "agent_text_delta", "agent_text_completed"})).order_by(AgentEvent.id)).scalars()
         partial = ""
+        native_text_ids = set()
         for event in chunks:
             payload = event.payload_json or {}
-            partial = str(payload.get("answer", partial)) if event.event_type == "answer_completed" else partial + str(payload.get("text", ""))
+            if event.event_type == "agent_text_started":
+                native_text_ids.add(payload.get("text_id"))
+                partial = ""
+            elif event.event_type == "agent_text_completed":
+                partial = "" if payload.get("role") == "progress" else str(payload.get("text", partial))
+            elif event.event_type == "answer_completed":
+                partial = str(payload.get("answer", partial))
+            elif event.event_type != "answer_delta" or payload.get("text_id") not in native_text_ids:
+                partial += str(payload.get("text", ""))
         run.chat_control_phase = "interrupted"
         run_repo.update(run, status=status, error_message=error, completed_at=datetime.now(), final_answer=partial, result_summary=partial)
         messages = AgentChatMessageRepository(db).list_by_conversation(user_id, run.conversation_id)

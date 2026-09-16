@@ -4,10 +4,10 @@ import logging
 from typing import Any, TYPE_CHECKING
 import re
 
-from src.web_app.agent.runtime.tool_routing import detect_local_tool, is_explicit_or_realtime_web_query
+from src.web_app.mcp.tool_routing import detect_local_tool, is_explicit_or_realtime_web_query
 
 if TYPE_CHECKING:
-    from src.web_app.agent.runtime.intent_schema import LLMToolSelectionResult
+    from src.web_app.mcp.intent_schema import LLMToolSelectionResult
 
 logger = logging.getLogger(__name__)
 
@@ -423,7 +423,7 @@ def validate_tool_input(
 
     # Copy optional fields too
     for field_name, field_schema in properties.items():
-        if field_name not in required and field_name in arguments and arguments[field_name]:
+        if field_name not in required and field_name in arguments and arguments[field_name] is not None:
             cleaned[field_name] = arguments[field_name]
 
     # ── email.send: basic format check on `to` ──

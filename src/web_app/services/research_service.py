@@ -44,6 +44,43 @@ def _safe_error_message(exc: BaseException) -> str:
 class ResearchService:
     """High-level service for creating and managing research runs."""
 
+    async def research_for_supervisor(self, db, state, arguments, runtime_config=None):
+        """Run the existing ODR graph once for a persisted, authorized action.
+
+        Research results are stored under the parent run; optional user-facing
+        artifacts and knowledge mutations are owned by explicit capabilities.
+        An unfinished receipt is not automatically replayed after a crash.
+        """
+        if not state.get("research_authorized"):
+            raise ValueError("research_confirmation_required")
+        repo = ResearchRunRepository(db)
+        action_id = state["current_action"]["action_id"]
+        existing = repo.get_by_user(state["user_id"], action_id)
+        if existing:
+            data = self._to_read(existing)
+            if existing.status == "running":
+                data.update(status="failed", error="research_outcome_unknown; inspect the existing research run before retrying")
+            return data
+        feed = (state.get("context") or {}).get("feed_card") or {}
+        evidence = [e for observation in state.get("observations", []) for e in observation.get("evidence", [])]
+        row = repo.create(id=action_id, user_id=state["user_id"], agent_run_id=state["run_id"],
+            feed_card_id=feed.get("id"), query=arguments["query"], status="running", findings=[], evidence=evidence,
+            risks=[], opportunities=[], suggested_actions=[], markdown_report="", summary="", error="",
+            metadata_json={"engine": "open_deep_research", "parent_run_id": state["run_id"], "action_id": action_id,
+                           "model_context": state.get("model_context", {}), "used_fallback": False})
+        try:
+            result = await OpenDeepResearchAdapter().run_research(query=arguments["query"], user_id=state["user_id"],
+                run_id=action_id, context=state.get("context", {}), evidence=evidence,
+                depth=arguments.get("depth", "standard"), runtime_config=runtime_config)
+            repo.update(row, status="completed", summary=result.summary, findings=result.findings,
+                evidence=result.evidence, risks=result.risks, opportunities=result.opportunities,
+                suggested_actions=result.suggested_actions, markdown_report=result.markdown_report,
+                metadata_json={**row.metadata_json, **result.metadata}, completed_at=datetime.now(UTC).replace(tzinfo=None))
+        except Exception as exc:
+            logger.exception("Supervisor research failed action_id=%s", action_id)
+            repo.update(row, status="failed", error=type(exc).__name__ + ": research failed")
+        return self._to_read(repo.get_by_user(state["user_id"], action_id))
+
     # ── public API used by HTTP endpoints ───────────────────────────────
 
     def create_research_run(

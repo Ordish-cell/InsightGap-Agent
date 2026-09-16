@@ -5,8 +5,6 @@ from datetime import UTC, datetime
 
 import pytest
 
-from src.web_app.agent.runtime.nodes import _has_explicit_email_send_intent, _is_memory_like_input
-from src.web_app.agent.runtime.planner import _has_english_term, plan_route
 from src.web_app.db.repositories.memory_repository import MemoryRepository
 from src.web_app.models.orm import Memory, User
 from src.web_app.services.memory_service import MemoryService
@@ -441,89 +439,26 @@ def test_forget_by_capacity_archives_lowest():
 # Memory-like input guard tests
 # ═══════════════════════════════════════════════════════════════════════════
 
-@pytest.mark.parametrize("text,expected", [
-    ("以后都用中文回答", True),
-    ("记住我偏好简洁的界面", True),
-    ("帮我记一下这个项目的技术栈", True),
-    ("我偏好 React 和 TypeScript", True),
-    ("我的项目使用 FastAPI", True),
-    ("不要再给我看英文的 FeedCard", True),
-    ("今天天气怎么样", False),
-    ("你好", False),
-    ("帮我研究一下 AI 趋势", False),
-    ("发邮件给 test@example.com", False),
-])
-def test_memory_like_input(text, expected):
-    assert _is_memory_like_input(text) == expected
 
 
-@pytest.mark.parametrize("text,expected", [
-    ("发邮件给 test@example.com", True),
-    ("发送邮件到 admin@test.org", True),
-    ("帮我把报告发给 team@company.com", True),
-    ("发一封邮件", False),  # no recipient
-    ("send email", False),  # no recipient
-    ("以后发邮件都用中文签名", False),  # memory-like, not explicit action
-    ("记住我的邮箱是 test@example.com", False),  # memory-like
-    ("帮我研究一下邮件系统", False),
-])
-def test_has_explicit_email_send_intent(text, expected):
-    assert _has_explicit_email_send_intent(text) == expected
 
 
-@pytest.mark.parametrize("text,term,expected", [
-    ("send an email", "send", True),
-    ("I will send it", "send", True),
-    ("post a comment", "post", True),
-    ("use PostgreSQL database", "post", False),  # word boundary
-    ("delete a file", "delete", True),
-    ("delete_account function", "delete", False),  # word boundary
-    ("email me later", "email", True),
-    ("myemail@test.com", "email", False),  # word boundary
-])
-def test_has_english_term(text, term, expected):
-    assert _has_english_term(text, term) == expected
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Intent classifier tests
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_intent_tech_stack_to_memory():
-    """Tech stack declarations should route to memory."""
-    plan = plan_route("我的项目技术栈是 React + FastAPI")
-    assert plan["intent"] in ("memory", "chat")
 
 
-def test_intent_with_question_to_advice():
-    """A 'with' question about how to do something should be chat/advice, not tool."""
-    plan = plan_route("使用 React 时如何优化性能？")
-    assert plan["intent"] in ("chat", "memory", "skill")
 
 
-def test_intent_general_knowledge_candidates():
-    """General knowledge questions should be research candidates."""
-    plan = plan_route("AI 在医疗领域的最新趋势是什么")
-    assert plan["intent"] in ("research", "chat")
 
 
-def test_intent_document_specific_candidates():
-    """Document-specific queries should route to RAG."""
-    plan = plan_route("根据我上传的文档，总结一下要点", has_document_attachments=True)
-    assert plan["intent"] in ("rag", "document_qa", "chat")
 
 
-def test_intent_email_candidates():
-    """Email send intent should route to tool."""
-    plan = plan_route("发邮件给 test@example.com 通知进度")
-    assert plan["intent"] in ("tool", "tool.email", "chat")
 
 
-def test_intent_no_tool_action():
-    """Empty or trivial input should not trigger tool action."""
-    plan = plan_route("你好")
-    assert plan["intent"] != "tool"
-    assert not plan["needs_approval"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

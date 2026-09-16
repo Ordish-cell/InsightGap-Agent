@@ -1,5 +1,4 @@
 from src.web_app.context.builder import ContextBuilder
-from src.web_app.agent.runtime.planner import plan_route
 from src.web_app.services.graph_context_service import GraphContextService
 
 
@@ -69,20 +68,6 @@ def test_context_builder_includes_graph_context_section():
     assert "DocumentService" in context
 
 
-def test_project_diagnostic_query_routes_to_chat_even_if_llm_says_research():
-    query = "\u4e0a\u4f20\u6587\u6863\u5931\u8d25\u5e94\u8be5\u770b\u54ea\u4e9b\u6a21\u5757\uff1f"
-    plan = plan_route(
-        query,
-        home_intent={
-            "intent": "research",
-            "risk_level": "L1",
-            "suggested_route_hints": ["research_agent"],
-        },
-    )
-
-    assert plan["intent"] == "chat"
-    assert "research_agent" not in plan["route"]
-    assert plan["answer_mode"] == "project_advice"
 
 
 def test_graph_context_project_diagnostic_skips_memory_and_returns_modules(monkeypatch):

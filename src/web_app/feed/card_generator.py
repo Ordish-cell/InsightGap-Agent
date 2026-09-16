@@ -1,4 +1,5 @@
 import re
+from hashlib import sha256
 from typing import Any
 
 _DOMAIN_CN = {
@@ -109,7 +110,7 @@ _GAP_TEMPLATES = {
     "far_domain": [
         "多数人把「{title}」当一条普通行业信息消费，但它展示的信号筛选和机会发现模式可以直接启发 Feed 远域模块的设计。",
         "表面上「{title}」和你做的 Agent 系统没有直接关系，但它的反馈回路和信号捕捉机制值得远域启发模块借鉴。",
-        "这条信息本身不属于 Agent/RAG 圈，但展示了弱信号如何被产品化捕捉和放大。",
+        "「{title}」本身不属于 Agent/RAG 圈，但展示了弱信号如何被产品化捕捉和放大。",
         "远域启发点不在技术栈，而在信号筛选、反馈回路和机会发现流程——这正是「{title}」的价值所在。",
     ],
 }
@@ -346,7 +347,9 @@ def _extract_entity_name(original_title: str) -> str:
         return shorten_title_words(clean, max_words=10, max_chars=40)
     if ":" in clean:
         parts = clean.split(":", 1)
-        main = parts[1].strip().rstrip(".") if len(parts) > 1 else parts[0].strip()
+        # Named papers commonly use "ShortName: descriptive subtitle".
+        prefix = parts[0].strip()
+        main = prefix if len(prefix) <= 24 else parts[1].strip().rstrip(".")
         return shorten_title_words(main, max_words=8, max_chars=60)
     if "/" in clean:
         return shorten_title_words(clean, max_words=6, max_chars=60)
@@ -392,10 +395,12 @@ def _arxiv_title(title: str, domain: str, tags: list[str]) -> str:
         f"「{entity}」：{topic}方向的技术新思路",
         f"从「{entity}」看{topic}的演进趋势",
     ]
-    idx = hash(title) % len(templates)
+    idx = _stable_hash(title) % len(templates)
     result = templates[idx]
     if len(result) > 64:
         result = result[:61] + "…"
+    if is_mostly_english(result):
+        result = f"关于{topic}的新研究动态"
     return result
 
 
@@ -410,7 +415,7 @@ def _github_title(title: str, domain: str, tags: list[str]) -> str:
         f"GitHub 新项目「{entity}」与{topic}",
         f"适合{domain_cn}场景的「{entity}」",
     ]
-    idx = hash(title) % len(templates)
+    idx = _stable_hash(title) % len(templates)
     result = templates[idx]
     if len(result) > 64:
         result = result[:61] + "…"
@@ -430,7 +435,7 @@ def _far_domain_title(title: str, domain: str, tags: list[str], source_kind: str
         f"「{entity}」——信号筛选与行动判断",
         f"来自{topic}领域的远域信号：「{entity}」",
     ]
-    idx = hash(title) % len(templates)
+    idx = _stable_hash(title) % len(templates)
     result = templates[idx]
     if len(result) > 64:
         result = result[:61] + "…"
@@ -449,17 +454,24 @@ def _generic_cn_title(title: str, domain: str, tags: list[str], source_type: str
         f"「{entity}」：{topic}领域的最新动态",
         f"一条关于{topic}的高价值信息：「{entity}」",
     ]
-    idx = hash(title) % len(templates)
+    idx = _stable_hash(title) % len(templates)
     result = templates[idx]
     if len(result) > 64:
         result = result[:61] + "…"
+    if is_mostly_english(result):
+        result = f"关于{topic}的新研究动态"
     return result
+
+
+def _stable_hash(text: str) -> int:
+    """Keep template choices stable across process restarts."""
+    return int.from_bytes(sha256(text.encode("utf-8")).digest()[:4], "big")
 
 
 def _generate_one_sentence_value(title: str, domain: str, tags: list[str], source_type: str, relation_type: str = "") -> str:
     template_key = "far_domain" if relation_type == "far_domain" else domain
     prefixes = _VALUE_PREFIXES.get(template_key, _VALUE_PREFIXES["ai"])
-    idx = hash(title + "value") % len(prefixes)
+    idx = _stable_hash(title + "value") % len(prefixes)
     keywords = _extract_keywords(title, tags)
     entity = _extract_entity_name(title)
     suffix_templates = [
@@ -467,16 +479,16 @@ def _generate_one_sentence_value(title: str, domain: str, tags: list[str], sourc
         f"「{entity}」提供了一种可复用的思路，能直接改进你的{_DOMAIN_CN.get(domain, 'AI')}模块。",
         f"「{entity}」标记了一个容易被忽略但实际很重要的技术信号。",
         f"「{entity}」把{keywords}和你当前的产品方向连接了起来。",
-        f"这条信息的核心变化在于：它可能影响你现有{_DOMAIN_CN.get(domain, 'AI')}系统的设计决策。",
+        f"「{entity}」的核心变化在于：它可能影响你现有{_DOMAIN_CN.get(domain, 'AI')}系统的设计决策。",
     ]
-    suffix_idx = hash(title + "suffix") % len(suffix_templates)
+    suffix_idx = _stable_hash(title + "suffix") % len(suffix_templates)
     return prefixes[idx] + suffix_templates[suffix_idx]
 
 
 def _generate_why_relevant(title: str, domain: str, tags: list[str], interests: list[str], source_type: str, relation_type: str = "") -> str:
     template_key = "far_domain" if relation_type == "far_domain" else domain
     prefixes = _WHY_RELEVANT_PREFIXES.get(template_key, _WHY_RELEVANT_PREFIXES["ai"])
-    idx = hash(title + "why") % len(prefixes)
+    idx = _stable_hash(title + "why") % len(prefixes)
     matched = [t for t in tags if t.lower() in " ".join(interests).lower()]
     entity = _extract_entity_name(title)
     if relation_type == "far_domain":
@@ -491,7 +503,7 @@ def _generate_why_relevant(title: str, domain: str, tags: list[str], interests: 
 def _generate_benefit(domain: str, tags: list[str], title: str, relation_type: str = "") -> str:
     template_key = "far_domain" if relation_type == "far_domain" else domain
     templates = _BENEFIT_TEMPLATES.get(template_key, _BENEFIT_TEMPLATES["ai"])
-    idx = hash(title + str(tags)) % len(templates)
+    idx = _stable_hash(title + str(tags)) % len(templates)
     entity = _extract_entity_name(title)
     domain_cn = _DOMAIN_CN.get(domain, "AI")
     return templates[idx].format(title=entity, domain_cn=domain_cn)
@@ -500,13 +512,13 @@ def _generate_benefit(domain: str, tags: list[str], title: str, relation_type: s
 def _generate_information_gap(domain: str, tags: list[str], source_type: str, title: str, relation_type: str = "") -> str:
     template_key = "far_domain" if relation_type == "far_domain" else domain
     templates = _GAP_TEMPLATES.get(template_key, _GAP_TEMPLATES["ai"])
-    idx = hash(title + str(tags) + "gap") % len(templates)
+    idx = _stable_hash(title + str(tags) + "gap") % len(templates)
     entity = _extract_entity_name(title)
     return templates[idx].format(title=entity)
 
 
 def _generate_next_action(domain: str, source_type: str, title: str) -> str:
-    idx = hash(title + domain + source_type) % len(_NEXT_ACTIONS)
+    idx = _stable_hash(title + domain + source_type) % len(_NEXT_ACTIONS)
     entity = _extract_entity_name(title)
     return _NEXT_ACTIONS[idx].format(title=entity)
 

@@ -5,24 +5,13 @@ import pytest
 from sqlalchemy import select
 
 from src.web_app.agent.runtime.chat_control import ChatExecution, controlled_node, execution
-from src.web_app.agent.runtime.chat_fast_path import RouteHeader, RouteProtocolError, chat_entry
-from src.web_app.agent.runtime.nodes import RuntimeNodes
+from src.web_app.agent.runtime.nodes import SupervisorNodes
 from src.web_app.models.orm import AgentEvent
 from src.web_app.tests.test_chat_control import env
 
 
-@pytest.mark.parametrize("chunks,route,body", [(["ch", "at\n你", "好"], "chat", "你好"),
-    (["workflow\n"], "workflow", ""), (["chat\r\nanswer"], "chat", "answer")])
-def test_header_split(chunks, route, body):
-    parser = RouteHeader()
-    assert "".join(parser.feed(chunk) for chunk in chunks) == body
-    assert parser.route == route
 
 
-@pytest.mark.parametrize("value", ["x" * 513, "other\n", "```chat\n"])
-def test_invalid_header(value):
-    with pytest.raises(RouteProtocolError):
-        RouteHeader().feed(value)
 
 
 def fake_model(monkeypatch, chunks, *, wait=False, error=False):
@@ -40,8 +29,17 @@ def fake_model(monkeypatch, chunks, *, wait=False, error=False):
                 await asyncio.Event().wait()
         finally:
             closed.append(True)
-    monkeypatch.setattr("src.web_app.agent.runtime.chat_fast_path.get_chat_model", lambda *a, **k: SimpleNamespace(astream=stream))
-    monkeypatch.setattr("src.web_app.agent.runtime.chat_fast_path.settings.chat_fast_path_enabled", True)
+    from langchain_core.messages import AIMessageChunk
+    from src.web_app.agent.llm.content import message_text
+    class NativeModel:
+        def bind_tools(self, tools):
+            return self
+        async def astream(self, prompt):
+            async for chunk in stream(prompt):
+                text = message_text(chunk)
+                if text:
+                    yield AIMessageChunk(content=text)
+    monkeypatch.setattr("src.web_app.agent.runtime.nodes.get_chat_model", lambda *a, **k: NativeModel())
     return calls, closed, ready
 
 
@@ -51,16 +49,17 @@ def initial(env):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_version", [2])
 @pytest.mark.parametrize("question", ["唉，我好累", "你好", "解释一下哈希表"])
-async def test_compiled_graph_chat_is_one_call(env, monkeypatch, question):
+async def test_compiled_graph_chat_is_one_call(env, monkeypatch, question, runtime_version):
     from src.web_app.agent.runtime.graph import AgentRuntime
-    calls, closed, _ = fake_model(monkeypatch, [[{"type": "reasoning", "text": "private"}], "ch", "at\n先休息", "一下。"])
+    calls, closed, _ = fake_model(monkeypatch, [[{"type": "reasoning", "text": "private"}], "先休息", "一下。"])
     monkeypatch.setattr("src.web_app.agent.runtime.graph.settings.agent_langgraph_checkpointer_enabled", False)
     with env.factory() as db:
-        runtime = AgentRuntime(db, {})
+        runtime = AgentRuntime(db, {"runtime_version": runtime_version})
         async def forbidden(state):
             pytest.fail("Chat entered heavy workflow")
-        for name in ("home_intent_react", "planner", "parallel_prefetch", "parallel_read_stage", "final_response"):
+        for name in ("capability", "tool_runtime", "document_read", "deep_research"):
             monkeypatch.setattr(runtime.nodes, name, forbidden)
         state = {**initial(env), "user_input": question}
         result = await runtime.run(state)
@@ -72,34 +71,19 @@ async def test_compiled_graph_chat_is_one_call(env, monkeypatch, question):
         assert "".join(e.payload_json["text"] for e in events if e.event_type == "answer_delta") == "先休息一下。"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("chunks,reason", [(["workflow\nignored"], None), (["workflow"], None), (["oops\nsecret"], "invalid_header"),
-    (["chat"], "incomplete_stream"), (["chat\n"], "incomplete_stream"), (["x" * 513], "header_too_long")])
-async def test_workflow_and_protocol_fallback_emit_no_answer(env, monkeypatch, chunks, reason):
-    calls, closed, _ = fake_model(monkeypatch, chunks)
-    with env.factory() as db:
-        result = await chat_entry(RuntimeNodes(db, {}), initial(env))
-        assert result["chat_entry_route"] == "workflow"
-        events = db.execute(select(AgentEvent)).scalars().all()
-        assert not any(e.event_type.startswith("answer_") for e in events)
-        fallback = [e for e in events if e.event_type == "chat_route_fallback"]
-        assert len(fallback) == int(reason is not None)
-        if reason:
-            assert fallback[0].payload_json == {"reason": reason, "count": 1}
-        assert len(calls) == 1 and closed == [True]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("chunks", [[], ["chat\n部分回复"]])
+@pytest.mark.parametrize("chunks", [[], ["部分回复"]])
 async def test_cancel_closes_actual_entry_stream(env, monkeypatch, chunks):
     calls, closed, ready = fake_model(monkeypatch, chunks, wait=True)
     token = execution.set(ChatExecution(env.run))
     try:
         with env.factory() as db:
-            nodes = RuntimeNodes(db, {})
+            nodes = SupervisorNodes(db, {})
             async def entry(state):
-                return await chat_entry(nodes, state)
-            task = asyncio.create_task(controlled_node("chat_entry", entry, db)(initial(env)))
+                return await run_native(nodes, state)
+            task = asyncio.create_task(controlled_node("supervisor", entry, db)(initial(env)))
             await ready.wait()
             execution.get().cancelled = True
             task.cancel()
@@ -107,7 +91,7 @@ async def test_cancel_closes_actual_entry_stream(env, monkeypatch, chunks):
                 await task
             events = db.execute(select(AgentEvent)).scalars().all()
             assert any(e.event_type == "node_cancelled" for e in events)
-            assert not any(e.event_type == "node_completed" for e in events)
+            assert not any(e.event_type == "node_completed" and e.node_name == "supervisor" for e in events)
             assert closed == [True]
     finally:
         execution.reset(token)
@@ -117,31 +101,23 @@ async def test_cancel_closes_actual_entry_stream(env, monkeypatch, chunks):
 async def test_provider_failure_is_not_protocol_retry(env, monkeypatch):
     calls, closed, _ = fake_model(monkeypatch, [], error=True)
     with env.factory() as db:
-        with pytest.raises(RuntimeError, match="provider unavailable"):
-            await chat_entry(RuntimeNodes(db, {}), initial(env))
+        result = await run_native(SupervisorNodes(db, {}), initial(env))
+        assert result["status"] == "failed" and result["error"] == "supervisor_unavailable"
         assert len(calls) == 1 and closed == [True]
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("payload", [{"attachment_ids": [1]}, {"route": "research"}, {"explicit_agent": "tool_agent"}, {"page_context": {"selected_feed_card_id": 1}}])
-async def test_explicit_work_does_not_use_chat_model(env, monkeypatch, payload):
-    calls, _, _ = fake_model(monkeypatch, ["chat\nwrong"])
-    with env.factory() as db:
-        result = await chat_entry(RuntimeNodes(db, payload), initial(env))
-        assert result["chat_entry_route"] == "workflow"
-        assert not calls
 
 
 @pytest.mark.asyncio
 async def test_latest_message_and_unfinished_context_reach_selected_model(env, monkeypatch):
-    calls, _, _ = fake_model(monkeypatch, ["chat\n好的，只讲聊天。"])
+    calls, _, _ = fake_model(monkeypatch, ["好的，只讲聊天。"])
     with env.factory() as db:
-        nodes = RuntimeNodes(db, {"chat_continuation": "Assistant (unfinished): 原先在讲系统架构。"})
+        nodes = SupervisorNodes(db, {"chat_continuation": "Assistant (unfinished): 原先在讲系统架构。"})
         state = {**initial(env), "user_input": "只讲聊天模块，简单一点"}
-        await chat_entry(nodes, state)
+        await run_native(nodes, state)
     assert calls[0][0].type == "system"
     assert "Assistant (unfinished)" in calls[0][1].content
-    assert calls[0][1].content.endswith("只讲聊天模块，简单一点")
+    assert 0 <= calls[0][1].content.find("只讲聊天模块，简单一点")
 
 
 @pytest.mark.asyncio
@@ -176,9 +152,9 @@ async def test_cold_client_initialization_does_not_block_cancel(env, monkeypatch
         entered.set()
         release.wait(3)
         return SimpleNamespace()
-    monkeypatch.setattr("src.web_app.agent.runtime.chat_fast_path.get_chat_model", slow_factory)
+    monkeypatch.setattr("src.web_app.agent.runtime.nodes.get_chat_model", slow_factory)
     with env.factory() as db:
-        task = asyncio.create_task(chat_entry(RuntimeNodes(db, {}), initial(env)))
+        task = asyncio.create_task(run_native(SupervisorNodes(db, {}), initial(env)))
         try:
             while not entered.is_set():
                 await asyncio.sleep(.001)
@@ -187,3 +163,8 @@ async def test_cold_client_initialization_does_not_block_cancel(env, monkeypatch
                 await asyncio.wait_for(task, .3)
         finally:
             release.set()
+
+
+async def run_native(nodes, state):
+    from src.web_app.agent.runtime.graph_builder import build_graph
+    return await build_graph(nodes).ainvoke(state)

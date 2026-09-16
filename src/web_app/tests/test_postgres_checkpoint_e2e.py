@@ -1,7 +1,7 @@
-"""E2E: PostgresSaver checkpoint — process restart recovery.
+"""E2E: PostgresSaver checkpoint — graph reconstruction.
 
-Verifies approve/reject restarts using PostgresSaver as the
-LangGraph checkpointer backend.  This is the production path.
+Verifies approve/reject after rebuilding graph and saver objects in one process.
+Real process and owned service restarts use test_supervisor_process_restart.
 
 Run: uv run pytest src/web_app/tests/test_postgres_checkpoint_e2e.py -v -s
 """
@@ -69,7 +69,7 @@ class TestPostgresCheckpointerSetup:
 
 
 class TestPostgresCrossInstanceRestart:
-    """Full cycle: pause → kill process → restart → approve/reject."""
+    """Pause, rebuild graph/saver objects, then approve or reject."""
 
     def _build_graph(self, saver):
         from langgraph.graph import StateGraph, END
@@ -103,10 +103,10 @@ class TestPostgresCrossInstanceRestart:
         return g.compile(checkpointer=saver)
 
     def test_approve_restart_recovery(self):
-        """Pause in Process 1, approve in Process 2."""
+        """Pause in graph A, approve in graph B in the same process."""
         from langgraph.types import Command
 
-        # Process 1: build graph, run, pause at interrupt
+        # First graph: run and pause at interrupt
         saver1 = _pg_saver()
         app1 = self._build_graph(saver1)
         tid = "pg-e2e-approve-100"
@@ -117,7 +117,7 @@ class TestPostgresCrossInstanceRestart:
         assert "__interrupt__" in r1, f"Expected interrupt, got keys={list(r1.keys())}"
         assert r1["__interrupt__"][0].value["type"] == "approval_required"
 
-        # Process 2 (restart): new saver, same thread_id
+        # Rebuilt graph: new saver object, same thread_id
         saver2 = _pg_saver()
         app2 = self._build_graph(saver2)
 
@@ -131,7 +131,7 @@ class TestPostgresCrossInstanceRestart:
         assert r2["thread_id"] == tid
 
     def test_reject_restart_recovery(self):
-        """Pause in Process 1, reject in Process 2."""
+        """Pause in graph A, reject in graph B in the same process."""
         from langgraph.types import Command
 
         saver1 = _pg_saver()
@@ -154,7 +154,7 @@ class TestPostgresCrossInstanceRestart:
         assert r2["tool_result"] == "rejected_by_user"
 
     def test_thread_id_stable_across_restart(self):
-        """Same thread_id used in both processes."""
+        """Same thread_id used in both graph instances."""
         saver1 = _pg_saver()
         app1 = self._build_graph(saver1)
         tid = "pg-e2e-tid-102"

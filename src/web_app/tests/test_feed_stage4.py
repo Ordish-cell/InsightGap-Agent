@@ -68,16 +68,18 @@ def test_tavily_serpapi_disabled_without_key(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_search_source_manager_fetch_all_partial_failure():
+async def test_search_source_manager_fetch_all_partial_failure(monkeypatch):
     class BadSource:
         name = "bad"
         enabled = True
         async def fetch(self): raise RuntimeError("boom")
         def health(self): return {"enabled": True}
     manager = SearchSourceManager([BadSource(), ManualSeedSource()])
-    rows, source_stats = await manager.fetch_all()
+    monkeypatch.setattr(manager, "_build_real_sources", lambda bucket: manager.sources)
+    rows, source_stats, source_summary = await manager.fetch_all()
     assert rows
-    assert source_stats["bad"]["status"] == "degraded"
+    assert len(source_summary) == 3
+    assert all(source_stats[f"{bucket}/bad"]["status"] == "degraded" for bucket in source_summary)
 
 
 def test_search_sources_do_not_require_exa():

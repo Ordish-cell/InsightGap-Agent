@@ -63,7 +63,7 @@ async def steer_chat(run_id: int, payload: ChatSteerRequest, user_id: int = Depe
 @router.post("/runs")
 async def create_run(payload: AgentRunRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     try:
-        return ok(await run_agent_async(db, user_id, payload.model_dump()))
+        return ok(await run_agent_async(db, user_id, payload.runtime_payload()))
     except ModelSetupError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ChatControlError as exc:
@@ -72,7 +72,7 @@ async def create_run(payload: AgentRunRequest, user_id: int = Depends(get_curren
 
 @router.post("/runs/start", status_code=202)
 async def start_run(payload: AgentRunRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    request_payload = payload.model_dump()
+    request_payload = payload.runtime_payload()
     request_payload["_chat_managed"] = True
     try:
         prepared = prepare_agent_run(db, user_id, request_payload)

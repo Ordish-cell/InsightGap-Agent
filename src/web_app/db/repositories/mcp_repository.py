@@ -1,4 +1,4 @@
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from src.web_app.db.repositories.base_repository import BaseRepository
 from src.web_app.models.orm import MCPServer, MCPTool, ToolCall
@@ -23,6 +23,13 @@ class MCPToolRepository(BaseRepository[MCPTool]):
 
 class ToolCallRepository(BaseRepository[ToolCall]):
     model = ToolCall
+
+    def claim_execution(self, tool_call_id: int, user_id: int, expected_statuses: tuple[str, ...]) -> bool:
+        """Atomically claim a provider invocation; running calls are never replayed."""
+        result = self.db.execute(update(ToolCall).where(ToolCall.id == tool_call_id,
+            ToolCall.user_id == user_id, ToolCall.status.in_(expected_statuses)).values(status="running"))
+        self.db.commit()
+        return result.rowcount == 1
 
     def list_by_user(self, user_id: int, limit: int = 50, offset: int = 0) -> list[ToolCall]:
         stmt = select(ToolCall).where(ToolCall.user_id == user_id).order_by(ToolCall.created_at.desc()).limit(limit).offset(offset)

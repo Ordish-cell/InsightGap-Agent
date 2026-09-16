@@ -6,6 +6,7 @@ Includes startup health check for production hardening (Phase 13).
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Any
 
 _log = logging.getLogger(__name__)
@@ -103,6 +104,9 @@ def check_checkpointer_health(
                 "[CHECKPOINTER_HEALTH] PostgresSaver created successfully "
                 "type=%s", result["saver_type"],
             )
+            ctx = getattr(saver, "_checkpointer_ctx", None)
+            if ctx is not None:
+                ctx.__exit__(None, None, None)
         except Exception as exc:
             msg = (
                 f"[CHECKPOINTER_HEALTH] FATAL: PostgresSaver creation failed: {exc}"
@@ -202,8 +206,9 @@ class _PostgresSaverHandle:
         saver: Any = ctx.__enter__()
         try:
             saver.setup()
-        except Exception:
-            pass
+        except BaseException:
+            ctx.__exit__(*sys.exc_info())
+            raise
         saver._checkpointer_ctx = ctx  # type: ignore[attr-defined]
         return saver
 
@@ -223,8 +228,9 @@ class _AsyncPostgresSaverHandle:
         saver: Any = await ctx.__aenter__()
         try:
             await saver.setup()
-        except Exception:
-            pass
+        except BaseException:
+            await ctx.__aexit__(*sys.exc_info())
+            raise
         saver._checkpointer_ctx = ctx  # type: ignore[attr-defined]
         return saver
 
@@ -312,13 +318,7 @@ def build_checkpointer(
                 checkpoint_prefix=redis_key_prefix,
                 checkpoint_write_prefix=redis_key_prefix + "write",
             )
-            try:
-                saver.setup()
-            except Exception as setup_exc:
-                _log.warning(
-                    "[CHECKPOINTER] RedisSaver.setup() failed — "
-                    "indexes may need manual creation. error=%s", setup_exc
-                )
+            saver.setup()
             _log.info(
                 "[CHECKPOINTER] backend=redis saver_type=RedisSaver "
                 "durable=True url=%s", redis_url

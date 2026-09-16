@@ -5,7 +5,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class LLMSettings(BaseSettings):
     enabled: bool = Field(True, validation_alias="LLM_ENABLED")
-    intent_llm_enabled: bool = Field(True, validation_alias="AGENT_INTENT_LLM_ENABLED")
 
     model_config = SettingsConfigDict(
         env_file=".env",

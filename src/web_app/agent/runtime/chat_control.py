@@ -68,6 +68,9 @@ def disable_control(db, run_id):
 def controlled_node(name, node, db):
     @wraps(node)
     async def wrapped(state, *args, **kwargs):
+        if db is not None and state.get("conversation_id"):
+            from src.web_app.services.deletion_guard import check_conversation
+            check_conversation(db, state.get("user_id"), state["conversation_id"])
         token = execution.get()
         if token:
             with transition_lock:
@@ -75,8 +78,7 @@ def controlled_node(name, node, db):
                 from src.web_app.services.deletion_guard import check_conversation
                 if db is not None and state.get("conversation_id"):
                     check_conversation(db, state.get("user_id"), state["conversation_id"])
-                intent = (state.get("route_plan") or {}).get("intent")
-                if name in {"research_agent", "rag_agent", "tool_agent", "artifact_agent", "memory_agent", "skill_agent"} or (intent and intent != "chat"):
+                if name in {"capability", "deep_research", "tool_runtime"}:
                     disable_control(db, state["run_id"])
         from src.web_app.agent.runtime.live_progress import run_node
         result = await run_node(name, node, db, state, args, kwargs)

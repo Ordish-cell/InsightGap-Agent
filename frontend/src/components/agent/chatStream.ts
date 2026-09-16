@@ -7,7 +7,17 @@ export function projectChatEvent(message: AgentChatMessage, event: AgentEvent): 
   if (payload.message_id && payload.message_id !== message.message_id) return message
   if (['interrupted', 'failed'].includes(String(message.status))) return message
   switch (event.event_type) {
+    case 'agent_text_started':
+      return { ...message, content: '', metadata: { ...message.metadata, native_text_id: payload.text_id }, status: 'streaming' }
+    case 'agent_text_delta':
+      if (message.metadata?.native_text_id !== payload.text_id) return message
+      return { ...message, content: (message.content || '') + String(payload.text || ''), status: 'streaming' }
+    case 'agent_text_completed':
+      if (message.metadata?.native_text_id !== payload.text_id) return message
+      return { ...message, content: payload.role === 'progress' ? '' : String(payload.text || ''),
+        metadata: { ...message.metadata, native_text_role: payload.role } }
     case 'answer_delta':
+      if (payload.text_id && payload.text_id === message.metadata?.native_text_id) return message
       if (['interrupted', 'failed', 'completed'].includes(String(message.status))) return message
       return { ...message, status: 'streaming', content: (message.content || '') + String(payload.text || '') }
     case 'answer_completed':

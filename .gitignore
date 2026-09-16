@@ -111,3 +111,18 @@ tests/expt_results/
 /uploads/artifacts/rag_review*/
 
 .langgraph_api
+
+# Runtime data and local validation output are not source assets.
+/storage/uploads/
+/uploads/artifacts/
+/docs/validation/
+/docs/*_audit.json
+/.impeccable/
+*.sqlite
+*.sqlite3
+*.db
+*.pem
+*.key
+*.p12
+.env.*
+!.env.example

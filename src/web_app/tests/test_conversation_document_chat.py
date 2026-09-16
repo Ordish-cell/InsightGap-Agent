@@ -8,9 +8,8 @@ from sqlalchemy import select
 from src.web_app.models.orm import Document, DocumentChunk, AgentChatMessage, AgentEvent
 from src.web_app.services.conversation_files import conversation_files
 from src.web_app.services.document_chat_reader import read_documents_in_session
-from src.web_app.agent.runtime.chat_fast_path import RouteHeader, RouteProtocolError, chat_entry
 from src.web_app.tests.test_chat_control import env
-from src.web_app.tests.test_chat_fast_path import initial, fake_model
+from src.web_app.tests.test_chat_fast_path import initial, fake_model, run_native
 
 
 def add_file(env, name="实验报告.docx", text="实验目的：验证网络协议。实验步骤：抓包并分析。", conversation="chat", status="ingested"):
@@ -53,74 +52,65 @@ def test_scoped_reader_full_partial_and_other_conversation(env):
 
 
 @pytest.mark.asyncio
-async def test_followup_reads_document_without_heavy_graph(env, monkeypatch):
+@pytest.mark.parametrize("runtime_version", [2])
+async def test_followup_reads_document_without_heavy_graph(env, monkeypatch, runtime_version):
     did = add_file(env)
     monkeypatch.setattr("src.web_app.services.document_chat_reader.SessionLocal", env.factory)
-    monkeypatch.setattr("src.web_app.core.config.settings.chat_document_path_enabled", True)
-    calls, closed, _ = fake_model(monkeypatch, [json.dumps({"action": "document", "document_ids": [did], "mode": "overview", "query": "总结文件"}) + "\n"])
-    answers = []
-    async def answer(prompt):
-        assert "抓包并分析" in prompt[1].content
-        answers.append(prompt)
-        yield SimpleNamespace(content="这是网络协议实验报告。")
-    monkeypatch.setattr("src.web_app.agent.runtime.document_chat.get_chat_model", lambda *a, **kw: SimpleNamespace(astream=answer))
+    from src.web_app.tests.test_native_supervisor import Model, call
+    from langchain_core.messages import AIMessageChunk
+    model = Model([[call("document.read", {"document_ids": [did]})], [AIMessageChunk(content="Document answer")]])
+    monkeypatch.setattr("src.web_app.agent.runtime.nodes.get_chat_model", lambda *a, **k: model)
     from src.web_app.agent.runtime.graph import AgentRuntime
     monkeypatch.setattr("src.web_app.agent.runtime.graph.settings.agent_langgraph_checkpointer_enabled", False)
     with env.factory() as db:
         runtime = AgentRuntime(db, {})
         async def forbidden(state):
-            pytest.fail("document entered heavy workflow")
-        for name in ("home_intent_react", "planner", "parallel_prefetch", "final_response"):
+            pytest.fail("Direct document read entered a heavy capability")
+        for name in ("capability", "tool_runtime", "deep_research"):
             monkeypatch.setattr(runtime.nodes, name, forbidden)
-        state = await runtime.run({**initial(env), "user_input": "刚刚的文件是什么内容？"})
-        assert state["final_answer"] == "这是网络协议实验报告。"
-        assert state["file_context"]["document_ids"] == [did]
-        assert len(calls) == len(answers) == 1
-        assert "实验报告.docx" in calls[0][1].content
+        result = await runtime.run(initial(env))
+        assert result["final_answer"] == "Document answer"
+        assert result["file_context"]["document_ids"] == [did]
+        assert len(model.requests) == 2
+        assert "docx" in str(model.requests[0])
+        assert result["file_context"]["reads"][0]["coverage"] == "full"
+
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["chat", "clarify"])
 async def test_topic_change_or_clarify_does_not_read(env, monkeypatch, action):
     did = add_file(env)
-    monkeypatch.setattr("src.web_app.core.config.settings.chat_document_path_enabled", True)
-    fake_model(monkeypatch, [json.dumps({"action": action, "document_ids": [did]}) + "\n请说明。"])
-    monkeypatch.setattr("src.web_app.agent.runtime.document_chat.read_documents", lambda *a: pytest.fail("unexpected read"))
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
+    from src.web_app.tests.test_native_supervisor import Model, call
+    from langchain_core.messages import AIMessageChunk
+    model = Model([[call("ask_user", {"question": "Which file?", "document_ids": [did]})] if action == "clarify" else [AIMessageChunk(content="New topic")]])
+    monkeypatch.setattr("src.web_app.agent.runtime.nodes.get_chat_model", lambda *a, **k: model)
+    monkeypatch.setattr("src.web_app.services.document_chat_reader.read_documents_in_session", lambda *a, **k: pytest.fail("Unexpected read"))
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
     with env.factory() as db:
-        result = await chat_entry(RuntimeNodes(db, {}), initial(env))
-        assert result["final_answer"] == "请说明。"
+        result = await run_native(SupervisorNodes(db, {}), initial(env))
+        assert result["status"] == "completed"
+        assert not result.get("observations")
         if action == "clarify":
             assert result["file_context"]["document_ids"] == [did]
 
 
 @pytest.mark.asyncio
 async def test_forged_document_scope_falls_back_without_read(env, monkeypatch):
-    add_file(env)
-    monkeypatch.setattr("src.web_app.core.config.settings.chat_document_path_enabled", True)
-    fake_model(monkeypatch, ['{"action":"document","document_ids":[999],"mode":"overview","query":"x"}\n'])
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
+    did = add_file(env)
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
+    from src.web_app.tests.test_native_supervisor import Model, call
+    from langchain_core.messages import AIMessageChunk
+    model = Model([[call("document.read", {"document_ids": [999]})], [AIMessageChunk(content="File unavailable")]])
+    monkeypatch.setattr("src.web_app.agent.runtime.nodes.get_chat_model", lambda *a, **k: model)
     with env.factory() as db:
-        result = await chat_entry(RuntimeNodes(db, {}), initial(env))
-        assert "你想查看哪份文件" in result["final_answer"]
-        assert 999 not in result["file_context"]["document_ids"]
+        result = await run_native(SupervisorNodes(db, {"attachment_ids": [did]}), initial(env))
+    assert result["observations"][0]["status"] == "failed"
+    assert not result.get("file_context")
 
 
-@pytest.mark.parametrize("split", range(1, 20))
-def test_structured_header_split(split):
-    value = '{"action":"clarify","document_ids":[1,2]}\n哪份？'
-    parser = RouteHeader()
-    assert parser.feed(value[:split]) + parser.feed(value[split:]) == "哪份？"
-    assert parser.route == "clarify"
 
 
-def test_complete_json_at_stream_end_still_requires_scope_validation():
-    from src.web_app.agent.runtime.chat_fast_path import validate_file_decision
-    parser = RouteHeader()
-    parser.feed('{"action":"document","document_ids":[999],"mode":"overview","query":"总结"}')
-    parser.finish()
-    with pytest.raises(RouteProtocolError):
-        validate_file_decision(parser, [{"document_id": 1}])
 
 
 @pytest.mark.parametrize("status", ["processing", "failed", "uploaded"])
@@ -161,27 +151,31 @@ def test_long_document_search_failure_stays_scoped(env, monkeypatch):
 @pytest.mark.asyncio
 async def test_document_read_cancellation_discards_late_thread_result(env, monkeypatch):
     import threading
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
+    from src.web_app.agent.runtime.chat_control import controlled_node
     did = add_file(env)
-    monkeypatch.setattr("src.web_app.core.config.settings.chat_document_path_enabled", True)
-    fake_model(monkeypatch, [json.dumps({"action": "document", "document_ids": [did], "mode": "overview", "query": "总结"}) + "\n"])
     entered, release = threading.Event(), threading.Event()
-    def slow_read(*args):
+    def slow_read(*args, **kwargs):
         entered.set()
         release.wait(3)
         return []
-    monkeypatch.setattr("src.web_app.agent.runtime.document_chat.read_documents", slow_read)
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
+    monkeypatch.setattr("src.web_app.services.document_chat_reader.read_documents_in_session", slow_read)
     with env.factory() as db:
-        task = asyncio.create_task(chat_entry(RuntimeNodes(db, {}), initial(env)))
+        nodes = SupervisorNodes(db, {})
+        s = initial(env)
+        await nodes.permission_guard(s)
+        s["current_action"] = {"action": "document_read", "action_id": "read", "arguments": {"document_ids": [did]}}
+        task = asyncio.create_task(controlled_node("document_read", nodes.document_read, db)(s))
         try:
             assert await asyncio.to_thread(entered.wait, 2)
-            start = perf_counter()
+            started = perf_counter()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            assert perf_counter() - start < 2
+            assert perf_counter() - started < 2
         finally:
             release.set()
+        assert not s.get("observations")
         events = db.scalars(select(AgentEvent)).all()
         assert any(e.event_type == "node_cancelled" for e in events)
         assert not any(e.event_type == "answer_delta" for e in events)
@@ -194,17 +188,17 @@ async def test_completed_file_context_survives_persistence(env, monkeypatch, act
     from src.web_app.services.agent_service import execute_prepared_run, get_conversation
     from src.web_app.services.conversation_files import file_discussion
     did = add_file(env)
-    monkeypatch.setattr("src.web_app.core.config.settings.chat_document_path_enabled", True)
     monkeypatch.setattr("src.web_app.services.document_chat_reader.SessionLocal", env.factory)
     monkeypatch.setattr("src.web_app.agent.runtime.graph.settings.agent_langgraph_checkpointer_enabled", False)
     monkeypatch.setattr("src.web_app.services.summary_tasks.summary_tasks.schedule", lambda *a: None)
     ctx = ModelExecutionContext(1, 1, 1, "custom", "openai_chat_completions", "fake", "Fake")
     monkeypatch.setattr("src.web_app.services.llm_registry_service.resolve_run_model_context", lambda *a, **kw: ctx)
-    fake_model(monkeypatch, [json.dumps({"action": action, "document_ids": [did], "mode": "overview", "query": "总结文件"}) + "\n你指的是实验报告吗？"])
-    async def answer(prompt):
-        assert "抓包并分析" in prompt[1].content
-        yield SimpleNamespace(content="报告介绍网络协议实验。")
-    monkeypatch.setattr("src.web_app.agent.runtime.document_chat.get_chat_model", lambda *a, **kw: SimpleNamespace(astream=answer))
+    from src.web_app.tests.test_native_supervisor import Model, call
+    from langchain_core.messages import AIMessageChunk
+    turns = [[call("ask_user", {"question": "Which file?", "document_ids": [did]})]] if action == "clarify" else [
+        [call("document.read", {"document_ids": [did]})], [AIMessageChunk(content="Document answer")]]
+    model = Model(turns)
+    monkeypatch.setattr("src.web_app.agent.runtime.nodes.get_chat_model", lambda *a, **k: model)
     with env.factory() as db:
         await execute_prepared_run(db, env.user, env.run, {"attachment_ids": [did]} if action == "document" else {})
     with env.factory() as db:
@@ -214,28 +208,18 @@ async def test_completed_file_context_survives_persistence(env, monkeypatch, act
             assert file_discussion(db, env.user, "chat")["reads"][0]["coverage"] == "full"
 
 
-@pytest.mark.asyncio
-async def test_document_flag_off_keeps_validated_legacy_scope(env, monkeypatch):
-    did = add_file(env)
-    monkeypatch.setattr("src.web_app.core.config.settings.chat_document_path_enabled", False)
-    fake_model(monkeypatch, [json.dumps({"action": "document", "document_ids": [did], "mode": "overview", "query": "总结"}) + "\n"])
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-    with env.factory() as db:
-        nodes = RuntimeNodes(db, {})
-        state = await chat_entry(nodes, initial(env))
-        assert state["chat_entry_route"] == "workflow"
-        assert nodes.payload["attachment_ids"] == [did]
 
 
 @pytest.mark.asyncio
-async def test_mixed_image_attachment_keeps_legacy_entry(env, monkeypatch):
+async def test_mixed_image_attachment_keeps_native_context(env, monkeypatch):
     did = add_file(env)
-    monkeypatch.setattr("src.web_app.core.config.settings.chat_document_path_enabled", True)
-    calls, _, _ = fake_model(monkeypatch, ["chat\nwrong"])
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
+    calls, _, _ = fake_model(monkeypatch, ["Image and document context"])
     with env.factory() as db:
-        state = await chat_entry(RuntimeNodes(db, {"attachment_ids": [did, 999], "attachment_context": "existing image understanding"}), initial(env))
-        assert state["chat_entry_route"] == "workflow" and calls == []
+        result = await run_native(SupervisorNodes(db, {"attachment_ids": [did], "attachment_context": "existing image understanding"}), initial(env))
+    assert result["status"] == "completed"
+    assert "existing image understanding" in str(calls[0])
+    assert str(did) in str(calls[0])
 
 
 @pytest.mark.asyncio
@@ -245,18 +229,17 @@ async def test_real_document_followup_smoke(env, monkeypatch):
     from src.web_app.models.orm import AgentRun
     from src.web_app.services.llm_registry_service import resolve_run_model_context
     from src.web_app.agent.llm.context import use_model_context
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
     with SessionLocal() as source:
         run = source.scalar(select(AgentRun).where(AgentRun.status == "completed").order_by(AgentRun.id.desc()))
         if not run:
             pytest.skip("No configured model")
         ctx = resolve_run_model_context(source, run.user_id, (run.graph_state or {}).get("model_context") or {})
     did = add_file(env)
-    monkeypatch.setattr("src.web_app.core.config.settings.chat_document_path_enabled", True)
     monkeypatch.setattr("src.web_app.services.document_chat_reader.SessionLocal", env.factory)
     with use_model_context(ctx), env.factory() as db:
         started = perf_counter()
-        result = await chat_entry(RuntimeNodes(db, {}), {**initial(env), "user_input": "刚刚上传的实验报告讲什么？"})
+        result = await run_native(SupervisorNodes(db, {}), {**initial(env), "user_input": "刚刚上传的实验报告讲什么？"})
         assert result["file_context"]["document_ids"] == [did]
         events = db.scalars(select(AgentEvent).order_by(AgentEvent.id)).all()
         assert not any(e.event_type == "chat_route_fallback" for e in events), [e.payload_json for e in events if e.event_type == "chat_route_fallback"]
@@ -267,19 +250,20 @@ async def test_real_document_followup_smoke(env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_document_fake_latency_samples(env, monkeypatch):
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
+    from src.web_app.tests.test_native_supervisor import Model, call
+    from langchain_core.messages import AIMessageChunk
     did = add_file(env)
-    monkeypatch.setattr("src.web_app.services.document_chat_reader.SessionLocal", env.factory)
-    monkeypatch.setattr("src.web_app.core.config.settings.chat_document_path_enabled", True)
-    fake_model(monkeypatch, [json.dumps({"action": "document", "document_ids": [did], "mode": "overview", "query": "总结"}) + "\n"])
-    async def answer(prompt):
-        yield SimpleNamespace(content="报告介绍网络协议实验。")
-    monkeypatch.setattr("src.web_app.agent.runtime.document_chat.get_chat_model", lambda *a, **kw: SimpleNamespace(astream=answer))
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
     durations = []
-    with env.factory() as db:
-        for _ in range(30):
-            start = perf_counter()
-            await chat_entry(RuntimeNodes(db, {}), initial(env))
-            durations.append((perf_counter() - start) * 1000)
-    print("DOCUMENT_FAKE_LATENCY " + json.dumps({"samples": 30, "entry_total_p95_ms": round(sorted(durations)[28], 1)}))
+    for _ in range(30):
+        model = Model([[call("document.read", {"document_ids": [did]})], [AIMessageChunk(content="Document answer")]])
+        monkeypatch.setattr("src.web_app.agent.runtime.nodes.get_chat_model", lambda *a, **k: model)
+        with env.factory() as db:
+            db.query(AgentEvent).delete()
+            db.commit()
+            started = perf_counter()
+            result = await run_native(SupervisorNodes(db, {}), initial(env))
+            durations.append((perf_counter() - started) * 1000)
+            assert result["file_context"]["document_ids"] == [did]
+            assert len(model.requests) == 2
     assert sorted(durations)[28] <= 500

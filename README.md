@@ -15,6 +15,8 @@
 
 ![首页主界面](images/index.jpg)
 
+> Runtime 使用单一原生工具调用 Supervisor：轻量上下文准备后，同一模型直接回答或调用能力，再根据结果继续。独立入口分类、JSON 决策和二次回答模型已删除；不会自动换模型或使用 JSON 兜底。新任务记录 `runtime_version=2`、`loop_protocol_version=1`，不转换旧 checkpoint，历史继续可读。当前验证与边界见 [原生循环架构](docs/native_runtime.md)。
+
 ## 能力总览
 
 | 能力 | 如何帮助打破信息差 | 关键模块 |
@@ -319,14 +321,18 @@ flowchart TD
     FE --> API["FastAPI Web App"]
     API --> RT["LangGraph Agent Runtime"]
 
-    RT --> PLAN["Planner / Supervisor"]
-    PLAN --> DISPATCH["Dispatcher"]
-    DISPATCH --> TOOL["tool_agent"]
-    DISPATCH --> RAG["rag_agent"]
-    DISPATCH --> MEM["memory_agent"]
-    DISPATCH --> RESEARCH["research_agent"]
-    DISPATCH --> ART["artifact_agent"]
-    DISPATCH --> SKILL["skill_agent"]
+    RT --> BOOT["代码准备 Context / GSSC，不调用模型"]
+    BOOT --> S["单一 Supervisor：原生工具调用 / 直接流式回答"]
+    S --> DOC["document.read：限定文件直接读取"]
+    DOC -->|内容与覆盖范围| S
+    S --> TOOL["Tool Runtime"]
+    S --> RAG["按需 RAG"]
+    S --> MEM["Memory / Artifact / Skill"]
+    S -->|已授权| RESEARCH["现有 ODR"]
+    RAG -->|Observation| S
+    MEM -->|Observation| S
+    RESEARCH -->|Observation| S
+    TOOL -->|Observation| S
 
     TOOL --> MCP["MCP Registry + ToolExecutor"]
     MCP --> APPROVAL["ToolCall / Approval"]
@@ -339,8 +345,7 @@ flowchart TD
 
     RT --> CHECKPOINT["LangGraph Checkpoint"]
     CHECKPOINT --> PG
-    RT --> FINAL["Evaluator + Final Response"]
-    FINAL --> API
+    S -->|一次收尾| API
 ```
 
 ## 核心业务闭环

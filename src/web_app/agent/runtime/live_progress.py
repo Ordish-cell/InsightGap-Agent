@@ -8,6 +8,8 @@ from uuid import uuid4
 current_step = ContextVar("current_live_step", default=None)
 step_started_at = ContextVar("live_step_started_at", default=None)
 NAMES = {"chat_entry": "判断处理方式", "permission_guard": "检查操作权限",
+         "bootstrap_context": "读取会话上下文", "supervisor": "分析当前结果",
+         "capability": "处理请求", "deep_research": "深入研究", "tool_runtime": "执行工具",
          "home_intent_react": "判断任务需要", "planner": "安排执行步骤",
          "parallel_prefetch": "获取相关上下文", "parallel_read_stage": "准备上下文",
          "context_builder": "读取会话上下文", "skill_matcher": "匹配可用能力",

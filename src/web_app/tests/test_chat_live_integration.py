@@ -17,7 +17,7 @@ from src.web_app.tests.test_chat_fast_path import fake_model
 
 @pytest.mark.asyncio
 async def test_service_commits_answer_and_terminal_before_summary(env, monkeypatch):
-    fake_model(monkeypatch, ["chat\n现在先休息一下。"])
+    fake_model(monkeypatch, ["现在先休息一下。"])
     monkeypatch.setattr("src.web_app.agent.runtime.graph.settings.agent_langgraph_checkpointer_enabled", False)
     ctx = ModelExecutionContext(1, 1, 1, "custom", "openai_chat_completions", "fake", "Fake")
     monkeypatch.setattr("src.web_app.services.llm_registry_service.resolve_run_model_context", lambda *a, **k: ctx)
@@ -60,14 +60,16 @@ async def test_notify_wakes_long_poll_and_replay_is_identical(env):
 
 @pytest.mark.asyncio
 async def test_fake_model_latency_samples(env, monkeypatch):
-    from src.web_app.agent.runtime.chat_fast_path import chat_entry
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-    fake_model(monkeypatch, ["chat\n简短回答。"])
+    from src.web_app.tests.test_chat_fast_path import run_native
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
+    fake_model(monkeypatch, ["简短回答。"])
     samples = []
     with env.factory() as db:
         for _ in range(30):
+            db.query(AgentEvent).delete()
+            db.commit()
             started = perf_counter()
-            await chat_entry(RuntimeNodes(db, {}), {"run_id": env.run, "user_id": env.user,
+            await run_native(SupervisorNodes(db, {}), {"run_id": env.run, "user_id": env.user,
                 "conversation_id": "chat", "user_input": "唉，我好累"})
             samples.append((perf_counter() - started) * 1000)
     p95 = sorted(samples)[28]
@@ -85,7 +87,7 @@ async def test_completed_turn_latency_samples(env, monkeypatch):
         observed[(row.run_id, row.event_type, (row.payload_json or {}).get("stage"))] = perf_counter()
         return row
     monkeypatch.setattr(AgentEventRepository, "create", timed_create)
-    fake_model(monkeypatch, ["chat\n简短回答。"])
+    fake_model(monkeypatch, ["简短回答。"])
     monkeypatch.setattr("src.web_app.agent.runtime.graph.settings.agent_langgraph_checkpointer_enabled", False)
     ctx = ModelExecutionContext(1, 1, 1, "custom", "openai_chat_completions", "fake", "Fake")
     monkeypatch.setattr("src.web_app.services.llm_registry_service.resolve_run_model_context", lambda *a, **k: ctx)
@@ -123,32 +125,28 @@ async def test_real_provider_isolated_smoke(env, monkeypatch):
     from src.web_app.db.session import SessionLocal
     from src.web_app.services.llm_registry_service import resolve_run_model_context
     from src.web_app.agent.llm.context import use_model_context
-    from src.web_app.agent.runtime.chat_fast_path import chat_entry
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
+    from src.web_app.tests.test_chat_fast_path import run_native
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
     with SessionLocal() as source:
         run = source.scalar(select(AgentRun).where(AgentRun.status == "completed").order_by(AgentRun.id.desc()))
         if not run:
             pytest.skip("No configured completed run")
         ctx = resolve_run_model_context(source, run.user_id, (run.graph_state or {}).get("model_context") or {})
-    monkeypatch.setattr("src.web_app.agent.runtime.chat_fast_path.settings.chat_fast_path_enabled", True)
-    from src.web_app.agent.runtime.chat_fast_path import RouteHeader
-    parsers = []
-    def tracked_header():
-        parser = RouteHeader()
-        parsers.append(parser)
-        return parser
-    monkeypatch.setattr("src.web_app.agent.runtime.chat_fast_path.RouteHeader", tracked_header)
     results = []
     previous_seq = 0
     with use_model_context(ctx), env.factory() as db:
         for question, route in [("唉，我好累", "chat"), ("请联网核查今天的科技新闻，引用来源", "workflow")]:
+            db.query(AgentEvent).delete()
+            db.commit()
             started = perf_counter()
-            result = await chat_entry(RuntimeNodes(db, {}), {"run_id": env.run, "user_id": env.user,
+            result = await run_native(SupervisorNodes(db, {}), {"run_id": env.run, "user_id": env.user,
                 "conversation_id": "isolated-smoke", "user_input": question})
             events = db.execute(select(AgentEvent).where(AgentEvent.run_id == env.run, AgentEvent.id > previous_seq).order_by(AgentEvent.id)).scalars().all()
             previous_seq = events[-1].id
-            assert not any(e.event_type == "chat_route_fallback" for e in events), repr(parsers[-1].buffer[:120])
-            assert result["chat_entry_route"] == route
+            assert not any(e.event_type == "chat_route_fallback" for e in events), result.get("error")
+            assert result["status"] == "completed"
+            if route == "workflow":
+                assert any(r["capability"] == "tool" for r in result["observations"])
             results.append({"route": route, "elapsed_ms": round((perf_counter() - started) * 1000),
                             "answer_chars": len(result.get("final_output", "")),
                             "stages_ms": {e.payload_json["stage"]: round(e.payload_json["elapsed_ms"]) for e in events if e.event_type == "chat_latency"}})

@@ -215,123 +215,94 @@ class TestDeleteCheckpointsForRuns:
 # ── integration tests: hard_delete_conversation ─────────────────────
 
 
+def _perform(db, job_id, cleanup):
+    from sqlalchemy.orm import sessionmaker
+    from src.web_app.services import conversation_deletion as service
+    from src.web_app.models.orm import ConversationDeletionTask
+    with patch.object(service, "SessionLocal", sessionmaker(bind=db.get_bind())), patch.object(service, "cleanup_external", cleanup):
+        service.perform(job_id)
+    db.expire_all()
+    return db.get(ConversationDeletionTask, job_id)
+
+
 class TestHardDeleteCleansCheckpoints:
     def test_checkpoint_cleanup_called_before_orm_delete(self):
-        """hard_delete_conversation calls delete_checkpoints_for_runs before ORM delete."""
         db = make_test_session()
         user = _user(db)
-        conv, runs = _create_conversation_with_runs(
-            db, user.id, "conv-test-1", ["completed", "completed"]
-        )
-        run_ids = [r.id for r in runs]
+        conv, runs = _create_conversation_with_runs(db, user.id)
+        ids = [r.id for r in runs]
+        checked = []
+        def cleanup(job):
+            assert set(job.manifest["checkpoint_threads"]) >= {f"run:{i}" for i in ids}
+            assert all(db.get(AgentRun, i) is not None for i in ids)
+            checked.append(True)
+        result = hard_delete_conversation(db, user.id, conv.conversation_id)
+        assert result["status"] == "pending"
+        job = _perform(db, result["id"], cleanup)
+        assert checked == [True] and job.status == "completed"
+        assert all(db.get(AgentRun, i) is None for i in ids)
 
-        with patch(
-            "src.web_app.services.agent_service.delete_checkpoints_for_runs"
-        ) as mock_delete:
-            result = hard_delete_conversation(db, user.id, "conv-test-1")
-
-            mock_delete.assert_called_once_with(run_ids)
-            assert result["deleted_records"] >= 1
-
-    def test_orm_data_deleted_after_checkpoint_cleanup(self):
-        """ORM records are gone after hard_delete, even if checkpoint cleanup fails."""
+    def test_orm_data_retained_when_checkpoint_cleanup_fails(self):
         db = make_test_session()
         user = _user(db)
-        conv, runs = _create_conversation_with_runs(
-            db, user.id, "conv-rm-1", ["completed"]
-        )
-        run_id = runs[0].id
-
-        with patch(
-            "src.web_app.services.agent_service.delete_checkpoints_for_runs",
-            side_effect=Exception("checkpoint DB down"),
-        ):
-            result = hard_delete_conversation(db, user.id, "conv-rm-1")
-
-        assert result["deleted_records"] >= 1
-        # Run should be gone
-        run_repo = AgentRunRepository(db)
-        assert run_repo.get_by_id(run_id) is None
-        # Conversation should be gone
-        assert db.get(AgentConversation, conv.id) is None
+        conv, runs = _create_conversation_with_runs(db, user.id, "retain", ["completed"])
+        cid, rid = conv.id, runs[0].id
+        result = hard_delete_conversation(db, user.id, "retain")
+        def unavailable(job): raise RuntimeError("checkpoint DB down")
+        job = _perform(db, result["id"], unavailable)
+        assert job.status == "failed" and job.manifest
+        assert db.get(AgentRun, rid) is not None and db.get(AgentConversation, cid) is not None
+        assert _perform(db, result["id"], lambda job: None).status == "completed"
+        assert db.get(AgentRun, rid) is None
 
     def test_single_run_conversation(self):
-        """Single-run conversation: checkpoint deleted, ORM deleted."""
         db = make_test_session()
         user = _user(db)
-        conv, runs = _create_conversation_with_runs(
-            db, user.id, "conv-single-1", ["completed"]
-        )
-
-        with patch(
-            "src.web_app.services.agent_service.delete_checkpoints_for_runs"
-        ) as mock_delete:
-            result = hard_delete_conversation(db, user.id, "conv-single-1")
-
-            mock_delete.assert_called_once_with([1])
-            assert result["deleted_records"] >= 1
+        conv, runs = _create_conversation_with_runs(db, user.id, "single", ["completed"])
+        cid, rid = conv.id, runs[0].id
+        scopes = []
+        result = hard_delete_conversation(db, user.id, "single")
+        job = _perform(db, result["id"], lambda job: scopes.extend(job.manifest["checkpoint_threads"]))
+        assert job.status == "completed" and f"run:{rid}" in scopes
+        assert db.get(AgentConversation, cid) is None
 
 
 class TestHardDeletePendingGuard:
     def test_blocked_when_pending_approval_exists(self):
-        """409 when conversation has a pending approval and cancel_pending=False."""
+        from src.web_app.services.conversation_deletion import DeletionError
         db = make_test_session()
         user = _user(db)
-        _create_blocked_conversation(db, user.id, "conv-blocked-1")
-
-        with pytest.raises(PendingApprovalExistsError) as exc_info:
-            hard_delete_conversation(db, user.id, "conv-blocked-1", cancel_pending=False)
-
-        assert "等待审批" in str(exc_info.value)
+        _create_blocked_conversation(db, user.id, "blocked")
+        with pytest.raises(DeletionError) as exc:
+            hard_delete_conversation(db, user.id, "blocked", cancel_pending=False)
+        assert exc.value.code == "CONVERSATION_HAS_PENDING_APPROVAL"
 
     def test_cancel_pending_cleans_checkpoints(self):
-        """cancel_pending=True cancels approvals AND cleans checkpoints."""
         db = make_test_session()
         user = _user(db)
-        _create_blocked_conversation(db, user.id, "conv-cancel-1")
-
-        with patch(
-            "src.web_app.services.agent_service.delete_checkpoints_for_runs"
-        ) as mock_delete:
-            result = hard_delete_conversation(
-                db, user.id, "conv-cancel-1", cancel_pending=True
-            )
-
-            mock_delete.assert_called_once_with([1])
-            assert result["cancelled_approvals"] >= 1
-            assert result["cancelled_runs"] >= 1
+        _create_blocked_conversation(db, user.id, "cancel")
+        result = hard_delete_conversation(db, user.id, "cancel", cancel_pending=True)
+        scopes = []
+        job = _perform(db, result["id"], lambda job: scopes.extend(job.manifest["checkpoint_threads"]))
+        assert job.status == "completed" and "run:1" in scopes
+        assert db.get(AgentRun, 1) is None
 
     def test_cancel_pending_approval_becomes_cancelled(self):
-        """After cancel_pending=True, approval status is 'cancelled'."""
         db = make_test_session()
         user = _user(db)
-        _, _, approval, _, _ = _create_blocked_conversation(
-            db, user.id, "conv-cancel-2"
-        )
-
-        with patch(
-            "src.web_app.services.agent_service.delete_checkpoints_for_runs"
-        ):
-            hard_delete_conversation(db, user.id, "conv-cancel-2", cancel_pending=True)
-
+        _, _, approval, _, _ = _create_blocked_conversation(db, user.id, "cancel-approval")
+        aid = approval.id
+        hard_delete_conversation(db, user.id, "cancel-approval", cancel_pending=True)
         db.expire_all()
-        a = db.get(Approval, approval.id)
-        assert a is not None
-        assert a.status == "cancelled"
+        assert db.get(Approval, aid).status == "cancelled"
 
     def test_no_pending_approval_allows_delete(self):
-        """Conversation without pending approvals is deleted directly."""
         db = make_test_session()
         user = _user(db)
-        _create_conversation_with_runs(db, user.id, "conv-clean-1", ["completed"])
-
-        with patch(
-            "src.web_app.services.agent_service.delete_checkpoints_for_runs"
-        ) as mock_delete:
-            result = hard_delete_conversation(db, user.id, "conv-clean-1")
-
-            mock_delete.assert_called_once()
-            assert result["deleted_records"] >= 1
+        _create_conversation_with_runs(db, user.id, "clean", ["completed"])
+        result = hard_delete_conversation(db, user.id, "clean")
+        assert result["status"] == "pending"
+        assert _perform(db, result["id"], lambda job: None).status == "completed"
 
 
 # ── orphan cleanup tests ─────────────────────────────────────────────

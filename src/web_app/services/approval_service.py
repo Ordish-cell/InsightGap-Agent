@@ -12,7 +12,7 @@ stream (agent_service.resume_run_after_approval).
 """
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -65,10 +65,18 @@ def update_approval_status(
     Raises ValueError with code APPROVAL_CONTEXT_GONE if the run, conversation,
     or assistant message no longer exists.
     """
+    if status not in {"approved", "rejected"}:
+        raise ValueError("Approval decision must be approved or rejected")
     repo = ApprovalRepository(db)
     item = repo.get_by_user(user_id, approval_id)
     if not item:
         raise ValueError("Approval not found")
+    from src.web_app.core.config import settings
+    cutoff = datetime.now(UTC).replace(tzinfo=None) - timedelta(hours=settings.agent_approval_pending_ttl_hours)
+    if item.status == "expired" or (item.status == "pending" and item.created_at.replace(tzinfo=None) < cutoff):
+        if item.status == "pending":
+            repo.decide_pending(item, "expired", item.payload or {})
+        raise ValueError("APPROVAL_EXPIRED: 该审批已超时，无法继续执行。")
     if item.status != "pending":
         raise ValueError(f"Approval is already {item.status}")
 
@@ -88,6 +96,7 @@ def update_approval_status(
             tool_call = ToolCallRepository(db).get_by_user(user_id, int(tool_call_id))
             if not tool_call:
                 raise ValueError("APPROVAL_CONTEXT_GONE: ToolCall not found.")
+            repo.decide_pending(item, status, payload)
             tool_result = tool_executor.execute_approved_tool_once(
                 db,
                 user_id,
@@ -102,7 +111,10 @@ def update_approval_status(
 
             ToolCallRepository(db).update_status(int(tool_call_id), "rejected", error_message="User rejected the approval")
 
-        repo.update(item, status=status, payload=payload)
+        if item.status == "pending":
+            repo.decide_pending(item, status, payload)
+        else:
+            repo.update(item, payload=payload)
         result = approval_to_dict(item)
         if tool_result is not None:
             result["tool_result"] = tool_result
@@ -156,7 +168,7 @@ def update_approval_status(
 
     event_type = "approval_approved" if status == "approved" else "approval_rejected"
 
-    repo.update(item, status=status, payload=payload)
+    repo.decide_pending(item, status, payload)
 
     record_event(
         db,

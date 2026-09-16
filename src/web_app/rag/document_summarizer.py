@@ -176,12 +176,10 @@ def _format_sources(sources: list[dict[str, Any]]) -> str:
 
 def _llm_summary(prompt: str) -> str:
     from src.web_app.agent.llm.factory import get_chat_model
+    from src.web_app.agent.llm.content import message_text
 
     message = get_chat_model("rag", complexity="low", temperature=0.1).invoke(prompt)
-    content = getattr(message, "content", str(message))
-    if isinstance(content, list):
-        content = "\n".join(str(item.get("text", item)) if isinstance(item, dict) else str(item) for item in content)
-    result = str(content).strip()
+    result = message_text(message).strip()
     if not result:
         raise RuntimeError("Summary model returned empty content")
     return result

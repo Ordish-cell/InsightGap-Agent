@@ -331,6 +331,9 @@ export interface AgentReplayPage {
 }
 
 export type AgentTraceEventType =
+  | 'agent_text_started'
+  | 'agent_text_delta'
+  | 'agent_text_completed'
   | 'interaction_mode'
   | 'progress_delta'
   | 'progress_completed'

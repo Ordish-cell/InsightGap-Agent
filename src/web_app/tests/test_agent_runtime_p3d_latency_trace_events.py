@@ -1,6 +1,9 @@
 import inspect
 import sys
+from datetime import datetime
 from pathlib import Path
+
+import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
@@ -9,6 +12,7 @@ if str(_ROOT) not in sys.path:
 from src.web_app.agent.runtime.latency import build_runtime_slow_path_hints
 from src.web_app.services import agent_service
 from src.web_app.tests.db_test_utils import make_test_session
+from src.web_app.tests.test_chat_control import env as env
 
 
 def test_slow_path_hints_cover_slow_prepare_empty_evidence_and_supervisor_fallback():
@@ -88,11 +92,18 @@ def test_agent_service_emits_latency_trace_before_terminal_run_events():
     assert trace_index < source.index('publish_event(db, stream_queue, run.id, "run_paused"', trace_index)
 
 
-def test_resume_path_emits_latency_trace_before_run_completed():
-    module_source = inspect.getsource(agent_service)
-    source = module_source[
-        module_source.index("async def resume_run_after_approval"):
-        module_source.index("def get_run")
-    ]
-    trace_call = '_emit_runtime_latency_trace_event(db, stream_queue, run_id, thread_id, user_id, state)'
-    assert source.index(trace_call) < source.index('publish_event(db, stream_queue, run_id, "run_completed"')
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,event", [("completed", "run_completed"), ("failed", "run_failed"), ("waiting_approval", "run_paused")])
+async def test_resume_path_emits_latency_before_actual_terminal_event(env, monkeypatch, status, event):
+    from src.web_app.db.repositories.agent_repository import AgentEventRepository
+    from src.web_app.models.orm import AgentRun
+    monkeypatch.setattr("src.web_app.services.summary_tasks.summary_tasks.schedule", lambda *a: None)
+    with env.factory() as db:
+        state = {"user_id": env.user, "run_id": env.run, "runtime_version": 2, "conversation_id": "chat",
+                 "status": status, "final_answer": "result", "thread_id": f"run:{env.run}"}
+        await agent_service._finalize_resume(db=db, user_id=env.user, run_id=env.run, run=db.get(AgentRun, env.run),
+            state=state, conversation_id="chat", thread_id=state["thread_id"], user_input="test",
+            started_at=datetime.now(), pause_mode="interrupt", pending_approval_id=1,
+            pending_tool_call_id=1, pending_tool_name="email.send", stream_queue=None)
+        events = [e.event_type for e in AgentEventRepository(db).list_by_run(env.user, env.run)]
+        assert events.index("runtime_latency_trace") < events.index(event)

@@ -482,6 +482,8 @@ class TestQdrantWrite:
         user = _make_user(db)
         conv = _make_conversation(db, user.id)
 
+        monkeypatch.setattr("src.web_app.core.config.settings.qdrant_url", "http://qdrant.invalid")
+        monkeypatch.setattr("src.web_app.rag.embeddings.embed_text", lambda text: [0.1] * 8)
         mock_upsert = MagicMock()
         mock_client = MagicMock()
         mock_client.upsert = mock_upsert
@@ -954,9 +956,7 @@ class TestContextBuilderInjection:
 class TestTokenBudget:
     def test_segment_token_budget_truncates_low_score(self, monkeypatch):
         """High-score segments survive; low-score are truncated or dropped."""
-        from src.web_app.agent.runtime.node_groups.read_nodes import (
-            _format_recalled_segments_for_context,
-        )
+        from src.web_app.services.conversation_summary_service import conversation_summary_service
 
         monkeypatch.setattr(
             "src.web_app.core.config.settings.conversation_segment_max_tokens",
@@ -976,7 +976,7 @@ class TestTokenBudget:
             start_time=None, end_time=None, message_count=24, source="qdrant",
         )
 
-        result = _format_recalled_segments_for_context([high, low])
+        result = conversation_summary_service.format_for_context(relevant_segments=[high, low])
         assert "HIGH_VALUE_FACT" in result, "High-score segment must survive"
         # Low-score segment should be either truncated or absent
         assert "LOW_VALUE_FACT" not in result or "[segment truncated]" in result

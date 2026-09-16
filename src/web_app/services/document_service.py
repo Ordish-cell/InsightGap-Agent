@@ -287,7 +287,7 @@ class DocumentService:
             chunks = structured["chunks"]
             parent_chunks = [chunk for chunk in chunks if (chunk.get("metadata") or {}).get("chunk_role") == "parent"]
             self._update_ingest_progress(doc_repo, document, "summary", 35)
-            document_summary = build_document_summary(document.filename, parent_chunks)
+            document_summary = self._build_summary(db, user_id, document, parent_chunks)
             generated_summary_chunks = summary_chunks(
                 document_summary,
                 max((int(chunk.get("chunk_index") or 0) for chunk in chunks), default=-1) + 1,
@@ -366,6 +366,24 @@ class DocumentService:
             },
         )
         return {"status": "ingested", "chunk_count": child_count, "token_count": token_count}
+
+    def _build_summary(self, db, user_id, document, parent_chunks):
+        from src.web_app.rag.document_summarizer import EXTRACTIVE_SUMMARY_CHARS
+        from src.web_app.agent.llm.context import use_model_context
+        from src.web_app.services.llm_registry_service import resolve_model_context, ModelSetupError
+
+        if sum(len(str(c.get("content") or "")) for c in parent_chunks) <= EXTRACTIVE_SUMMARY_CHARS:
+            return build_document_summary(document.filename, parent_chunks)
+        if (document.metadata_json or {}).get("upload_type") == "chat":
+            # Chat readiness depends on indexed source text, not optional LLM summaries.
+            return {"status": "skipped", "summary_text": "", "section_summaries": [], "error": "", "method": "chat_source_only"}
+        try:
+            context = resolve_model_context(db, user_id, (document.metadata_json or {}).get("summary_model_config_id"))
+        except ModelSetupError as exc:
+            # Indexing source text remains useful without an optional generated summary.
+            return {"status": "failed", "summary_text": "", "section_summaries": [], "error": str(exc)}
+        with use_model_context(context):
+            return build_document_summary(document.filename, parent_chunks)
 
     def _update_ingest_progress(
         self,

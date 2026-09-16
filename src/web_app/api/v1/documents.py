@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, UploadFile
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, UploadFile, Form
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -93,10 +95,18 @@ def rag_stats(user_id: int = Depends(get_current_user_id), db: Session = Depends
 
 
 @router.post("/documents/chat-upload")
-async def chat_upload(file: UploadFile, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+async def chat_upload(file: UploadFile, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db), model_config_id: Annotated[int | None, Form()] = None):
     try:
+        if model_config_id is not None:
+            from src.web_app.services.llm_registry_service import resolve_model_context
+            resolve_model_context(db, user_id, model_config_id)
         result = document_service.upload_chat_attachment(db, user_id, file)
         if result.get("kind") == "document" and result.get("status") == "processing":
+            if model_config_id is not None:
+                from src.web_app.db.repositories.document_repository import DocumentRepository
+                repo = DocumentRepository(db)
+                document = repo.get_by_id_for_user(user_id, int(result["document_id"]))
+                repo.update(document, metadata_json={**(document.metadata_json or {}), "summary_model_config_id": model_config_id})
             document_ingest_task_manager.start(user_id, int(result["document_id"]))
         return ok(result)
     except ValueError as exc:

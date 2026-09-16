@@ -157,9 +157,12 @@ def test_email_and_browser_tools_are_drafts_only():
     assert browser["output"]["executed"] is False
 
 
-def test_agent_runtime_tool_node_records_tool_call():
+def test_agent_runtime_tool_node_records_tool_call(scripted_supervisor):
     db = make_test_session()
     user = _user(db)
+
+    from src.web_app.tests.db_test_utils import configure_test_model
+    configure_test_model(db, user)
 
     result = agent_service.run_agent(db, user.id, {"user_input": "run local search", "route": "tool", "tool_name": "search_mcp.search", "tool_input": {"query": "agent os", "limit": 1}})
 

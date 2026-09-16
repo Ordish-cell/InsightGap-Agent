@@ -5,8 +5,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    chat_fast_path_enabled: bool = True
-    chat_document_path_enabled: bool = True
     app_env: str = "local"
     secret_key: str = "change-me"
     access_token_expire_minutes: int = 10080
@@ -124,11 +122,6 @@ class Settings(BaseSettings):
     feed_min_personal_relevance: float = 0.15
     feed_min_source_credibility: float = 0.40
     feed_low_confidence_max_ratio: float = 0.20
-    agent_intent_llm_enabled: bool = True
-    agent_planner_llm_enabled: bool = False
-    agent_memory_llm_enabled: bool = True
-    agent_skill_llm_enabled: bool = True
-    agent_safety_llm_enabled: bool = True
     agent_llm_usage_log_enabled: bool = True
     agent_llm_log_prompt_preview: bool = False
     agent_llm_log_raw_output: bool = False
@@ -179,15 +172,13 @@ class Settings(BaseSettings):
     agent_langgraph_status_enabled: bool = True
     agent_langgraph_status_max_steps: int = 12
     agent_chat_real_messages_enabled: bool = True
-    agent_supervisor_enabled: bool = True
-    agent_supervisor_shadow_policy_enabled: bool = True
-    agent_supervisor_shadow_metrics_enabled: bool = True
-    agent_supervisor_control_enabled: bool = False
-    agent_replanner_control_enabled: bool = False
-    agent_llm_supervisor_enabled: bool = True
-    agent_llm_supervisor_mode: str = "full"
-    agent_llm_supervisor_temperature: float = 0
-    agent_llm_supervisor_timeout_seconds: int = 20
+    agent_max_supervisor_steps: int = 12
+    agent_max_tool_calls: int = 8
+    agent_max_deep_research_calls: int = 1
+    agent_max_consecutive_failures: int = 3
+    agent_max_context_tokens: int = 16000
+    # Bounds a complete native streaming turn, including answer generation.
+    agent_supervisor_timeout_seconds: int = 60
     agent_langgraph_checkpointer_enabled: bool = True
     # Approval pause always uses LangGraph interrupt() / Command(resume=...)
     # Pending approvals older than this are auto-expired (cannot be approved/rejected).
@@ -198,7 +189,7 @@ class Settings(BaseSettings):
     # plus any orphan checkpoints whose agent_runs row has been deleted.
     agent_checkpoint_cleanup_interval_minutes: int = 60
     agent_checkpoint_cleanup_enabled: bool = True
-    # Checkpointer backend: "postgres" (production) | "redis" (experimental) | "memory" (dev/test only)
+    # Supervisor: "postgres" (durable) | "memory" (dev/test only); Redis is rejected.
     agent_checkpointer_backend: str = "postgres"
     # True → fail fast at startup if durable checkpoint storage is unavailable.
     # Production must be True.  Only set False for local dev with no PostgreSQL.

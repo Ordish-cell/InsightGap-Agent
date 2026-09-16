@@ -1,7 +1,7 @@
 """Test LLM tool selection integration (infer_tool with llm_result parameter)."""
 import pytest
 
-from src.web_app.agent.runtime.intent_schema import LLMToolCall, LLMToolSelectionResult
+from src.web_app.mcp.intent_schema import LLMToolCall, LLMToolSelectionResult
 from src.web_app.mcp.tool_router import _build_email_input, _parse_email_fields, infer_tool
 
 
@@ -225,46 +225,26 @@ class TestMissingFieldsStopFlow:
         assert "body" not in missing_fields
 
 
-class TestMissingFieldsAnswerBuilder:
-    """Test natural language answer generation for missing fields."""
-
-    def test_email_missing_subject_body_answer(self):
-        from src.web_app.agent.runtime.nodes import _build_missing_fields_answer
-        provided = {"to": "test@example.com"}
-        missing = [
-            {"field": "subject", "question": "邮件主题是什么？"},
-            {"field": "body", "question": "邮件正文是什么？"},
-        ]
-        answer = _build_missing_fields_answer("email.send", provided, missing)
-        assert "test@example.com" in answer
-        assert "主题" in answer
-        assert "正文" in answer
-        # Must NOT contain "已执行" or similar execution language
-        assert "已执行" not in answer
-        assert "已发送" not in answer
-
-    def test_email_body_provided_subject_missing_answer(self):
-        from src.web_app.agent.runtime.nodes import _build_missing_fields_answer
-        provided = {"to": "test@example.com", "body": "今晚开会"}
-        missing = [
-            {"field": "subject", "question": "邮件主题是什么？"},
-        ]
-        answer = _build_missing_fields_answer("email.send", provided, missing)
-        assert "test@example.com" in answer
-        assert "今晚开会" in answer
-        assert "主题" in answer
-        # Must NOT mention body as missing
-        assert "正文是什么" not in answer
-
-    def test_file_write_missing_content_answer(self):
-        from src.web_app.agent.runtime.nodes import _build_missing_fields_answer
-        provided = {"path": "hello.txt"}
-        missing = [
-            {"field": "content", "question": "文件内容是什么？"},
-        ]
-        answer = _build_missing_fields_answer("local_file.write", provided, missing)
-        assert "hello.txt" in answer
-        assert "内容" in answer
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name,provided,expected", [
+    ("email.send", {"to": "test@example.com"}, {"subject", "body"}),
+    ("email.send", {"to": "test@example.com", "body": "Meeting tonight"}, {"subject"}),
+    ("local_file.write", {"path": "hello.txt"}, {"content"}),
+])
+async def test_missing_fields_observation_never_executes(monkeypatch, name, provided, expected):
+    from types import SimpleNamespace
+    from src.web_app.agent.runtime.tools import execute_tool
+    from src.web_app.services.mcp_service import mcp_service
+    monkeypatch.setattr(mcp_service, "get_tool", lambda *a: {"enabled": True, "permission_level": "L3", "input_schema": {}})
+    def forbidden(*a, **k):
+        pytest.fail("Incomplete tool must not execute or create an approval")
+    monkeypatch.setattr(mcp_service, "call_tool", forbidden)
+    state = {"run_id": 1, "user_id": 1, "user_input": "requested operation", "current_action": {"action": "tool", "action_id": "missing"}}
+    result = await execute_tool(SimpleNamespace(db=None, checkpoint_enabled=True), state, name, provided)
+    assert result.error == "missing_fields"
+    assert result.status == "empty"
+    assert {m["field"] for m in result.data["missing_fields"]} == expected
+    assert all(m["question"] for m in result.data["missing_fields"])
 
 
 class TestToolNotFoundPrevention:

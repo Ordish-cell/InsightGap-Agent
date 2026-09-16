@@ -127,13 +127,13 @@ def test_why_relevant_is_chinese():
 
 
 def test_benefit_is_chinese():
-    text = _generate_benefit("agent", ["agent", "eval"])
+    text = _generate_benefit("agent", ["agent", "eval"], "Agent evaluation")
     assert text
     assert _contains_chinese(text)
 
 
 def test_information_gap_is_chinese():
-    text = _generate_information_gap("agent", ["agent", "eval"], "arxiv")
+    text = _generate_information_gap("agent", ["agent", "eval"], "arxiv", "Agent evaluation")
     assert text
     assert _contains_chinese(text)
 
@@ -449,7 +449,9 @@ def test_memory_extract_and_save_integration():
 
     # Verify memories are in DB
     all_memories = memory_service.search_memory(user.id, min_importance=0.3, db=db)
-    assert len(all_memories) >= 2
+    assert len(all_memories) == len(saved["working"])
+    assert not saved["semantic"] and not saved["episodic"]
+    assert result["filtered_out"]["semantic"] > 0
 
 
 def test_extract_feed_interests():
@@ -537,6 +539,8 @@ def test_card_to_dict_fixes_old_english_title():
 
     # Simulate an old card with English title
     class OldCard:
+        batch_id = None
+        generated_at = None
         id = 999
         card_type = "insight"
         title = "Skill-RM: Unifying Heterogeneous Evaluation Criteria via Agent Skill"
@@ -611,3 +615,28 @@ def test_different_titles_produce_different_chinese_titles():
         "arxiv", ["rag", "memory"], "rag"
     )
     assert len({t1, t2, t3}) == 3, f"All three titles should differ, got: {t1}, {t2}, {t3}"
+
+
+def test_fallback_copy_stable_across_processes():
+    """Restarting a worker must not change the same card's fallback copy."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    program = """
+import json
+from src.web_app.feed.card_generator import _generate_information_gap, _generate_one_sentence_value
+rows = [(_generate_information_gap('agent', ['memory'], 'arxiv', title, 'far_domain'),
+         _generate_one_sentence_value(title, 'agent', ['memory'], 'arxiv', 'far_domain'))
+        for title in ['Paper A', 'Paper B', 'Paper C', 'Paper D']]
+print(json.dumps(rows))
+"""
+    outputs = []
+    for seed in ("1", "2"):
+        result = subprocess.run([sys.executable, "-c", program], capture_output=True,
+            text=True, timeout=30, env={**os.environ, "PYTHONHASHSEED": seed,
+                "PYTHONPATH": str(Path(__file__).resolve().parents[3])})
+        assert result.returncode == 0, result.stderr
+        outputs.append(result.stdout)
+    assert outputs[0] == outputs[1]

@@ -1,6 +1,10 @@
+import pytest
+
+pytestmark = pytest.mark.usefixtures("scripted_supervisor")
+
 from src.web_app.models.orm import User
 from src.web_app.services.agent_service import build_user_facing_answer, clear_conversation, get_conversation, list_steps, run_agent
-from src.web_app.tests.db_test_utils import make_test_session
+from src.web_app.tests.db_test_utils import make_test_session, configure_test_model
 
 
 def test_agent_run_and_step_record():
@@ -9,6 +13,7 @@ def test_agent_run_and_step_record():
     db.add(user)
     db.commit()
     db.refresh(user)
+    configure_test_model(db, user)
 
     result = run_agent(db, user.id, {"user_input": "帮我总结资料"})
     assert result["run_id"]
@@ -22,11 +27,12 @@ def test_agent_run_persists_conversation_messages_and_answer():
     db.add(user)
     db.commit()
     db.refresh(user)
+    configure_test_model(db, user)
 
     result = run_agent(db, user.id, {"user_input": "hello", "source": "home_chat"})
 
     assert result["conversation_id"]
-    assert result["thread_id"].endswith(result["conversation_id"])
+    assert result["thread_id"] == f"run:{result['run_id']}"
     assert result["answer"]
     assert result["final_response"]["answer"] == result["answer"]
     assert result["assistant_message"]["content"] == result["answer"]
@@ -41,7 +47,7 @@ def test_agent_run_persists_conversation_messages_and_answer():
     assert list_steps(db, user.id, result["run_id"])
 
 
-def test_generic_runtime_completed_is_not_user_answer():
+def test_history_projection_does_not_invent_a_new_answer():
     answer = build_user_facing_answer(
         {
             "user_input": "你好，你是谁？？",
@@ -53,5 +59,4 @@ def test_generic_runtime_completed_is_not_user_answer():
         }
     )
 
-    assert "信息差 Agent OS 助手" in answer
-    assert answer != "Agent runtime completed."
+    assert answer == "Agent runtime completed."

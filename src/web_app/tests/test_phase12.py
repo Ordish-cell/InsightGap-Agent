@@ -38,7 +38,7 @@ def _profile(db, user):
 # ===== UserGrowthService — process_conversation =====
 
 
-def test_process_conversation_extracts_semantic():
+def test_process_conversation_filters_low_confidence_semantic():
     db = make_test_session()
     user = _user(db)
 
@@ -51,7 +51,8 @@ def test_process_conversation_extracts_semantic():
     )
     saved = result.get("saved", {})
     assert "semantic" in saved
-    assert len(saved.get("semantic", [])) >= 1
+    assert saved["semantic"] == []
+    assert result["filtered_out"]["semantic"] > 0
 
 
 def test_process_conversation_casual_chat_no_high_semantic():

@@ -1,5 +1,6 @@
 import asyncio
 from types import SimpleNamespace
+from langchain_core.messages import AIMessageChunk
 
 import httpx
 import pytest
@@ -146,7 +147,7 @@ async def test_boundary_wins_or_cancel_wins_never_both(env, monkeypatch):
     with env.factory() as db:
         context = execution.set(token)
         try:
-            await controlled_node("tool_agent", tool, db)({"run_id": env.run})
+            await controlled_node("tool_runtime", tool, db)({"run_id": env.run})
         finally:
             execution.reset(context)
         with pytest.raises(ChatControlError):
@@ -227,20 +228,22 @@ def test_restart_preserves_partial_and_does_not_touch_approval(env):
 
 @pytest.mark.asyncio
 async def test_intent_call_is_cancellable_before_any_answer(env, monkeypatch):
-    from src.web_app.agent.runtime import intent_llm
+    from src.web_app.agent.runtime import nodes as supervisor_nodes
     entered, closed = asyncio.Event(), asyncio.Event()
     class Model:
-        async def ainvoke(self, prompt):
+        def bind_tools(self, tools):
+            return self
+        async def astream(self, prompt):
             try:
                 entered.set()
                 await asyncio.Event().wait()
+                yield AIMessageChunk(content="")
             finally:
                 closed.set()
-    monkeypatch.setattr(intent_llm, "resolve_model_name", lambda *a, **k: SimpleNamespace(model="fake"))
-    monkeypatch.setattr(intent_llm, "get_chat_model", lambda *a, **k: Model())
+    monkeypatch.setattr(supervisor_nodes, "get_chat_model", lambda *a, **k: Model())
     with env.factory() as db:
-        task = asyncio.create_task(intent_llm.infer_home_intent_async(
-            db, run_id=env.run, thread_id="chat", user_id=env.user, user_input="hello", page_context={}))
+        task = asyncio.create_task(supervisor_nodes.SupervisorNodes(db, {}).model_turn(
+            {"run_id": env.run, "thread_id": "chat", "user_id": env.user, "user_input": "hello", "runtime_budget": {"steps": 1}}))
         await asyncio.wait_for(entered.wait(), 1)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -270,31 +273,30 @@ def test_migration_generates_only_incremental_sql():
 
 @pytest.mark.asyncio
 async def test_real_stream_adapter_closes_on_cancel(env, monkeypatch):
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-    from src.web_app.agent.runtime.node_groups import eval_final_nodes as mod
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
+    from src.web_app.agent.runtime import nodes as mod
     entered, closed = asyncio.Event(), asyncio.Event()
     class Model:
+        def bind_tools(self, tools):
+            return self
         async def astream(self, prompt):
             try:
-                yield SimpleNamespace(content=[{"type": "reasoning", "summary": [{"text": "private reasoning"}]}])
-                yield SimpleNamespace(content=[{"type": "text", "text": "真实流适配器的部分输出"}])
+                yield AIMessageChunk(content=[{"type": "reasoning", "summary": [{"text": "private reasoning"}]}])
+                yield AIMessageChunk(content=[{"type": "text", "text": "真实流适配器的部分输出"}])
                 entered.set()
                 await asyncio.Event().wait()
             finally:
                 closed.set()
-    monkeypatch.setattr(mod, "get_llm_settings", lambda: SimpleNamespace(enabled=True))
-    monkeypatch.setattr(mod, "resolve_model_name", lambda *a: SimpleNamespace(model="fake", tier="test", provider="test"))
     monkeypatch.setattr(mod, "get_chat_model", lambda *a, **k: Model())
     with env.factory() as db:
-        nodes = RuntimeNodes(db, {})
-        monkeypatch.setattr(nodes, "_build_final_answer_prompt", lambda *a: "prompt")
-        task = asyncio.create_task(nodes._generate_final_answer_with_llm({"run_id": env.run, "user_id": env.user}, ""))
+        nodes = SupervisorNodes(db, {})
+        task = asyncio.create_task(nodes.model_turn({**{"run_id": env.run, "user_id": env.user, "user_input": "解释架构"}, "runtime_budget": {"steps": 1}}))
         await entered.wait()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
         assert closed.is_set()
-        deltas = db.execute(select(AgentEvent).where(AgentEvent.run_id == env.run, AgentEvent.event_type == "answer_delta")).scalars().all()
+        deltas = db.execute(select(AgentEvent).where(AgentEvent.run_id == env.run, AgentEvent.event_type == "agent_text_delta")).scalars().all()
         assert [event.payload_json["text"] for event in deltas] == ["真实流适配器的部分输出"]
 
 
@@ -341,8 +343,8 @@ async def test_cancel_immediately_after_start(env, monkeypatch):
 @pytest.mark.asyncio
 async def test_full_chat_service_continuation_and_final_snapshot(env, monkeypatch):
     from src.web_app.agent.llm.context import ModelExecutionContext
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-    from src.web_app.agent.runtime.node_groups import eval_final_nodes as mod
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
+    from src.web_app.agent.runtime import nodes as mod
     from src.web_app.services.agent_service import get_run
     context = ModelExecutionContext(1, 1, 1, "test", "openai_chat_completions", "test", "test")
     monkeypatch.setattr("src.web_app.services.llm_registry_service.resolve_run_model_context", lambda *a: context)
@@ -350,22 +352,25 @@ async def test_full_chat_service_continuation_and_final_snapshot(env, monkeypatc
     entered = asyncio.Event()
     prompts = []
     class Model:
+        def bind_tools(self, tools):
+            return self
         async def astream(self, prompt):
             prompt = "\n".join(message.content for message in prompt)
             prompts.append(prompt)
-            if "Latest user input:" not in prompt:
-                yield SimpleNamespace(content="架构包括聊天与其他模块。")
+            if "unfinished" not in prompt:
+                yield AIMessageChunk(content="架构包括聊天与其他模块。")
                 entered.set()
                 await asyncio.Event().wait()
             else:
                 assert "只讲聊天模块" in prompt and "unfinished" in prompt
-                yield SimpleNamespace(content="聊天模块：接收消息、构建上下文、流式回复。")
-    monkeypatch.setattr(mod, "get_llm_settings", lambda: SimpleNamespace(enabled=True))
-    monkeypatch.setattr(mod, "resolve_model_name", lambda *a: SimpleNamespace(model="test", tier="test", provider="test"))
+                yield AIMessageChunk(content="聊天模块：接收消息、构建上下文、流式回复。")
     monkeypatch.setattr(mod, "get_chat_model", lambda *a, **k: Model())
     async def runtime_run(runtime, state):
-        nodes = RuntimeNodes(runtime.db, runtime.payload)
-        answer = await nodes._generate_final_answer_with_llm(state, "")
+        nodes = SupervisorNodes(runtime.db, runtime.payload)
+        await nodes.permission_guard(state)
+        await nodes.bootstrap_context(state)
+        result = await nodes.supervisor(state)
+        answer = result["final_answer"]
         return {**state, "status": "completed", "final_answer": answer, "final_output": answer,
                 "_answer_delta_emitted": True, "route_plan": {"intent": "chat", "route": ["final_response"]}}
     monkeypatch.setattr("src.web_app.services.agent_service.AgentRuntime.run", runtime_run)

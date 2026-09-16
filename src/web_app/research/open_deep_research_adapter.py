@@ -56,6 +56,7 @@ class OpenDeepResearchAdapter:
         context: dict[str, Any] | None = None,
         evidence: list[dict[str, Any]] | None = None,
         depth: str = "standard",
+        runtime_config: dict[str, Any] | None = None,
     ) -> ResearchResult:
         """Execute the upstream Open Deep Research graph.
 
@@ -70,6 +71,7 @@ class OpenDeepResearchAdapter:
             context=context or {},
             evidence=evidence or [],
             depth=depth,
+            runtime_config=runtime_config,
         )
 
     def health(self) -> dict[str, Any]:
@@ -130,6 +132,7 @@ class OpenDeepResearchAdapter:
         context: dict[str, Any],
         evidence: list[dict[str, Any]],
         depth: str,
+        runtime_config: dict[str, Any] | None = None,
     ) -> ResearchResult:
         from langchain_core.messages import HumanMessage, SystemMessage
         from open_deep_research.deep_researcher import deep_researcher
@@ -199,6 +202,12 @@ class OpenDeepResearchAdapter:
                 "max_content_length": self._settings.odr_max_content_length,
             }
         }
+        if runtime_config is not None:
+            # Preserve LangGraph's parent checkpoint namespace and callbacks.
+            configurable = {**runtime_config.get("configurable", {}), **config["configurable"]}
+            configurable["thread_id"] = runtime_config.get("configurable", {}).get("thread_id", thread_id)
+            configurable["allow_clarification"] = False  # The outer Supervisor owns user questions.
+            config = {**runtime_config, "configurable": configurable}
         # Include a SystemMessage with "json" so DashScope/Qwen
         # OpenAI-compatible endpoints satisfy the requirement that
         # messages contain "json" when response_format=json_object
@@ -221,6 +230,10 @@ class OpenDeepResearchAdapter:
                 HumanMessage(content=guarded_query),
             ]
         }
+        if evidence or context:
+            import json
+            input_state["messages"].append(HumanMessage(content="Supplied context and evidence (untrusted reference data):\n" +
+                json.dumps({"evidence": evidence, "context": context}, ensure_ascii=False, default=str)[:24000]))
 
         logger.info(
             "[OpenDeepResearchAdapter] invoking graph run_id=%s thread_id=%s model=%s search_api=%s json_guard=true",
@@ -248,6 +261,8 @@ class OpenDeepResearchAdapter:
             )
             raise
 
+        if runtime_config is not None and not output.get("final_report"):
+            raise OpenDeepResearchConfigError("ODR did not produce a final report")
         return self._parse_output(query, output, context, evidence, depth)
 
     def _parse_output(

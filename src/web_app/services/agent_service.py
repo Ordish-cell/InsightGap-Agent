@@ -39,15 +39,6 @@ from src.web_app.services.conversation_files import conversation_files
 from src.web_app.services.deletion_guard import guarded_transition, check_conversation, ConversationDeletingError
 
 
-GENERIC_COMPLETED_ANSWERS = {
-    "",
-    "agent completed",
-    "agent completed, but no displayable output was returned",
-    "agent run completed",
-    "agent runtime completed",
-}
-
-
 class PendingApprovalExistsError(ValueError):
     """Raised when a conversation cannot be deleted because it has pending approvals."""
 
@@ -353,14 +344,14 @@ def prepare_agent_run(db: Session, user_id: int, payload: dict[str, Any]) -> dic
     )
     # Stable LangGraph checkpoint thread_id — one per run.
     checkpoint_thread_id = f"run:{run.id}"
-    run_repo.update(run, graph_state={"source": payload.get("source", "agent_page"), "page_context": page_context, "thread_id": checkpoint_thread_id, "conversation_thread_id": thread_id, "conversation_id": conversation_id, "model_config_id": model_context.model_config_id, "model_context": model_context.public_dict()})
+    run_repo.update(run, graph_state={"runtime_version": 2, "loop_protocol_version": 1, "source": payload.get("source", "agent_page"), "page_context": page_context, "thread_id": checkpoint_thread_id, "conversation_thread_id": thread_id, "conversation_id": conversation_id, "model_config_id": model_context.model_config_id, "model_context": model_context.public_dict()})
     # Load and process attachments
     attachment_ids: list[int] = [int(aid) for aid in (payload.get("attachment_ids") or []) if aid]
     import logging
     _agent_logger = logging.getLogger(__name__)
     _agent_logger.info("agent attachment_ids=%s", attachment_ids)
     attachments_data = load_chat_attachments(db, user_id, attachment_ids) if attachment_ids else []
-    if attachments_data and (not settings.chat_document_path_enabled or any(a.get("kind") != "document" for a in attachments_data)):
+    if attachments_data and any(a.get("kind") != "document" for a in attachments_data):
         run.chat_control_phase = "disabled"
     _agent_logger.info("loaded chat attachments count=%s kinds=%s", len(attachments_data), [a.get("kind") for a in attachments_data])
     attachment_snapshot = _attachment_snapshot(attachments_data)
@@ -585,62 +576,16 @@ async def execute_prepared_run(
         await asyncio.sleep(0)  # yield so consumer drains queue before sentinel arrives
         return response
 
-    # ── Pre-flight: check document attachments status before expensive Agent run ──
-    document_attachments_for_guard = [a for a in attachments_data if a.get("kind") == "document"]
-    if document_attachments_for_guard and not settings.chat_document_path_enabled:
-        from src.web_app.db.repositories.document_repository import DocumentRepository as _DocRepo
-        _doc_repo = _DocRepo(db)
-        _failed_msgs: list[str] = []
-        _pending_msgs: list[str] = []
-        _has_ready = False
-        for a in document_attachments_for_guard:
-            did = a["document_id"]
-            doc = _doc_repo.get_by_id_for_user(user_id, did)
-            if doc is None:
-                _failed_msgs.append(f"{a['filename']}: document not found")
-                continue
-            db_status = doc.status
-            meta = doc.metadata_json or {}
-            ingest_status = meta.get("ingest_status") or db_status
-            if db_status == "failed" or ingest_status == "failed":
-                _err = meta.get("error") or meta.get("error_message") or "unknown error"
-                _failed_msgs.append(f"{a['filename']}: {_err}")
-            elif ingest_status in ("pending", "processing", "uploaded"):
-                _pending_msgs.append(a["filename"])
-            else:
-                _has_ready = True
-        if _failed_msgs and not _has_ready:
-            fast_fail_answer = "文档解析失败：" + "；".join(_failed_msgs)
-            message_repo.update(assistant_message, content=fast_fail_answer, status="completed", elapsed_ms=0)
-            await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, fast_fail_answer)
-            run_repo.update(run, status="completed", result_summary=fast_fail_answer, final_answer=fast_fail_answer,
-                           elapsed_ms=0, completed_at=datetime.now())
-            conversation_repo.touch(conversation, preview=fast_fail_answer, last_run_id=run.id)
-            publish_event(db, stream_queue, run.id, "run_completed", {"status": "completed", "answer": fast_fail_answer}, user_id=user_id, thread_id=thread_id)
-            return _run_response(run.id, {"status": "completed", "answer": fast_fail_answer, "final_output": fast_fail_answer},
-                                conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=0)
-        if _pending_msgs and not _has_ready:
-            pending_answer = f"文档正在解析入库中，请稍后再问。待处理：{', '.join(_pending_msgs)}"
-            message_repo.update(assistant_message, content=pending_answer, status="completed", elapsed_ms=0)
-            await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, pending_answer)
-            run_repo.update(run, status="completed", result_summary=pending_answer, final_answer=pending_answer,
-                           elapsed_ms=0, completed_at=datetime.now())
-            conversation_repo.touch(conversation, preview=pending_answer, last_run_id=run.id)
-            publish_event(db, stream_queue, run.id, "run_completed", {"status": "completed", "answer": pending_answer}, user_id=user_id, thread_id=thread_id)
-            return _run_response(run.id, {"status": "completed", "answer": pending_answer, "final_output": pending_answer},
-                                conversation=conversation, user_message=user_message, assistant_message=assistant_message, elapsed_ms=0)
-
-    # ── Per-conversation lock: same conversation serialises, different ones run concurrently ──
     lock = await conversation_lock_manager.acquire(conversation_id)
     await lock.acquire()
     model_context_token = activate_model_context(model_context)
     try:
         try:
             # Build attachment context and inject into payload
-            deferred_documents = settings.chat_document_path_enabled and bool(attachments_data) and all(a.get("kind") == "document" for a in attachments_data)
+            deferred_documents = bool(attachments_data) and all(a.get("kind") == "document" for a in attachments_data)
             attachment_context = "" if deferred_documents else await _build_attachment_context(attachments_data, user_input, db, user_id)
             _agent_logger.info("final attachment_context length=%s has_context=%s", len(attachment_context or ""), bool(attachment_context))
-            enriched_payload = dict(payload)
+            enriched_payload = {**payload, "runtime_version": (run.graph_state or {}).get("runtime_version", 2)}
             if attachment_context:
                 enriched_payload["attachment_context"] = attachment_context
                 page_context = dict(page_context)
@@ -728,6 +673,10 @@ async def execute_prepared_run(
         # LangGraph filters undeclared state keys; retain the frozen model choice
         # in the durable run snapshot so a completed run can also be continued.
         state["model_context"] = model_context.public_dict()
+        state["runtime_version"] = 2
+        state["loop_protocol_version"] = 1
+        if state.get("status") == "failed" and not (state.get("final_answer") or state.get("final_output")):
+            state["final_output"] = "本次运行未完成，已取得的结果保留在任务记录中。"
         elapsed_ms = max(0, int((datetime.now() - started_at).total_seconds() * 1000))
         answer = build_user_facing_answer(state)
         state["answer"] = answer
@@ -783,7 +732,6 @@ async def execute_prepared_run(
                 "pending_tool_name": state.get("pending_tool_name"),
                 "pending_tool_args": state.get("pending_tool_args"),
                 "pending_tool_call_id": state.get("pending_tool_call_id"),
-                "route_plan_snapshot": state.get("route_plan_snapshot"),
                 "resume_token": state.get("resume_token"),
                 "original_status": "waiting_approval",
                 "approval_pause_mode": state.get("approval_pause_mode", "interrupt"),
@@ -971,6 +919,10 @@ def _emit_runtime_latency_trace_event(
     publish_event(db, stream_queue, run_id, "runtime_latency_trace", payload, user_id=user_id, thread_id=thread_id)
 
 
+from src.web_app.agent.runtime.resume_lock import exclusive_resume
+
+
+@exclusive_resume
 async def resume_run_after_approval(
     db: Session,
     user_id: int,
@@ -1011,6 +963,10 @@ async def resume_run_after_approval(
         raise ValueError("APPROVAL_CONTEXT_GONE: 会话已被删除。")
 
     graph_state = dict(run.graph_state or {})
+    if graph_state.get("runtime_version") != 2:
+        raise ValueError("RUNTIME_VERSION_UNSUPPORTED: 旧运行不能恢复，请发起新任务。")
+    if graph_state.get("loop_protocol_version") != 1:
+        raise ValueError("LOOP_PROTOCOL_UNSUPPORTED: checkpoint predates native tool calling")
     logger.info(
         "[APPROVAL_FLOW] resume_run_after_approval start "
         "run_id=%s pending_tcid=%s pending_aid=%s status=%s",
@@ -1176,29 +1132,6 @@ async def resume_run_after_approval(
     )
 
 
-    if state.get("error") == "approval_required" or state.get("status") == "waiting_approval" or state.get("approval_required"):
-        _log.warning(
-            "[approval_resume_debug] SAFETY_CLEANUP forcing cleanup of stale fields "
-            "error=%s status=%s approval_required=%s route=%s",
-            state.get("error"), state.get("status"), state.get("approval_required"),
-            state.get("route"),
-        )
-        state["error"] = ""
-        state["status"] = "completed"
-        state["approval_required"] = False
-        state["route"] = ""
-        state["approval_payload"] = None
-        tc = state.get("tool_call") or {}
-        if isinstance(tc, dict):
-            tc["error"] = ""
-            state["tool_call"] = tc
-
-    return state
-
-
-# ── Resume handler: interrupt-based (new) ─────────────────────────────
-
-
 async def _resume_interrupt_approval(
     *,
     db: Session,
@@ -1216,9 +1149,9 @@ async def _resume_interrupt_approval(
 ) -> dict[str, Any]:
     """NEW: Resume from LangGraph interrupt() checkpoint via Command(resume=...).
 
-    Does NOT re-run the graph from entry_point — LangGraph continues
-    from the checkpoint saved at the interrupt() call site inside
-    tool_agent.  No stale-state cleanup needed (no graph replay).
+    LangGraph re-enters the interrupted node from its beginning. Its
+    preparation and execution must therefore be replay-safe; completed
+    predecessor nodes are restored from the checkpoint.
     """
     import logging
     _log = logging.getLogger(__name__)
@@ -1231,6 +1164,7 @@ async def _resume_interrupt_approval(
     if approval_status == "approved":
         resume_payload: dict[str, Any] = {
             "action": "approved",
+            "approval_id": str(pending_approval_id) if pending_approval_id else "",
             "tool_call_id": pending_tool_call_id,
             "tool_result": tool_result if tool_succeeded else {"success": False, "error": "tool_execution_failed"},
         }
@@ -1252,7 +1186,8 @@ async def _resume_interrupt_approval(
         from src.web_app.agent.llm.context import use_model_context
         from src.web_app.services.llm_registry_service import resolve_run_model_context
         model_context = resolve_run_model_context(db, user_id, graph_state.get("model_context") or {})
-        runtime = AgentRuntime(db, {"user_input": user_input, "source": "resume_after_approval", "model_config_id": model_context.model_config_id}, stream_queue)
+        runtime = AgentRuntime(db, {"user_input": user_input, "source": "resume_after_approval", "model_config_id": model_context.model_config_id,
+                                   "runtime_version": 2}, stream_queue)
         with use_model_context(model_context):
             state = await runtime.resume_from_interrupt(resume_payload, thread_id)
     except Exception as exc:
@@ -1302,23 +1237,7 @@ async def _finalize_resume(
 
     elapsed_ms = max(0, int((datetime.now() - started_at).total_seconds() * 1000))
     answer = build_user_facing_answer(state)
-
-    # Stale-approval guard
-    if is_approval_placeholder(answer) or "Run failed: approval_required" in (answer or ""):
-        _log.info(
-            "[APPROVAL_FLOW] _finalize_resume regenerating stale answer "
-            "run_id=%s pause_mode=%s", run_id, pause_mode,
-        )
-        tr = state.get("tool_result") or {}
-        tn = pending_tool_name or (tr.get("tool_name") or "")
-        te = state.get("_tool_error") or ""
-        if tr.get("success") is True:
-            answer = f"已获得批准并执行 {tn or '工具'}。操作已完成。"
-        else:
-            answer = f"已获得批准，但 {tn or '工具'} 执行失败：{te or '未知错误'}。没有确认操作成功。"
-        state["answer"] = answer
-        state["final_answer"] = answer
-        state["final_output"] = answer
+    paused = state.get("status") == "waiting_approval"
 
     _log.info(
         "[approval_resume_debug] stage=before_persist run_id=%s "
@@ -1343,14 +1262,12 @@ async def _finalize_resume(
         "run_id": run_id, "thread_id": thread_id,
         "conversation_id": conversation_id,
         "status": state.get("status", "completed"),
-        "phase": "completed" if state.get("status") != "failed" else "failed",
+        "phase": "waiting_approval" if paused else "completed" if state.get("status") != "failed" else "failed",
         "elapsed_ms": elapsed_ms,
     })
     state["langgraphstatus"] = langgraphstatus
 
     final_status = state.get("status", "completed")
-    if final_status in ("waiting_approval", "resuming"):
-        final_status = "completed"
     state["status"] = final_status
 
     run_repo.update(
@@ -1363,7 +1280,7 @@ async def _finalize_resume(
         langgraphstatus_json=_json_safe(langgraphstatus),
         elapsed_ms=elapsed_ms,
         error_message=state.get("error", ""),
-        completed_at=datetime.now(),
+        completed_at=None if paused else datetime.now(),
     )
 
     # Find and update assistant message
@@ -1396,10 +1313,14 @@ async def _finalize_resume(
     if conversation:
         conversation_repo.touch(conversation, preview=answer, last_run_id=run_id)
     # Stream answer + run_completed
-    already_streamed = state.get("_answer_delta_emitted", False)
-    await _stream_answer_deltas(db, stream_queue, run_id, thread_id, user_id, answer, already_streamed=already_streamed)
+    already_streamed = state.get("_answer_completed_emitted", False) or state.get("_answer_delta_emitted", False)
+    if not paused:
+        await _stream_answer_deltas(db, stream_queue, run_id, thread_id, user_id, answer, already_streamed=already_streamed)
     _emit_runtime_latency_trace_event(db, stream_queue, run_id, thread_id, user_id, state)
-    publish_event(db, stream_queue, run_id, "run_completed", {
+    if paused:
+        publish_event(db, stream_queue, run_id, "approval_required", state.get("approval_payload") or {},
+                      user_id=user_id, thread_id=thread_id)
+    publish_event(db, stream_queue, run_id, "run_paused" if paused else "run_failed" if final_status == "failed" else "run_completed", {
         "status": final_status, "answer": answer, "run_id": run_id,
     }, user_id=user_id, thread_id=thread_id)
 
@@ -1454,7 +1375,18 @@ def _run_controls(db, user_id, run_id):
 def list_steps(db: Session, user_id: int, run_id: int) -> list[dict[str, Any]]:
     if not AgentRunRepository(db).get_by_user(user_id, run_id):
         raise ValueError("AgentRun not found")
-    return [{"id": step.id, "node_name": step.node_name, "status": step.status, "input": step.input, "output": step.output} for step in AgentStepRepository(db).list_by_run(run_id)]
+    steps = [{"id": step.id, "node_name": step.node_name, "status": step.status, "input": step.input, "output": step.output} for step in AgentStepRepository(db).list_by_run(run_id)]
+    if steps:
+        return steps
+    # V2 actions are durable ledger entries; keep the historical steps API readable.
+    from sqlalchemy import select
+    from src.web_app.models.orm import AgentEvent
+    rows = db.execute(select(AgentEvent).where(
+        AgentEvent.run_id == run_id, AgentEvent.user_id == user_id,
+        AgentEvent.event_type.in_(("supervisor_action", "capability_result")),
+    ).order_by(AgentEvent.id)).scalars().all()
+    return [{"id": row.id, "node_name": "supervisor", "status": (row.payload_json or {}).get("status", "completed"),
+             "input": {}, "output": row.payload_json or {}} for row in rows]
 
 
 def replay_events(
@@ -1710,114 +1642,16 @@ def _format_chat_messages_for_context(messages: list[Any]) -> str:
 
 
 def build_user_facing_answer(state: dict[str, Any]) -> str:
-    import logging
-    _log = logging.getLogger(__name__)
-
-    final_payload = state.get("final_payload") or {}
-    candidates = [
-        state.get("answer"),
-        final_payload.get("answer") if isinstance(final_payload, dict) else "",
-        state.get("final_answer"),
-        state.get("final_output"),
-    ]
-    for candidate in candidates:
-        text = extract_user_visible_answer(candidate)
-        if text and not _is_generic_completed_answer(text) and not is_approval_placeholder(text):
+    """Project a persisted answer without executing historical business policy."""
+    for value in (state.get("final_answer"), state.get("final_output"),
+                  (state.get("final_payload") or {}).get("answer"), state.get("answer")):
+        text = extract_user_visible_answer(value)
+        if text:
             return text
+    return ""
 
-    status = state.get("status", "completed")
-    # Check resume context
-    resume_token = state.get("resume_token") or (state.get("pending_approval_id") and f"approval:{state.get('pending_approval_id')}")
-    is_resume_context = bool(resume_token) or state.get("approval_required") is False
-    _tool_error = state.get("_tool_error") or (state.get("tool_result") or {}).get("error")
-
-    raw_errors = state.get("errors", [])
-    raw_error = state.get("error", "")
-    errors = [str(item) for item in raw_errors if item] or ([str(raw_error)] if raw_error else [])
-
-    # Guard: "approval_required" is NEVER a valid failure reason after resume
-    errors = [e for e in errors if "approval_required" not in str(e).lower()]
-
-    if _tool_error and _tool_error not in errors:
-        errors.insert(0, _tool_error)
-
-    _log.info(
-        "[approval_resume_debug] build_user_facing_answer "
-        "candidates_found=%s status=%s raw_error=%s raw_errors_count=%s "
-        "errors_filtered=%s is_resume_context=%s _tool_error=%s",
-        any(extract_user_visible_answer(c) for c in candidates if c),
-        status, raw_error, len(raw_errors), errors,
-        is_resume_context, _tool_error,
-    )
-
-    if status == "failed" or errors:
-        reason = errors[0] if errors else "runtime returned a failure state"
-        return f"Run failed: {reason}. You can retry or ask me to inspect this Agent Run."
-
-    route_plan = state.get("route_plan") or {}
-    home_intent = state.get("home_intent") or {}
-    intent = str(route_plan.get("intent") or home_intent.get("intent") or state.get("route") or "chat")
-    risk_level = str(route_plan.get("risk_level") or home_intent.get("risk_level") or "L0")
-    # On resume, NEVER return the approval placeholder — the approval was already decided
-    if not is_resume_context and (status == "waiting_approval" or route_plan.get("needs_approval") or home_intent.get("needs_approval")):
-        return f"Approval required: this is a {risk_level} risk action and must be approved before execution. I have not performed any external write or irreversible operation."
-
-    # \u2500\u2500 Memory write: confirm the save \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
-    mem_result = state.get("memory_write_result") or {}
-    if mem_result.get("success"):
-        content = mem_result.get("content", "")
-        return f"\u5df2\u8bb0\u4f4f\uff1a{content}"
-
-    # \u2500\u2500 HARD DEFENSE: resume context must never return approval_required \u2500\u2500
-    if is_resume_context:
-        rc = state.get("_resume_context") or {}
-        tool_name = rc.get("tool_name") or state.get("pending_tool_name") or ""
-        tool_result = state.get("tool_result") or {}
-        tool_error = state.get("_tool_error") or state.get("error") or ""
-        tool_success = tool_result.get("success") is True
-
-        logger.debug(
-            "[APPROVAL_RESUME_DEBUG] build_answer_fallback is_resume_context=True "
-            "tool_name=%s tool_success=%s tool_error=%s",
-            tool_name,
-            tool_success,
-            tool_error[:100],
-        )
-
-        if tool_success and tool_result:
-            if tool_name == "email.send":
-                to = tool_result.get("to") or ""
-                subject = tool_result.get("subject") or ""
-                body_text = tool_result.get("body_preview") or tool_result.get("body") or ""
-                body_display = body_text if body_text else "\u672a\u63d0\u4f9b"
-                return (f"\u5df2\u83b7\u5f97\u6279\u51c6\u5e76\u6267\u884c email.send\u3002"
-                        f"\u5f53\u524d EMAIL_PROVIDER=mock\uff0c\u90ae\u4ef6\u6ca1\u6709\u771f\u5b9e\u53d1\u9001\uff0c\u4f46\u6a21\u62df\u53d1\u9001\u5df2\u5b8c\u6210\u3002"
-                        f"\u6536\u4ef6\u4eba\uff1a{to or '\u672a\u6307\u5b9a'}\uff0c"
-                        f"\u4e3b\u9898\uff1a{subject or '\u672a\u6307\u5b9a'}\uff0c"
-                        f"\u6b63\u6587\uff1a{body_display}\u3002")
-            return f"\u5df2\u83b7\u5f97\u6279\u51c6\u5e76\u6267\u884c {tool_name or '\u5de5\u5177'}\u3002\u5de5\u5177\u6267\u884c\u5b8c\u6210\u3002"
-
-        if tool_error:
-            safe_err = str(tool_error)[:200]
-            return f"\u5df2\u83b7\u5f97\u6279\u51c6\uff0c\u4f46 {tool_name or '\u5de5\u5177'} \u6267\u884c\u5931\u8d25\uff1a{safe_err}\u3002\u6ca1\u6709\u786e\u8ba4\u64cd\u4f5c\u6210\u529f\u3002"
-
-        return "\u5df2\u83b7\u5f97\u6279\u51c6\u5e76\u7ee7\u7eed\u6267\u884c\uff0c\u4f46\u7cfb\u7edf\u6ca1\u6709\u8fd4\u56de\u660e\u786e\u7684\u5de5\u5177\u7ed3\u679c\u3002\u6ca1\u6709\u786e\u8ba4\u64cd\u4f5c\u6210\u529f\u3002"
-
-    user_input = str(state.get("user_input") or "").strip()
-    if _looks_like_greeting(user_input):
-        return "\u4f60\u597d\uff0c\u6211\u662f\u4fe1\u606f\u5dee Agent OS \u52a9\u624b\u3002\u4f60\u53ef\u4ee5\u8ba9\u6211\u7814\u7a76\u4fe1\u606f\u3001\u751f\u6210\u6210\u679c\u6216\u6c89\u6dc0 Skill\u3002"
-    if intent == "research":
-        return "\u6211\u5df2\u8bc6\u522b\u8fd9\u662f\u7814\u7a76\u4efb\u52a1\uff0c\u5e76\u5b8c\u6210\u4e86\u521d\u6b65\u89c4\u5212\u3002\u5f53\u524d\u6ca1\u6709\u53ef\u5c55\u793a\u7684\u5b8c\u6574\u7814\u7a76\u7ed3\u679c\u3002"
-    if intent == "artifact":
-        return "\u6211\u5df2\u8bc6\u522b\u8fd9\u662f\u6210\u679c\u751f\u6210\u4efb\u52a1\uff0c\u4f46\u5f53\u524d\u8fd8\u6ca1\u6709\u751f\u6210\u5b9e\u9645 Artifact\u3002"
-    if intent == "tool":
-        return "\u6211\u5df2\u8bc6\u522b\u8fd9\u662f\u5de5\u5177\u76f8\u5173\u4efb\u52a1\u3002\u5982\u679c\u6d89\u53ca\u5916\u90e8\u5199\u5165\u6216\u9ad8\u98ce\u9669\u52a8\u4f5c\uff0c\u4f1a\u5148\u8fdb\u5165\u5ba1\u6279\u72b6\u6001\u3002"
-
-    return "\u6211\u5df2\u7ecf\u5b8c\u6210\u57fa\u7840\u5224\u65ad\u3002\u4f60\u53ef\u4ee5\u7ee7\u7eed\u8865\u5145\u76ee\u6807\uff0c\u6211\u4f1a\u6cbf\u7528\u5f53\u524d\u4f1a\u8bdd\u4e0a\u4e0b\u6587\u3002"
 
 async def _stream_answer_deltas(db: Session, queue: asyncio.Queue | None, run_id: int, thread_id: str, user_id: int, answer: str, already_streamed: bool = False) -> None:
-    if not queue:
-        return
     # If the runtime already streamed answer_delta + answer_completed during
     # LLM generation, skip the fallback entirely — no duplicate events.
     if already_streamed:
@@ -1875,6 +1709,8 @@ def _run_response(
 ) -> dict[str, Any]:
     route_plan = state.get("route_plan") or {}
     answer = build_user_facing_answer(state)
+    route = state.get("route") or "chat"
+    risk_level = (state.get("approval_payload") or {}).get("risk_level") or state.get("risk_level") or route_plan.get("risk_level", "L0")
     final_response = dict(state.get("final_payload") or {})
     final_response["answer"] = answer
     final_response.setdefault("thinking_summary", visible_thought_texts(state))
@@ -1887,10 +1723,10 @@ def _run_response(
         "status": state.get("status", "completed"),
         "elapsed_ms": elapsed_ms,
         "answer": answer,
-        "route": state.get("route"),
-        "intent": route_plan.get("intent", state.get("route")),
+        "route": route,
+        "intent": route_plan.get("intent", route),
         "route_plan": route_plan.get("route", []),
-        "risk_level": route_plan.get("risk_level", "L0"),
+        "risk_level": str(risk_level).split("_")[0],
         "final_output": answer,
         "final_answer": answer,
         "final_response": final_response,
@@ -1909,7 +1745,7 @@ def _run_response(
         "skill_drafts": state.get("skill_drafts", []),
         "matched_skill": state.get("matched_skill"),
         "candidate_skills": state.get("candidate_skills", []),
-        "created_skill_draft": state.get("created_skill_draft"),
+        "created_skill_draft": state.get("created_skill_draft") or next(iter(state.get("skill_drafts") or []), None),
         "reusable_score": (state.get("skill_reuse") or {}).get("reusable_score", 0),
         "tool_call": state.get("tool_call", {}),
         "tool_result": state.get("tool_result"),
@@ -1972,18 +1808,6 @@ def _short_title(value: str) -> str:
     if not title:
         return "New Agent Run"
     return title[:42]
-
-
-def _looks_like_greeting(value: str) -> bool:
-    lowered = value.lower()
-    return lowered in {"hi", "hello", "hey"} or any(token in value for token in ("\u4f60\u597d", "\u60a8\u597d", "\u4f60\u662f\u8c01", "\u4f60\u662f\u8ab0"))
-
-
-def _is_generic_completed_answer(value: str) -> bool:
-    normalized = value.strip().rstrip(".\u3002").lower()
-    if normalized in GENERIC_COMPLETED_ANSWERS:
-        return True
-    return normalized.startswith("\u5df2\u5b8c\u6210\u672c\u6b21 agent run") or normalized.startswith("\u5df2\u5b8c\u6210\u672c\u6b21 agent")
 
 
 _APPROVAL_PLACEHOLDER_PREFIXES = (

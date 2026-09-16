@@ -88,6 +88,7 @@ def request_control(db, user_id, run_id, kind, client_command_id, text=""):
             successor.graph_state = {"thread_id": f"run:{successor.id}", "conversation_id": run.conversation_id,
                                      "conversation_thread_id": run.thread_id, "source": "chat_steer",
                                      "model_context": previous.get("model_context", {}),
+                                     "runtime_version": previous.get("runtime_version", 2),
                                      "model_config_id": previous.get("model_config_id"), "page_context": {}}
             for role, content, status in (("user", text, "completed"), ("assistant", "", "queued")):
                 db.add(AgentChatMessage(message_id=str(uuid4()), user_id=user_id, conversation_id=run.conversation_id,

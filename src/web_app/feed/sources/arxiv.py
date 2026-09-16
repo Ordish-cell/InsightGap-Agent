@@ -45,9 +45,9 @@ class ArxivSource(FeedSource):
         async with httpx.AsyncClient(timeout=8) as client:
             response = await client.get("https://export.arxiv.org/api/query", params={"search_query": query, "start": 0, "max_results": self.max_items, "sortBy": "submittedDate", "sortOrder": "descending"})
             response.raise_for_status()
-        return self._parse(response.text)
+        return self._parse(response.text, query)
 
-    def _parse(self, xml_text: str) -> list[RawFeedItem]:
+    def _parse(self, xml_text: str, query: str = "") -> list[RawFeedItem]:
         ns = {"atom": "http://www.w3.org/2005/Atom"}
         root = ET.fromstring(xml_text)
         items = []

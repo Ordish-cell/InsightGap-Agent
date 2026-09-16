@@ -1,35 +1,12 @@
-"""Supervisor Agent Runtime - LangGraph multi-agent orchestration.
-
-Routes user requests through a Planner, then executes the resulting
-RoutePlan through conditional agent nodes (research, RAG, artifact,
-MCP tool, memory, skill), concluding with an evaluator and final_response.
-
-When a tool requires approval (L3/L4), the graph performs a true interrupt:
-tool_agent sets status=waiting_approval, the dispatcher routes to END,
-and the graph terminates cleanly.  The agent_service layer detects the
-pause, emits approval events, and later resumes the run by re-invoking
-the graph with the pre-executed tool result injected.
-"""
+"""Single Supervisor runtime with versioned durable checkpoint validation."""
 
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from src.web_app.agent.runtime.checkpointers import build_checkpointer
-from src.web_app.agent.runtime.dispatch import (
-    END_SENTINEL as _END_SENTINEL,
-    after_permission,
-    dispatch_after_evaluator,
-    dispatch_next_route_node,
-    map_route_to_node,
-    record_supervisor_dispatch_audit,
-)
-from src.web_app.agent.runtime.fallback import run_fallback
-from src.web_app.agent.runtime.graph_builder import build_agent_runtime_graph
 from src.web_app.agent.runtime.graph_config import build_langgraph_invoke_config
-from src.web_app.agent.runtime.graph_registry import build_fallback_nodes
 from src.web_app.agent.runtime.langgraph_status import clear_status_stream_queue, set_status_stream_queue
-from src.web_app.agent.runtime.nodes import RuntimeNodes
 from src.web_app.agent.runtime.state import AgentRuntimeState
 from src.web_app.core.config import settings
 
@@ -39,13 +16,21 @@ class AgentRuntime:
         self.db = db
         self.payload = payload
         self._stream_queue = stream_queue
-        self.nodes = RuntimeNodes(db, payload, stream_queue)
+        self._checkpointer = None
+        if payload.get("runtime_version", 2) != 2:
+            raise ValueError("RUNTIME_VERSION_UNSUPPORTED: only Supervisor runtime 2 can execute")
+        from src.web_app.agent.runtime.nodes import SupervisorNodes
+        self.nodes = SupervisorNodes(db, payload, stream_queue)
 
     async def run(self, state: AgentRuntimeState) -> AgentRuntimeState:
         import logging
         _run_log = logging.getLogger(__name__)
         # Remove non-serializable objects before LangGraph sees the state.
         state.pop("_stream_queue", None)
+        if state.get("runtime_version", 2) != 2:
+            raise ValueError("RUNTIME_VERSION_UNSUPPORTED: only Supervisor runtime 2 can execute")
+        state["runtime_version"] = 2
+        state["loop_protocol_version"] = 1
         state.setdefault("interaction_version", 2)
         # Set module-level queue so append_status_step can push SSE events in real-time.
         set_status_stream_queue(self._stream_queue)
@@ -57,12 +42,13 @@ class AgentRuntime:
                 cfg.get("configurable", {}).get("thread_id"), state.get("run_id"),
             )
             if graph:
-                return await graph.ainvoke(state, config=cfg)
-            from src.web_app.agent.runtime.chat_control import disable_control
-            disable_control(self.db, state["run_id"])
-            return await run_fallback(self._fallback_nodes(), state)
+                cfg["recursion_limit"] = max(50, settings.agent_max_supervisor_steps * 3 + 10)
+                result = await graph.ainvoke(state, config=cfg)
+                return self._project_interrupt(result)
+            raise RuntimeError("LangGraph is required for the Supervisor runtime")
         finally:
             clear_status_stream_queue()
+            await self._close_checkpointer()
 
     async def resume_from_interrupt(
         self,
@@ -72,8 +58,9 @@ class AgentRuntime:
         """Resume a graph that paused via LangGraph interrupt().
 
         Uses Command(resume=resume_payload) to continue from the
-        checkpoint saved at the interrupt() call site.  Does NOT
-        re-run the graph from entry_point.
+        saved checkpoint. The interrupted node starts again from its beginning;
+        operations preceding interrupt must therefore be replay-safe. Earlier
+        completed graph nodes do not restart from the graph entry point.
 
         Args:
             resume_payload: The value that interrupt() will return
@@ -111,12 +98,22 @@ class AgentRuntime:
             thread_id, action, tool_call_id,
         )
 
-        graph = await self._build_langgraph()
-        if not graph:
-            raise RuntimeError("LangGraph is not available")
-
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
-        result = await graph.ainvoke(Command(resume=resume_payload), config=config)
+        config["recursion_limit"] = max(50, settings.agent_max_supervisor_steps * 3 + 10)
+        set_status_stream_queue(self._stream_queue)
+        try:
+            graph = await self._build_langgraph()
+            if not graph:
+                raise RuntimeError("LangGraph is not available")
+            snapshot = await graph.aget_state(config)
+            if not snapshot or (snapshot.values or {}).get("runtime_version") != 2:
+                raise ValueError("RUNTIME_VERSION_UNSUPPORTED: checkpoint is missing or belongs to the retired runtime")
+            if snapshot.values.get("loop_protocol_version") != 1:
+                raise ValueError("LOOP_PROTOCOL_UNSUPPORTED: checkpoint predates the native Supervisor loop")
+            result = self._project_interrupt(await graph.ainvoke(Command(resume=resume_payload), config=config))
+        finally:
+            clear_status_stream_queue()
+            await self._close_checkpointer()
         _log.info(
             "[approval_interrupt_resume] completed "
             "thread_id=%s action=%s status=%s",
@@ -124,8 +121,30 @@ class AgentRuntime:
         )
         return result
 
-    def _fallback_nodes(self):
-        return build_fallback_nodes(self.nodes)
+    async def _close_checkpointer(self):
+        saver, self._checkpointer = self._checkpointer, None
+        ctx = getattr(saver, "_checkpointer_ctx", None)
+        if ctx is not None:
+            try:
+                if hasattr(ctx, "__aexit__"):
+                    await ctx.__aexit__(None, None, None)
+                else:
+                    ctx.__exit__(None, None, None)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception("Checkpoint connection cleanup failed")
+
+    def _project_interrupt(self, state):
+        interrupts = state.get("__interrupt__")
+        if interrupts:
+            payload = interrupts[0].value
+            state.update(status="waiting_approval", approval_required=True, approval_pause_mode="interrupt",
+                tool_call={"id": payload["tool_call_id"], "tool_name": payload["tool_name"], "status": "waiting_approval"},
+                pending_approval_id=str(payload["approval_id"]), pending_tool_call_id=payload["tool_call_id"],
+                pending_tool_name=payload["tool_name"], approval_payload=payload,
+                pending_tool_args=(state.get("current_action", {}).get("arguments", {}).get("input", {})))
+        state.pop("__interrupt__", None)
+        return state
 
     async def _build_langgraph(self):
         import logging
@@ -133,6 +152,11 @@ class AgentRuntime:
         checkpointer = None
         if getattr(settings, "agent_langgraph_checkpointer_enabled", False):
             backend = getattr(settings, "agent_checkpointer_backend", "postgres")
+            if backend == "redis":
+                raise RuntimeError(
+                    "Supervisor V2 does not support the current Redis checkpoint adapter; "
+                    "use AGENT_CHECKPOINTER_BACKEND=postgres for durable approval recovery."
+                )
             require_durable = getattr(settings, "agent_checkpointer_require_durable", False)
             cp_conn_string = getattr(settings, "agent_checkpointer_database_url", "") or getattr(settings, "database_url", "").replace("+psycopg2", "")
 
@@ -173,38 +197,6 @@ class AgentRuntime:
             _build_log.info(
                 "[CHECKPOINTER] checkpointer disabled (agent_langgraph_checkpointer_enabled=False)"
             )
-        return build_agent_runtime_graph(
-            self.nodes,
-            after_permission=self._after_permission,
-            dispatch_next_route_node=self._dispatch_next_route_node,
-            dispatch_after_evaluator=self._dispatch_after_evaluator,
-            checkpointer=checkpointer,
-        )
-
-    # Conditional routing.
-
-    def _after_permission(self, state: AgentRuntimeState) -> str:
-        return after_permission(state)
-
-    def _dispatch_next_route_node(self, state: AgentRuntimeState) -> str:
-        """Pop the next node from route_plan["route"] and return its name.
-
-        When the run is waiting for approval, the graph performs a true
-        interrupt: we return __end__ which maps to END, terminating the
-        graph immediately.  No evaluator, no final_response - the
-        agent_service layer detects the paused state and emits
-        approval_required / run_paused.
-
-        Falls back to 'final_response' when all route nodes are completed.
-        """
-        return dispatch_next_route_node(state)
-
-    def _dispatch_after_evaluator(self, state: AgentRuntimeState) -> str:
-        return dispatch_after_evaluator(state)
-
-    def _record_supervisor_dispatch_audit(self, state: AgentRuntimeState, legacy_next_node: str) -> str:
-        return record_supervisor_dispatch_audit(state, legacy_next_node)
-
-    def _map_route_to_node(self, route_item: str) -> str:
-        """Map a route_plan route item to a registered graph node name."""
-        return map_route_to_node(route_item)
+        self._checkpointer = checkpointer
+        from src.web_app.agent.runtime.graph_builder import build_graph
+        return build_graph(self.nodes, checkpointer)

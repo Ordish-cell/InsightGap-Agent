@@ -48,6 +48,7 @@ class LocalMCPProvider:
             "artifact_mcp.create_text_artifact": self._create_text_artifact,
             "memory_mcp.search": self._search_memory,
             "memory_mcp.add": self._add_memory,
+            "memory_mcp.extract": self._extract_memory,
             "skill_mcp.create_draft": self._create_skill_draft,
             "email_mcp.create_draft": self._create_email_draft,
             "email.send": self._send_email,
@@ -148,7 +149,8 @@ class LocalMCPProvider:
         title = str(payload.get("title", "MCP Artifact")).strip() or "MCP Artifact"
         content = str(payload.get("content", ""))
         artifact_type = str(payload.get("artifact_type", "note")).strip() or "note"
-        file_path = artifact_service.save_text_artifact(user_id, f"mcp_artifact_{agent_run_id or 'manual'}_{abs(hash(title))}.md", content)
+        from uuid import uuid4
+        file_path = artifact_service.save_text_artifact(user_id, f"mcp_artifact_{agent_run_id or 'manual'}_{uuid4().hex}.md", content)
         artifact = ArtifactRepository(db).create(user_id=user_id, run_id=agent_run_id, artifact_type=artifact_type, title=title, file_path=file_path, metadata_json={"source_type": "mcp_tool", "tool_name": "artifact_mcp.create_text_artifact"})
         return {"artifact_id": artifact.id, "title": artifact.title, "file_path": artifact.file_path}
 
@@ -164,6 +166,13 @@ class LocalMCPProvider:
     def _create_skill_draft(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
         draft = skill_service.create_skill_draft_from_run(agent_run_id or 0, user_id=user_id, db=db, payload=payload)
         return {"skill_id": draft["id"], "skill": draft}
+
+    def _extract_memory(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        import asyncio
+        return asyncio.run(memory_service.async_extract_and_save(user_id=user_id,
+            user_input=payload["user_input"], agent_output=payload.get("agent_output", ""),
+            page_context=payload.get("page_context"), thread_id=payload.get("thread_id", ""),
+            db=db, run_id=str(agent_run_id or "")))
 
     def _create_email_draft(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
         return {"draft": {"to": payload.get("to", ""), "subject": payload.get("subject", ""), "body": payload.get("body", "")}, "sent": False}

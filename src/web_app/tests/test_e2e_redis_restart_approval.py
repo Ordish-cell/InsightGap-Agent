@@ -1,15 +1,7 @@
-"""E2E: process restart recovery via checkpoint.
+"""Memory graph rebuild contracts and separately configured Redis probes.
 
-Phase 1 (current): Verifies the architecture works by sharing an
-InMemorySaver between two AgentRuntime instances in the same process.
-This is architecturally identical to restart recovery — same pattern
-works with RedisSaver / PostgresSaver / SqliteSaver.
-
-Phase 2 (blocked): RedisSaver requires langgraph-checkpoint-redis >= 0.5.0
-(current 0.4.1 has internal bug with _key_registry = None during resume).
-Once the package is updated, the same tests pass with RedisSaver.
-
-Run:  uv run pytest src/web_app/tests/test_e2e_redis_restart_approval.py -v -s
+Sharing InMemorySaver verifies graph reconstruction only. Real process and
+owned PostgreSQL service restart are covered by test_supervisor_process_restart.
 """
 
 from __future__ import annotations
@@ -23,13 +15,6 @@ import pytest
 _ROOT = Path(__file__).resolve().parents[3]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
-
-os.environ.setdefault("AGENT_LANGGRAPH_CHECKPOINTER_ENABLED", "true")
-os.environ.setdefault("AGENT_APPROVAL_INTERRUPT_ENABLED", "true")
-
-import importlib
-import src.web_app.core.config as _cfg_mod
-importlib.reload(_cfg_mod)
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import StateGraph, END
@@ -68,7 +53,7 @@ def _build_graph():
 
 
 class TestCrossInstanceRestart:
-    """Simulate process restart: pause in one graph, resume in another."""
+    """Rebuild graph objects in one process using the same in-memory saver."""
 
     def test_pause_and_resume_same_saver(self):
         """Same InMemorySaver: pause in graph A, resume in graph B."""
@@ -131,9 +116,7 @@ class TestCrossInstanceRestart:
 
 
 class TestRedisBackendReadiness:
-    """RedisSaver requires langgraph-checkpoint-redis >= 0.5.0 (future).
-    Current 0.4.1 has _key_registry=None bug during resume.
-    These tests verify the fail-fast path works correctly."""
+    """Probe configured Redis availability; this does not establish V2 support."""
 
     def test_redis_saver_can_connect(self):
         """RedisSaver constructor succeeds with real Redis (backend=redis)."""

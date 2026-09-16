@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
+from fastapi.encoders import jsonable_encoder
 
 from src.web_app.agent.runtime.events import event_channels, validate_event_payload
 from src.web_app.agent.runtime.chat_control import serialized_transition
@@ -32,7 +33,7 @@ def record_event(
     state = (getattr(run, "graph_state", None) or {}) if run else {}
     resolved_visibility, resolved_channel = event_channels(event_type)
     validated_payload = validate_event_payload(event_type, payload or {})
-    if event_type in {"answer_started", "answer_delta", "answer_completed"} and run:
+    if event_type in {"answer_started", "answer_delta", "answer_completed", "agent_text_started", "agent_text_delta", "agent_text_completed"} and run:
         from sqlalchemy import select
         from src.web_app.models.orm import AgentChatMessage
         message_id = db.execute(select(AgentChatMessage.message_id).where(
@@ -52,7 +53,7 @@ def record_event(
         schema_version=schema_version,
         visibility=visibility or resolved_visibility,
         display_channel=display_channel or resolved_channel,
-        payload_json=validated_payload,
+        payload_json=jsonable_encoder(validated_payload),
     )
     from src.web_app.agent.runtime.event_notify import notify
     notify(run_id)

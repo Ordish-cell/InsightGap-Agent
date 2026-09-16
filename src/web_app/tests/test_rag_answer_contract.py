@@ -2,8 +2,11 @@ import pytest
 from src.web_app.services.rag_service import rag_service, EvidenceBatch
 from src.web_app.rag.evidence import ANSWER_CONTRACT
 from src.web_app.tests.test_rag_hybrid_retrieval import hybrid_env
-from src.web_app.agent.runtime.nodes import RuntimeNodes
-from src.web_app.tests.test_agent_runtime_p3b_rag_prepare_empty_reuse import _patch_runtime_side_effects
+from src.web_app.agent.runtime.nodes import SupervisorNodes
+from src.web_app.agent.runtime.context import bounded_prompt
+from src.web_app.tests.test_chat_control import env as env
+from src.web_app.tests.test_supervisor_loop import state as initial
+from src.web_app.agent.runtime.state import CapabilityResult
 
 
 def test_scoped_no_evidence_never_general_fallback(monkeypatch):
@@ -22,17 +25,15 @@ def test_failure_is_not_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_scoped_successful_empty_prepare_is_reused(hybrid_env, monkeypatch):
-    db, user, _ = hybrid_env
-    _patch_runtime_side_effects(monkeypatch)
+async def test_completed_empty_action_is_not_retrieved_again(env, monkeypatch):
     monkeypatch.setattr(rag_service, "ask", lambda *a, **kw: pytest.fail("duplicate retrieval"))
-    state = {"user_id": user.id, "run_id": 1, "thread_id": "t", "user_input": "合同金额", "page_context": {"attachment_ids": [42]},
-             "route_plan": {"intent": "document_qa", "route": ["rag_agent"]},
-             "parallel_read_results": {"rag_prepare": {"status": "ok", "search_attempted": True, "evidence": [],
-                 "query": "合同金额", "document_ids": [42], "retrieval_status": "empty"}}}
-    result = await RuntimeNodes(db, {}).rag_agent(state)
-    assert result["rag_result"]["_parallel_read_no_evidence_used"]
-    assert not result["rag_result"]["needs_general_fallback"]
+    with env.factory() as db:
+        s = initial(env)
+        s["current_action"] = {"action": "rag", "action_id": "read", "arguments": {"query": "合同金额"}}
+        s["observations"] = [CapabilityResult(action_id="read", capability="rag", status="empty").model_dump()]
+        result = await SupervisorNodes(db, {}).capability(s)
+    assert len(result["observations"]) == 1
+    assert result["observations"][0]["status"] == "empty"
 
 
 def test_contract_covers_conflict_and_partial_reading():
@@ -47,6 +48,7 @@ def test_discarded_rag_draft_cannot_bypass_selected_evidence(gssc):
              'rag_result': {'answer': 'DISCARDED_RAW_CANDIDATE',
                             'evidence': [{'quote': 'VISIBLE'}],
                             'context': {'document_context_block': '[E1] VISIBLE'}}}
-    prompt = RuntimeNodes(None, {})._build_final_answer_prompt(state, 'DISCARDED_RAW_CANDIDATE')
+    state['observations'] = [CapabilityResult(action_id='read', capability='rag', status='ok', summary='[E1] VISIBLE').model_dump()]
+    prompt = bounded_prompt(state, 'Use selected evidence', 16000)
     assert '[E1] VISIBLE' in prompt
     assert 'DISCARDED_RAW_CANDIDATE' not in prompt

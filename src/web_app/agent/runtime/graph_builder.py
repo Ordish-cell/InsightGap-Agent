@@ -1,85 +1,26 @@
-"""LangGraph builder for the agent runtime."""
-
-from __future__ import annotations
-
-from collections.abc import Callable
-from typing import Any
-
-from src.web_app.agent.runtime.dispatch import END_SENTINEL
-from src.web_app.agent.runtime.graph_registry import (
-    AGENT_NODE_NAMES,
-    ROUTE_DESTINATION_NODE_NAMES,
-    build_runtime_node_registry,
-)
-from src.web_app.agent.runtime.nodes import RuntimeNodes
-from src.web_app.agent.runtime.state import AgentRuntimeState
+"""All observations return to the single native Supervisor."""
+from langgraph.graph import START, END, StateGraph
+from .state import AgentRuntimeState
+from .chat_control import controlled_node
 
 
-def build_agent_runtime_graph(
-    nodes: RuntimeNodes,
-    *,
-    after_permission: Callable[[AgentRuntimeState], str],
-    dispatch_next_route_node: Callable[[AgentRuntimeState], str],
-    dispatch_after_evaluator: Callable[[AgentRuntimeState], str],
-    checkpointer: Any | None = None,
-) -> Any | None:
-    try:
-        from langgraph.graph import END, StateGraph
-    except Exception:
-        return None
-
-    workflow = StateGraph(AgentRuntimeState)
-
-    for name, node_callable in build_runtime_node_registry(nodes).items():
-        from src.web_app.agent.runtime.chat_control import controlled_node
-        workflow.add_node(name, controlled_node(name, node_callable, getattr(nodes, "db", None)))
-
-    route_dests = {name: name for name in ROUTE_DESTINATION_NODE_NAMES}
-    route_dests[END_SENTINEL] = END
-
-    from src.web_app.agent.runtime.chat_fast_path import chat_entry
-    async def entry(state):
-        return await chat_entry(nodes, state)
-    workflow.add_node("chat_entry", controlled_node("chat_entry", entry, getattr(nodes, "db", None)))
-    workflow.add_conditional_edges("chat_entry", lambda state: state.get("chat_entry_route", "workflow"),
-                                   {"chat": END, "workflow": "home_intent_react"})
-
-    workflow.set_entry_point("permission_guard")
-    workflow.add_conditional_edges(
-        "permission_guard",
-        after_permission,
-        {"continue": "chat_entry", "done": "final_response"},
-    )
-
-    # Planner -> parallel_prefetch -> parallel_read_stage -> supervisor_observer
-    # -> optional LLM route_plan supervision -> route dispatch.
-    workflow.add_edge("home_intent_react", "planner")
-    workflow.add_edge("planner", "parallel_prefetch")
-    workflow.add_edge("parallel_prefetch", "parallel_read_stage")
-    workflow.add_edge("parallel_read_stage", "supervisor_observer")
-    workflow.add_edge("supervisor_observer", "llm_supervisor_route")
-
-    # context_builder + skill_matcher run inside parallel_read_stage.
-    workflow.add_conditional_edges(
-        "llm_supervisor_route",
-        dispatch_next_route_node,
-        route_dests,
-    )
-
-    for agent_name in AGENT_NODE_NAMES:
-        workflow.add_conditional_edges(
-            agent_name,
-            dispatch_next_route_node,
-            route_dests,
-        )
-
-    workflow.add_conditional_edges(
-        "evaluator",
-        dispatch_after_evaluator,
-        route_dests,
-    )
-    workflow.add_edge("final_response", END)
-
-    if checkpointer is None:
-        return workflow.compile()
-    return workflow.compile(checkpointer=checkpointer)
+def build_graph(nodes, checkpointer=None):
+    nodes.checkpoint_enabled = checkpointer is not None
+    graph = StateGraph(AgentRuntimeState)
+    names = ("permission_guard", "bootstrap_context", "supervisor", "capability", "deep_research", "tool_runtime", "document_read")
+    for name in names:
+        graph.add_node(name, controlled_node(name, getattr(nodes, name), nodes.db))
+    graph.add_edge(START, "permission_guard")
+    graph.add_edge("permission_guard", "bootstrap_context")
+    graph.add_edge("bootstrap_context", "supervisor")
+    def route(state):
+        if state.get("status") in {"completed", "failed"}:
+            return END
+        action = state.get("current_action", {})
+        if state.get("termination_reason"):
+            return "supervisor"
+        return {"deep_research": "deep_research", "tool": "tool_runtime", "document_read": "document_read"}.get(action.get("action"), "capability")
+    graph.add_conditional_edges("supervisor", route, {END: END, **{n: n for n in names[2:]}})
+    for name in names[3:]:
+        graph.add_edge(name, "supervisor")
+    return graph.compile(checkpointer=checkpointer)

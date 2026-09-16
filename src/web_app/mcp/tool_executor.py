@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from src.web_app.core.constants import L3_EXTERNAL_WRITE, L4_HIGH_RISK
 from src.web_app.db.repositories.approval_repository import ApprovalRepository
@@ -43,21 +44,32 @@ class MCPToolExecutor:
         if idempotency_key:
             existing_call = call_repo.get_by_idempotency_key(idempotency_key)
             if existing_call:
+                if existing_call.user_id != user_id or existing_call.run_id != agent_run_id or existing_call.tool_name != tool_name or canonical_tool_args(existing_call.input) != canonical_tool_args(input_data):
+                    raise ValueError("Idempotency key scope or arguments mismatch")
                 approval_id = _approval_id_for_call(db, existing_call)
                 return tool_call_to_read(existing_call, approval_id=approval_id)
 
-        call = call_repo.create(
-            user_id=user_id,
-            run_id=agent_run_id,
-            tool_name=tool_name,
-            mcp_tool_id=tool.id if tool else None,
-            input=input_data,
-            output={},
-            permission_level=safety_level,
-            status="pending",
-            error_message="",
-            idempotency_key=idempotency_key,
-        )
+        try:
+            call = call_repo.create(
+                user_id=user_id,
+                run_id=agent_run_id,
+                tool_name=tool_name,
+                mcp_tool_id=tool.id if tool else None,
+                input=input_data,
+                output={},
+                permission_level=safety_level,
+                status="pending",
+                error_message="",
+                idempotency_key=idempotency_key,
+            )
+        except IntegrityError:
+            db.rollback()
+            existing = call_repo.get_by_idempotency_key(idempotency_key) if idempotency_key else None
+            if existing is None:
+                raise
+            if existing.user_id != user_id or existing.run_id != agent_run_id or existing.tool_name != tool_name or canonical_tool_args(existing.input) != canonical_tool_args(input_data):
+                raise ValueError("Idempotency key scope or arguments mismatch")
+            return tool_call_to_read(existing, approval_id=_approval_id_for_call(db, existing))
 
         if not tool or not tool.enabled:
             return self._finish(db, call, "failed", {}, "Tool not found or disabled")
@@ -80,6 +92,7 @@ class MCPToolExecutor:
                 "safety_notes": safety_notes,
                 "requires_approval": True,
                 "approval_mode": approval_mode,
+                "dry_run": dry_run,
                 "idempotency_key": idempotency_key,
             }
             approval = self._get_or_create_approval(
@@ -104,12 +117,15 @@ class MCPToolExecutor:
         if dry_run:
             return self._finish(db, call, "completed", {"dry_run": True, "would_call": tool_name}, "")
 
-        call_repo.update(call, status="running")
+        if not call_repo.claim_execution(call.id, user_id, ("pending",)):
+            db.refresh(call)
+            return tool_call_to_read(call)
         try:
             output = local_provider.call(db, user_id, tool_name, input_data, agent_run_id)
             return self._finish(db, call, "completed", output, "")
         except Exception as exc:
-            return self._finish(db, call, "failed", {}, str(exc))
+            status = "failed" if str(safety_level).startswith("L0") else "unknown"
+            return self._finish(db, call, status, {}, str(exc))
 
     def execute_approved_tool(
         self,
@@ -135,6 +151,8 @@ class MCPToolExecutor:
         call = repo.get_by_user(user_id, tool_call_id)
         if not call:
             raise ValueError(f"ToolCall not found: {tool_call_id}")
+        if call.tool_name != tool_name or call.run_id != agent_run_id or canonical_tool_args(call.input) != canonical_tool_args(input_data):
+            raise ValueError("ToolCall scope or arguments mismatch")
         if call.status == "completed":
             return _normalize_tool_output(tool_name, call.output or {})
         if call.status in {"blocked", "rejected"}:
@@ -145,17 +163,32 @@ class MCPToolExecutor:
                 "message": call.error_message or f"Tool call is {call.status}.",
             }
 
-        repo.update_status(tool_call_id, "running")
+        if call.status in {"running", "failed", "unknown"}:
+            return {"success": False, "tool_name": tool_name, "error_code": "TOOL_OUTCOME_UNKNOWN",
+                    "message": "The existing tool attempt cannot be safely repeated. Inspect its outcome before retrying."}
+        approval_id = _approval_id_for_call(db, call)
+        approval = ApprovalRepository(db).get_by_user(user_id, int(approval_id)) if approval_id else None
+        if not approval or approval.status != "approved" or approval.run_id != agent_run_id:
+            raise ValueError("ToolCall requires an approved matching approval")
+        payload = approval.payload or {}
+        if payload.get("tool_call_id") != call.id or payload.get("tool_name") != tool_name or canonical_tool_args(payload.get("tool_args", {})) != canonical_tool_args(input_data):
+            raise ValueError("Persisted approval arguments mismatch")
+        if not repo.claim_execution(tool_call_id, user_id, ("waiting_approval",)):
+            db.refresh(call)
+            if call.status == "completed":
+                return _normalize_tool_output(tool_name, call.output or {})
+            return {"success": False, "tool_name": tool_name, "error_code": "TOOL_OUTCOME_UNKNOWN",
+                    "message": "Tool execution is already claimed; it will not be repeated."}
         try:
-            output = local_provider.call(db, user_id, tool_name, input_data, agent_run_id)
+            output = {"dry_run": True, "would_call": tool_name} if payload.get("dry_run") else local_provider.call(db, user_id, tool_name, input_data, agent_run_id)
             repo.update_status(tool_call_id, "completed", output=output)
             return _normalize_tool_output(tool_name, output)
         except Exception as exc:
-            repo.update_status(tool_call_id, "failed", error_message=str(exc))
+            repo.update_status(tool_call_id, "unknown", error_message=str(exc))
             return {
                 "success": False,
                 "tool_name": tool_name,
-                "error_code": type(exc).__name__,
+                "error_code": "TOOL_OUTCOME_UNKNOWN",
                 "message": str(exc),
             }
 

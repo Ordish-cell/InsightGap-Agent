@@ -1,8 +1,10 @@
 import pytest
 
-from src.web_app.models.orm import FeedCard, InfoItem, Skill, User
+pytestmark = pytest.mark.usefixtures("scripted_supervisor")
+
+from src.web_app.models.orm import AgentRun, FeedCard, InfoItem, Skill, User
 from src.web_app.services.agent_service import list_steps, run_agent
-from src.web_app.tests.db_test_utils import make_test_session
+from src.web_app.tests.db_test_utils import make_test_session, configure_test_model
 
 
 def _user(db, email="home-agent@example.com"):
@@ -10,6 +12,7 @@ def _user(db, email="home-agent@example.com"):
     db.add(user)
     db.commit()
     db.refresh(user)
+    configure_test_model(db, user)
     return user
 
 
@@ -75,10 +78,9 @@ def test_home_chat_request_creates_agent_run_with_context():
     )
 
     assert result["status"] == "completed"
-    assert result["route"] in ("research", "feed_research")
+    assert result["route"] == "chat"
     steps = list_steps(db, user.id, result["run_id"])
-    context_step = next(step for step in steps if step["node_name"] == "context_builder")
-    assert context_step["output"]["feed_card_loaded"] is True
+    assert db.get(AgentRun, result["run_id"]).graph_state["context"]["feed_card"]["id"] == card.id
 
 
 def test_legacy_agent_request_without_page_context_still_works():
@@ -96,12 +98,12 @@ def test_skill_matching_uses_approved_high_score_skill():
     user = _user(db, "skill-match@example.com")
     skill = _skill(db, user.id, trigger_text="research report workflow")
 
-    result = run_agent(db, user.id, {"user_input": "please research report workflow", "route": "memory", "create_skill_draft_if_reusable": False})
+    result = run_agent(db, user.id, {"user_input": "please research report workflow", "route": "skill", "create_skill_draft_if_reusable": False})
 
     assert result["matched_skill"]["id"] == skill.id
     assert result["matched_skill"]["match_score"] >= 0.75
     steps = list_steps(db, user.id, result["run_id"])
-    assert any(step["node_name"] == "skill_matcher" and step["output"]["matched_skill"] for step in steps)
+    assert any(step["output"].get("capability") == "skill" for step in steps)
 
 
 def test_low_score_skill_is_not_auto_used():
@@ -109,7 +111,7 @@ def test_low_score_skill_is_not_auto_used():
     user = _user(db, "skill-low@example.com")
     _skill(db, user.id, trigger_text="email outreach sequence")
 
-    result = run_agent(db, user.id, {"user_input": "summarize a note", "route": "memory", "create_skill_draft_if_reusable": False})
+    result = run_agent(db, user.id, {"user_input": "summarize a note", "route": "skill", "create_skill_draft_if_reusable": False})
 
     assert result["matched_skill"] is None
     assert result["candidate_skills"] == []
@@ -119,12 +121,12 @@ def test_reusable_task_creates_skill_draft():
     db = make_test_session()
     user = _user(db, "draft-agent@example.com")
 
-    result = run_agent(db, user.id, {"user_input": "以后复用这个流程 create report", "route": "artifact"})
+    result = run_agent(db, user.id, {"user_input": "创建一个可复用的报告 Skill create report workflow", "route": "artifact", "create_skill_draft": True})
 
     assert result["created_skill_draft"]
     assert result["reusable_score"] >= 0.70
     steps = list_steps(db, user.id, result["run_id"])
-    assert any(step["node_name"] in ("skill_draft_detector", "skill_agent") and step["output"].get("created_skill_draft") for step in steps)
+    assert any(step["output"].get("capability") == "skill" and step["output"]["status"] == "ok" for step in steps)
 
 
 def test_casual_chat_does_not_create_skill_draft():
@@ -155,8 +157,7 @@ def test_feed_card_context_is_user_isolated():
     )
 
     steps = list_steps(db, other.id, result["run_id"])
-    context_step = next(step for step in steps if step["node_name"] == "context_builder")
-    assert context_step["output"]["feed_card_loaded"] is False
+    assert not db.get(AgentRun, result["run_id"]).graph_state["context"]["feed_card"]
 
 
 @pytest.mark.parametrize("status", ["draft", "disabled"])
@@ -165,6 +166,6 @@ def test_draft_or_disabled_skill_is_not_auto_used(status):
     user = _user(db, f"{status}-skill@example.com")
     _skill(db, user.id, status=status, trigger_text="research report workflow")
 
-    result = run_agent(db, user.id, {"user_input": "research report workflow", "route": "memory", "create_skill_draft_if_reusable": False})
+    result = run_agent(db, user.id, {"user_input": "research report workflow", "route": "skill", "create_skill_draft_if_reusable": False})
 
     assert result["matched_skill"] is None

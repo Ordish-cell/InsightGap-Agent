@@ -343,7 +343,7 @@ def test_context_builder_keeps_conversation_memory():
 def test_conversation_recall_uses_summary_and_segments():
     """The conversation_recall prompt builder uses conversation_recall_context and user_input."""
     from src.web_app.agent.runtime.state import AgentRuntimeState
-    from src.web_app.agent.runtime.node_groups.eval_final_nodes import EvalFinalNodesMixin
+    from src.web_app.agent.runtime.context import bounded_prompt
 
     state: AgentRuntimeState = {
         "user_id": 1,
@@ -364,13 +364,11 @@ def test_conversation_recall_uses_summary_and_segments():
         "answer_mode": "conversation_recall",
     }
 
-    mixin = EvalFinalNodesMixin()
-    prompt = mixin._build_conversation_recall_prompt(state)
+    prompt = bounded_prompt(state, "Use conversation history", 16000)
 
     assert "Phoenix" in prompt
-    assert "[Previous User Messages]" in prompt
-    assert "[Recent Conversation Messages]" in prompt
-    assert "conversation_recall" in prompt.lower()
+    assert "conversation_history" in prompt
+    assert "我的项目叫什么" in prompt
 
 
 # ── Test 6: New run must have conversation_id ──────────────────────────
@@ -718,17 +716,7 @@ def test_segment_not_duplicated(monkeypatch):
 @pytest.mark.asyncio
 async def test_empty_conversation_id_does_not_crash(monkeypatch):
     """context_builder handles missing/empty conversation_id gracefully."""
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-    from src.web_app.agent.runtime.node_groups import read_nodes
-
-    monkeypatch.setattr(read_nodes.memory_service, "search_memory", lambda *a, **kw: [])
-    monkeypatch.setattr(read_nodes.memory_service, "get_baseline_memories", lambda *a, **kw: [])
-    monkeypatch.setattr(read_nodes.rag_service, "search_evidence", lambda *a, **kw: [])
-    monkeypatch.setattr(read_nodes.user_growth_service, "build_dynamic_preference_profile", lambda *a, **kw: {})
-    monkeypatch.setattr(read_nodes, "record_step", lambda *a, **kw: None)
-    monkeypatch.setattr(read_nodes, "append_status_step", lambda *a, **kw: None)
-    monkeypatch.setattr(read_nodes, "emit_visible_thought", lambda *a, **kw: None)
-
+    from src.web_app.agent.runtime.nodes import SupervisorNodes
     state = {
         "user_id": 1,
         "run_id": 1,
@@ -741,7 +729,7 @@ async def test_empty_conversation_id_does_not_crash(monkeypatch):
         "context": {},
     }
 
-    result = await RuntimeNodes(make_test_session(), {}).context_builder(state)
+    result = await SupervisorNodes(make_test_session(), {}).bootstrap_context(state)
     # Must not crash; context is built with fallbacks
     assert result is not None
     assert "context" in result

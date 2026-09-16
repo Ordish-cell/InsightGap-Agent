@@ -1,22 +1,46 @@
-"""Tests for the long-term memory false-confirmation bug fix.
+"""Memory receipts, confirmation quality policy, and context isolation."""
+import pytest
+from types import SimpleNamespace
 
-These tests validate:
-1. add_memory / add_with_dedup return structured save results
-2. _save_extracted includes save_results
-3. Planner routes tech stack declarations → memory (NOT rag)
-4. Planner sets answer_mode=memory_confirm for declarations
-5. _sanitize_memory_claims removes false claims
-6. MEMORY_CONTEXT_POLICY constraints
-"""
+@pytest.mark.parametrize("claim,receipts,expected", [
+    ("已记住你的偏好", [{"ok": False, "error": "db_error"}], "没有确认写入成功"),
+    ("我记住了你的偏好", [{"ok": False, "error": "timeout"}], "没有确认写入成功"),
+    ("已记住你的偏好", [{"ok": True, "qdrant_indexed": True}], ""),
+    ("已记住你的偏好", [{"ok": True, "qdrant_indexed": False}], "向量索引暂不可用"),
+    ("你好", [], ""),
+    ("已记住你的偏好", [], "没有确认写入成功"),
+    ("偏好已保存，我记住了", [{"ok": False}], "没有确认写入成功"),
+])
+def test_memory_claim_requires_receipt(claim, receipts, expected):
+    from src.web_app.agent.runtime.policy import check_answer
+    state = {"memory_save_results": receipts}
+    correction = check_answer(SimpleNamespace(db=None), state, claim)
+    if expected:
+        assert expected in correction
+        assert state["evaluation"]["warnings"]
+    else:
+        assert correction == ""
 
-import sys
-from typing import Any
+def test_state_keeps_memory_receipts_and_observations():
+    from src.web_app.agent.runtime.state import AgentRuntimeState
+    assert {"memory_save_results", "observations", "save_policy"} <= AgentRuntimeState.__annotations__.keys()
 
+def test_memory_action_validates_content():
+    from pydantic import ValidationError
+    from src.web_app.agent.runtime.state import SupervisorAction
+    with pytest.raises(ValidationError):
+        SupervisorAction(action="memory_write", arguments={"content": ""})
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Memory service return value tests
-# ═══════════════════════════════════════════════════════════════════════════
+def test_memory_result_distinguishes_failure():
+    from src.web_app.agent.runtime.state import CapabilityResult
+    result = CapabilityResult(action_id="save", capability="memory_write", status="failed", error="db_error")
+    assert result.model_dump()["status"] == "failed"
 
+def test_model_cannot_authorize_memory_save():
+    from pydantic import ValidationError
+    from src.web_app.agent.runtime.state import SupervisorAction
+    with pytest.raises(ValidationError):
+        SupervisorAction(action="memory_write", arguments={"content": "preference"}, save_policy={"write_memory": True})
 
 def test_add_memory_returns_ok_and_qdrant_status():
     """add_memory() must return ok=True and qdrant_indexed status (no DB)."""
@@ -37,7 +61,6 @@ def test_add_memory_returns_ok_and_qdrant_status():
     assert result.get("deduped") is False
     assert result.get("updated_existing") is False
 
-
 def test_add_memory_includes_category_and_status():
     """add_memory() must include category and status from metadata."""
     import pytest
@@ -53,152 +76,6 @@ def test_add_memory_includes_category_and_status():
     assert result.get("category") == "preference"
     assert result.get("status") == "active"
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Planner routing tests
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def test_planner_tech_stack_to_memory_not_rag():
-    """Tech stack declarations must NOT route to rag_agent even with Qdrant keyword."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("这个项目用FastAPI+PostgreSQL+Qdrant")
-    assert "rag_agent" not in plan["route"], (
-        f"Tech stack declaration should NOT route to rag, but got route={plan['route']}"
-    )
-    assert plan["intent"] in ("memory", "chat")
-
-
-def test_planner_tech_stack_qdrant_suppress_rag():
-    """'项目技术栈：Qdrant向量数据库' must suppress RAG even with 'Qdrant' keyword."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("项目技术栈：Qdrant向量数据库")
-    assert "rag_agent" not in plan["route"], (
-        f"Qdrant keyword should not trigger RAG for tech stack, got route={plan['route']}"
-    )
-
-
-def test_planner_name_preference_memory_confirm():
-    """'我叫C' must route to memory with answer_mode=memory_confirm."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("我叫C，以后叫我C")
-    assert plan.get("answer_mode") == "memory_confirm", (
-        f"Expected memory_confirm, got {plan.get('answer_mode')}"
-    )
-
-
-def test_planner_greeting_is_casual():
-    """Greetings must have answer_mode=casual or chat."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("你好")
-    assert plan["intent"] == "chat"
-    assert plan.get("answer_mode") in ("casual", "chat")
-
-
-def test_planner_weather_is_chat_not_project_advice():
-    """Weather question must NOT be project_advice."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("今天天气怎么样")
-    assert plan["intent"] == "chat"
-    assert plan.get("answer_mode") in ("casual", "chat"), (
-        f"Weather should be casual/chat, got {plan.get('answer_mode')}"
-    )
-
-
-def test_planner_email_still_triggers():
-    """Email intent must still work after tech-stack suppression changes."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("帮我发邮件给张三")
-    assert str(plan["intent"]).startswith("tool.")
-    assert plan["needs_approval"] is True
-
-
-def test_planner_memory_write_is_memory_confirm():
-    """Explicit memory write must have answer_mode=memory_confirm."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("记住我叫C")
-    assert plan.get("answer_mode") == "memory_confirm"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Sanitize memory claims tests
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def test_sanitize_removes_false_claim_on_explicit_failure():
-    """When memory_write_result.success=False, '已记住' must be stripped."""
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-
-    answer = "好的，已记住：你喜欢用FastAPI。还有其他需要吗？"
-    save_results = [{"ok": False, "error": "db_error", "content": "test"}]
-    mem_write = {"success": False, "error": "db_error"}
-
-    result = RuntimeNodes._sanitize_memory_claims(answer, save_results, mem_write)
-    assert "已记住" not in result, f"Should strip 已记住, got: {result}"
-    assert "未能保存" in result, f"Should say 未能保存, got: {result}"
-
-
-def test_sanitize_removes_false_claim_when_no_ok():
-    """When no save_result has ok=True but save_results exists, must not claim success."""
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-
-    answer = "我记住了你的偏好"
-    save_results = [{"ok": False, "error": "timeout"}, {"ok": False, "error": "db_error"}]
-    mem_write = {}
-
-    result = RuntimeNodes._sanitize_memory_claims(answer, save_results, mem_write)
-    assert "没有确认写入成功" in result or "不能说已经记住" in result, (
-        f"Must say not confirmed, got: {result}"
-    )
-
-
-def test_sanitize_passes_through_when_ok():
-    """When save_results has ok=True, answer should pass through (with Qdrant note if needed)."""
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-
-    answer = "已记住：你喜欢用FastAPI。"
-    save_results = [{"ok": True, "qdrant_indexed": True, "content": "test"}]
-    mem_write = {"success": True}
-
-    result = RuntimeNodes._sanitize_memory_claims(answer, save_results, mem_write)
-    assert "已记住" in result, f"Should keep 已记住, got: {result}"
-    assert "未能保存" not in result
-
-
-def test_sanitize_qdrant_fail_adds_note():
-    """When PG succeeded but Qdrant failed, answer should include note."""
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-
-    answer = "已记住：你喜欢用FastAPI。"
-    save_results = [{"ok": True, "qdrant_indexed": False, "content": "test"}]
-    mem_write = {"success": True}
-
-    result = RuntimeNodes._sanitize_memory_claims(answer, save_results, mem_write)
-    assert "已记住" in result, "Should keep 已记住"
-    assert "向量索引暂不可用" in result, f"Should mention qdrant unavailability, got: {result}"
-
-
-def test_sanitize_empty_save_results_no_effect():
-    """When save_results is empty, answer should pass through unchanged."""
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-
-    answer = "你好，我是Agent OS助手。"
-    result = RuntimeNodes._sanitize_memory_claims(answer, [], {})
-    assert result == answer
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# MEMORY_CONTEXT_POLICY tests
-# ═══════════════════════════════════════════════════════════════════════════
-
-
 def test_general_qa_disallows_tech_stack():
     """general_qa must NOT allow tech_stack, project_goal, boundary, workflow_pattern."""
     from src.web_app.context.builder import MEMORY_CONTEXT_POLICY
@@ -209,7 +86,6 @@ def test_general_qa_disallows_tech_stack():
     assert "boundary" not in allowed, "general_qa must NOT allow boundary"
     assert "workflow_pattern" not in allowed, "general_qa must NOT allow workflow_pattern"
     assert "name_preference" in allowed, "general_qa must allow name_preference"
-
 
 def test_memory_confirm_allows_name_but_not_tech_stack():
     """memory_confirm must allow name/language/tone but NOT tech_stack/project_goal."""
@@ -222,7 +98,6 @@ def test_memory_confirm_allows_name_but_not_tech_stack():
     assert "tech_stack" not in allowed, "memory_confirm must NOT allow tech_stack"
     assert "project_goal" not in allowed, "memory_confirm must NOT allow project_goal"
 
-
 def test_casual_disallows_tech_stack():
     """casual mode must NOT inject tech_stack/project_goal."""
     from src.web_app.context.builder import MEMORY_CONTEXT_POLICY
@@ -232,7 +107,6 @@ def test_casual_disallows_tech_stack():
     assert "project_goal" not in allowed
     assert "name_preference" in allowed
 
-
 def test_project_advice_allows_tech_stack():
     """project_advice must allow tech_stack and project_goal."""
     from src.web_app.context.builder import MEMORY_CONTEXT_POLICY
@@ -241,139 +115,3 @@ def test_project_advice_allows_tech_stack():
     assert "tech_stack" in allowed
     assert "project_goal" in allowed
     assert "workflow_pattern" in allowed
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# State definition tests
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def test_state_has_memory_save_results_field():
-    """AgentRuntimeState must have memory_save_results, memory_candidates, answer_mode."""
-    from src.web_app.agent.runtime.state import AgentRuntimeState
-
-    # Verify the TypedDict has the new fields (compile-time check)
-    fields = AgentRuntimeState.__annotations__
-    assert "memory_save_results" in fields, "Missing memory_save_results in state"
-    assert "memory_candidates" in fields, "Missing memory_candidates in state"
-    assert "answer_mode" in fields, "Missing answer_mode in state"
-
-
-def test_route_plan_has_answer_mode():
-    """RoutePlan must have answer_mode field."""
-    from src.web_app.agent.runtime.state import RoutePlan
-
-    fields = RoutePlan.__annotations__
-    assert "answer_mode" in fields, "Missing answer_mode in RoutePlan"
-
-
-def test_memory_save_result_typed_dict():
-    """MemorySaveResult must have required fields."""
-    from src.web_app.agent.runtime.state import MemorySaveResult
-
-    fields = MemorySaveResult.__annotations__
-    required_fields = {"ok", "memory_id", "qdrant_point_id", "memory_type", "content",
-                       "category", "status", "qdrant_indexed", "error", "deduped", "updated_existing"}
-    assert required_fields <= set(fields), f"Missing fields: {required_fields - set(fields)}"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Intent schema tests
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def test_home_intent_result_has_answer_mode():
-    """HomeIntentResult must have answer_mode field."""
-    from src.web_app.agent.runtime.intent_schema import HomeIntentResult
-
-    result = HomeIntentResult(intent="chat", answer_mode="casual")
-    assert result.answer_mode == "casual"
-
-    d = result.to_home_intent_dict()
-    assert "answer_mode" in d
-    assert d["answer_mode"] == "casual"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Planner routing: preference / negation / advice tests (P0 fix)
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def test_planner_preference_routes_to_memory():
-    """'我喜欢用 FastAPI' must route to memory_agent with memory_confirm."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("我喜欢用 FastAPI")
-    assert plan["intent"] == "memory", f"Expected memory, got {plan['intent']}"
-    assert plan.get("answer_mode") == "memory_confirm"
-    assert "memory_agent" in plan["route"]
-
-
-def test_planner_negative_preference_routes_to_memory():
-    """'我不喜欢太啰嗦' must route to memory_agent with memory_confirm."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("我不喜欢太啰嗦")
-    assert plan["intent"] == "memory", f"Expected memory, got {plan['intent']}"
-    assert plan.get("answer_mode") == "memory_confirm"
-    assert "memory_agent" in plan["route"]
-
-
-def test_planner_qa_not_memory():
-    """'帮我解释 FastAPI' must NOT route to memory_agent."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("帮我解释 FastAPI")
-    assert plan["intent"] == "chat"
-    assert plan.get("answer_mode") == "chat"
-    assert "memory_agent" not in plan["route"]
-
-
-def test_planner_advice_question_not_memory_confirm():
-    """'这个项目用X怎么设计架构？' must be project_advice, NOT memory_confirm."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    plan = plan_route("这个项目用 FastAPI + PostgreSQL + Qdrant 怎么设计架构？")
-    assert plan.get("answer_mode") == "project_advice", (
-        f"Expected project_advice, got {plan.get('answer_mode')}"
-    )
-
-
-def test_planner_rule_fallback_preference_to_memory():
-    """When LLM fails, '我喜欢用 FastAPI' still routes to memory via rule fallback."""
-    from src.web_app.agent.runtime.planner import plan_route
-
-    # plan_route without home_intent simulates LLM failure (pure rule-based)
-    plan = plan_route("我喜欢用 FastAPI", home_intent=None)
-    assert plan["intent"] == "memory"
-    assert "memory_agent" in plan["route"]
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Hard guard: final_response must NOT claim '已记住' without ok=True
-# ═══════════════════════════════════════════════════════════════════════════
-
-
-def test_sanitize_blocks_empty_save_results():
-    """Even with memory intent, if no save_results ok=True, sanitize must block."""
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-
-    answer = "已记住：你喜欢用 FastAPI。"
-    save_results: list = []
-    mem_write: dict = {}
-
-    result = RuntimeNodes._sanitize_memory_claims(answer, save_results, mem_write)
-    # Empty save_results → no change (guard only triggers when save_results is non-empty)
-    assert result == answer  # passes through — empty save_results means no memory write attempted
-
-
-def test_sanitize_blocks_candidates_without_ok():
-    """When save_results exist but all ok=False, must block '已记住'."""
-    from src.web_app.agent.runtime.nodes import RuntimeNodes
-
-    answer = "好的，已记住：你的偏好已保存到用户档案。"
-    save_results = [{"ok": False, "error": "db_error"}]
-
-    result = RuntimeNodes._sanitize_memory_claims(answer, save_results, {})
-    assert "已记住" not in result
-    assert "没有确认写入成功" in result

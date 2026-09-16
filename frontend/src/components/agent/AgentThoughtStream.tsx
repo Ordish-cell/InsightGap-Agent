@@ -346,6 +346,14 @@ function collectActivityTrace(message: AgentThoughtStreamProps['message'], local
       return
     }
 
+    if (eventType === 'agent_text_completed' && payload.role === 'progress' && payload.text) {
+      pushItem(items, {
+        id: `native-progress-${String(payload.text_id)}`,
+        kind: 'progress', text: String(payload.text), status: 'completed', createdAt,
+      })
+      return
+    }
+
     if (eventType === 'answer_started') {
       pushItem(items, {
         id: `answer-started-${event.id || index}`,

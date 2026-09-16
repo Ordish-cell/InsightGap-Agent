@@ -1,5 +1,7 @@
 import pytest
 
+pytestmark = pytest.mark.usefixtures("scripted_supervisor")
+
 from src.web_app.db.repositories.artifact_repository import ArtifactRepository
 from src.web_app.db.repositories.memory_repository import MemoryRepository
 from src.web_app.db.repositories.skill_repository import SkillRepository
@@ -9,12 +11,12 @@ from src.web_app.research.open_deep_research_adapter import OpenDeepResearchAdap
 from src.web_app.research.schemas import ResearchRequest
 from src.web_app.services.auth_service import hash_password
 from src.web_app.services.research_service import research_service
-from src.web_app.tests.db_test_utils import make_test_session
+from src.web_app.tests.db_test_utils import make_test_session, configure_test_model
 
 
 @pytest.mark.asyncio
 async def test_open_deep_research_adapter_fallback_returns_result():
-    result = await OpenDeepResearchAdapter().fallback.run(
+    result = await FallbackResearcher().run(
         "Research Agent OS",
         {},
         [{"source_type": "manual", "title": "Source", "url": "https://example.com", "snippet": "Agent evidence", "score": 0.8, "metadata": {}}],
@@ -70,12 +72,12 @@ async def test_research_result_has_required_fields_and_evidence(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_research_markdown_report_has_sections(monkeypatch):
+async def test_research_markdown_report_preserves_provider_output(monkeypatch):
     db, user, card = _setup_feed_card()
     _patch_rag(monkeypatch)
     result = await research_service.research_feed_card(db, user.id, card.id, ResearchRequest())
-    for section in ["# Research Report:", "## 1. Executive Summary", "## 4. Evidence", "## 9. Sources"]:
-        assert section in result["markdown_report"]
+    assert result["markdown_report"] == "# Test research"
+    assert research_service.get_research_run(db, user.id, result["id"])["markdown_report"] == result["markdown_report"]
 
 
 @pytest.mark.asyncio
@@ -115,7 +117,7 @@ async def test_research_failure_marks_run_failed(monkeypatch):
     async def boom(*args, **kwargs):
         raise RuntimeError("research failed")
 
-    monkeypatch.setattr("src.web_app.services.research_service.OpenDeepResearchAdapter.run_research", boom)
+    monkeypatch.setattr(research_service, "_execute_research", boom)
     result = await research_service.research_feed_card(db, user.id, card.id, ResearchRequest())
     assert result["status"] == "failed"
     assert "research failed" in result["error"]
@@ -125,8 +127,9 @@ def test_health_dependencies_contains_open_deep_research():
     from src.web_app.research.open_deep_research_adapter import OpenDeepResearchAdapter
 
     health = OpenDeepResearchAdapter().health()
-    assert health["adapter"] == "available"
-    assert health["fallback_enabled"] is True
+    assert health["adapter"] == "OpenDeepResearchAdapter"
+    assert health["status"] in {"ok", "degraded"}
+    assert isinstance(health["odr_importable"], bool)
 
 
 def test_research_does_not_require_exa():
@@ -154,6 +157,7 @@ def _create_user(db, email="research@example.com"):
     db.add(user)
     db.commit()
     db.refresh(user)
+    configure_test_model(db, user)
     return user
 
 
