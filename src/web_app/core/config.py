@@ -123,8 +123,6 @@ class Settings(BaseSettings):
     feed_min_source_credibility: float = 0.40
     feed_low_confidence_max_ratio: float = 0.20
     agent_llm_usage_log_enabled: bool = True
-    agent_llm_log_prompt_preview: bool = False
-    agent_llm_log_raw_output: bool = False
     # Max recent chat messages injected into the LLM context per turn.
     # Only the last N messages are loaded; earlier messages rely on
     # conversation_summary (running) + recalled historical segments.
@@ -168,10 +166,6 @@ class Settings(BaseSettings):
     feed_refresh_explicit_min: int = 2
     feed_refresh_adjacent_min: int = 2
     feed_refresh_far_min: int = 1
-    agent_timeline_enabled: bool = True
-    agent_langgraph_status_enabled: bool = True
-    agent_langgraph_status_max_steps: int = 12
-    agent_chat_real_messages_enabled: bool = True
     agent_max_supervisor_steps: int = 12
     agent_max_tool_calls: int = 8
     agent_max_deep_research_calls: int = 1

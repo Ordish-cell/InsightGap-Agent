@@ -37,10 +37,7 @@ def scripted_supervisor(monkeypatch):
     from types import SimpleNamespace
     from src.web_app.agent.runtime.nodes import SupervisorNodes
     from src.web_app.agent.runtime.state import SupervisorAction
-    from src.web_app.agent.llm.config import clear_llm_settings_cache
     from src.web_app.core.config import settings
-    monkeypatch.setenv("LLM_ENABLED", "true")
-    clear_llm_settings_cache()
     async def decide(self, state):
         if state.get("observations"):
             return SupervisorAction(action="respond")
@@ -79,4 +76,3 @@ def scripted_supervisor(monkeypatch):
         return ResearchResult(summary="Test research evidence", markdown_report="# Test research", evidence=kwargs.get("evidence") or [], metadata={"engine": "test_provider"})
     monkeypatch.setattr(OpenDeepResearchAdapter, "run_research", research)
     yield
-    clear_llm_settings_cache()

@@ -859,8 +859,6 @@ async def execute_prepared_run(
             )
 
 
-            if state.get("chat_entry_route") == "chat":
-                publish_event(db, stream_queue, run.id, "answer_completed", {"answer": answer}, user_id=user_id, thread_id=thread_id)
             already_streamed = state.get("_answer_delta_emitted", False)
             await _stream_answer_deltas(db, stream_queue, run.id, thread_id, user_id, answer, already_streamed=already_streamed)
             publish_event(db, stream_queue, run.id, "final_response_created", {"answer": answer, "answer_len": len(answer)}, user_id=user_id, thread_id=thread_id)

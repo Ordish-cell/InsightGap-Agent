@@ -1,6 +1,5 @@
 import pytest
 
-from src.web_app.agent.llm.config import clear_llm_settings_cache
 from src.web_app.agent.llm.errors import LLMParseError, LLMUnavailableError
 from src.web_app.agent.llm.factory import clear_chat_model_cache, get_chat_model
 from src.web_app.agent.llm.router import resolve_model_name
@@ -14,7 +13,6 @@ from src.web_app.tests.db_test_utils import make_test_session, configure_test_mo
 
 
 def _clear_llm():
-    clear_llm_settings_cache()
     clear_chat_model_cache()
 
 

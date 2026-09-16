@@ -6,7 +6,8 @@ from pydantic import ValidationError
 from sqlalchemy.orm import sessionmaker
 
 from src.web_app.agent.runtime import event_ledger
-from src.web_app.agent.runtime.emitter import RuntimeEventEmitter
+from types import SimpleNamespace
+from src.web_app.agent.runtime.finalization import emit
 from src.web_app.agent.runtime.event_ledger import publish_event
 from src.web_app.agent.runtime.ledger_stream import stream_ledger_events
 from src.web_app.db.repositories.agent_repository import AgentEventRepository
@@ -72,13 +73,12 @@ async def test_runtime_emitter_projects_the_persisted_event_identity():
     db = make_test_session()
     user, run = _run(db)
     queue = asyncio.Queue()
-    emitter = RuntimeEventEmitter(
-        db,
+    emit(
+        SimpleNamespace(db=db, _stream_queue=queue),
         {"run_id": run.id, "user_id": user.id, "thread_id": run.thread_id},
-        queue,
+        "run_paused",
+        {"status": "waiting_approval"},
     )
-
-    await emitter.status("run_paused", {"status": "waiting_approval"})
 
     event = AgentEventRepository(db).list_by_run(user.id, run.id)[0]
     streamed = queue.get_nowait()

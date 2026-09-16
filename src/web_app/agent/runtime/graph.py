@@ -6,7 +6,6 @@ from sqlalchemy.orm import Session
 
 from src.web_app.agent.runtime.checkpointers import build_checkpointer
 from src.web_app.agent.runtime.graph_config import build_langgraph_invoke_config
-from src.web_app.agent.runtime.langgraph_status import clear_status_stream_queue, set_status_stream_queue
 from src.web_app.agent.runtime.state import AgentRuntimeState
 from src.web_app.core.config import settings
 
@@ -32,8 +31,6 @@ class AgentRuntime:
         state["runtime_version"] = 2
         state["loop_protocol_version"] = 1
         state.setdefault("interaction_version", 2)
-        # Set module-level queue so append_status_step can push SSE events in real-time.
-        set_status_stream_queue(self._stream_queue)
         try:
             graph = await self._build_langgraph()
             cfg = build_langgraph_invoke_config(state)
@@ -47,7 +44,6 @@ class AgentRuntime:
                 return self._project_interrupt(result)
             raise RuntimeError("LangGraph is required for the Supervisor runtime")
         finally:
-            clear_status_stream_queue()
             await self._close_checkpointer()
 
     async def resume_from_interrupt(
@@ -100,7 +96,6 @@ class AgentRuntime:
 
         config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
         config["recursion_limit"] = max(50, settings.agent_max_supervisor_steps * 3 + 10)
-        set_status_stream_queue(self._stream_queue)
         try:
             graph = await self._build_langgraph()
             if not graph:
@@ -112,7 +107,6 @@ class AgentRuntime:
                 raise ValueError("LOOP_PROTOCOL_UNSUPPORTED: checkpoint predates the native Supervisor loop")
             result = self._project_interrupt(await graph.ainvoke(Command(resume=resume_payload), config=config))
         finally:
-            clear_status_stream_queue()
             await self._close_checkpointer()
         _log.info(
             "[approval_interrupt_resume] completed "

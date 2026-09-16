@@ -75,7 +75,7 @@
 在本仓库中：
 
 - `src/open_deep_research/` 保留官方 Open Deep Research 的核心研究图和配置。
-- `src/web_app/agent/adapters/open_deep_research_adapter.py` 将官方研究能力接入 Web App 的 Agent Runtime。
+- `src/web_app/research/open_deep_research_adapter.py` 将官方研究能力接入 Web App 的 Agent Runtime。
 - `research_agent` 负责在用户发起深度研究时调用该能力，并把结果接入本项目的 Artifact、Memory、Skill 和运行审计链路。
 
 也就是说，深度研究本身不是从零手写的临时 prompt，而是基于 LangChain 官方 Open Deep Research 工作流；本项目重点在其外围补齐产品化运行时、前端工作台、工具治理、审批恢复、上下文管理和成果沉淀。
@@ -607,11 +607,9 @@ POSTGRES_USER=postgres
 POSTGRES_PASSWORD=<你的本地数据库密码>
 POSTGRES_DATABASE=agent_os
 
-AGENT_LLM_ENABLED=true
-AGENT_LLM_PROVIDER=aliyun
+# 聊天模型在应用的模型设置页配置和选择。
 DASHSCOPE_API_KEY=<你的 DashScope Key>
 ALIYUN_BAILIAN_API_KEY=<你的阿里云百炼 Key，可与 DashScope 相同或按实际配置>
-ALIYUN_BAILIAN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 
 AGENT_CHECKPOINTER_BACKEND=postgres
 AGENT_CHECKPOINTER_REQUIRE_DURABLE=true

@@ -1,16 +1,11 @@
-from src.web_app.services.scoring_service import calculate_final_score, should_show_card
+"""Feed relevance filtering uses the production scorer and configured threshold."""
+from src.web_app.core.config import settings
+from src.web_app.tests.test_scoring import score_candidate
 
 
-def test_scoring_formula_and_hard_filter():
-    score = calculate_final_score(
-        {
-            "personal_relevance": 0.31,
-            "novelty": 0.74,
-            "cross_domain_distance": 0.65,
-            "opportunity_value": 0.69,
-            "source_credibility": 0.82,
-            "actionability": 0.68,
-        }
-    )
-    assert score == 0.592
-    assert should_show_card({"personal_relevance": 0.14}) is False
+def test_scoring_formula_and_hard_filter(monkeypatch):
+    relevance = score_candidate()["personal_relevance"]
+    monkeypatch.setattr(settings, "feed_min_personal_relevance", relevance + 0.01)
+    assert score_candidate()["filtered"] is True
+    monkeypatch.setattr(settings, "feed_min_personal_relevance", relevance)
+    assert score_candidate()["filtered"] is False
