@@ -72,13 +72,12 @@ flowchart TD
     OUT --> PG
 ```
 
-实际运行图包含七个节点：`permission_guard`、`bootstrap_context`、`supervisor`、`capability`、`deep_research`、`tool_runtime` 和 `document_read`。独立入口分类、旧 Planner / dispatcher / evaluator、JSON 正文转工具调用和独立回答模型已移除。
+实际运行图包含七个节点：`permission_guard`、`bootstrap_context`、`supervisor`、`capability`、`deep_research`、`tool_runtime` 和 `document_read`。
 
-- **模型选择固定**：当前任务使用选定模型，不会静默切换到另一个供应商或用 JSON 解析替代原生工具协议。工具任务需要模型支持原生 tool calling。
+- **模型选择固定**：当前任务使用选定模型，工具任务需要模型支持原生 tool calling。
 - **有界执行**：默认最多 12 次 Supervisor 决策、8 次工具执行、1 次深度研究，连续失败上限为 3 次；单个原生模型回合默认超时 60 秒。
 - **流式可追踪**：通过 `agent_text_started/delta/completed` 发布文本，结合事件账本恢复展示；使用 `text_id` 去重，断流时保留部分答案。
 - **控制有边界**：普通聊天和直接文档读取支持运行中追加指令；进入其他业务能力前关闭该类控制。
-- **版本有边界**：新任务记录 `runtime_version=2`、`loop_protocol_version=1`；旧历史仍可读取，旧 checkpoint 不转换、不恢复到新循环。
 
 实现入口见 [运行图](src/web_app/agent/runtime/graph_builder.py)、[Supervisor](src/web_app/agent/runtime/nodes.py) 和 [原生模型流协议](src/web_app/agent/llm/native_turn.py)。详细边界见 [原生运行架构](docs/native_runtime.md)。
 
@@ -303,7 +302,7 @@ npm run build
 
 `npm run build` 已包含 TypeScript 类型检查。浏览器验证脚本另需可用的浏览器、Playwright 和前端开发服务，不能直接视为上述 Node 测试的一部分。
 
-历史回归记录和验证边界见 [原生运行架构](docs/native_runtime.md)。离线通过不代表真实模型、ODR 外部调用、向量检索效果或跨进程恢复已在当前部署环境验证；这些需要单独配置并测试。
+离线测试覆盖运行时与业务逻辑。真实模型、ODR 外部调用、向量检索效果和跨进程恢复需要在部署环境中单独配置并测试。
 
 ## 界面预览
 
@@ -341,8 +340,6 @@ npm run build
 - [信息差产品定位](docs/gap_identity.md)
 - [信息流架构](docs/info_flow_architecture.md)
 - [会话删除与数据清理](docs/conversation_deletion.md)
-
-部分早期设计文档保留了迁移前的节点名或开关；当前运行时以源码和 `docs/native_runtime.md` 为准。
 
 ## 开源许可与致谢
 
