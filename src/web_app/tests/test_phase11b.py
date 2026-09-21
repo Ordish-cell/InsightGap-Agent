@@ -119,9 +119,7 @@ def test_one_sentence_value_is_chinese():
 
 
 def test_why_relevant_is_chinese():
-    text = _generate_why_relevant(
-        "Paper about agents", "agent", ["agent", "eval"], ["Agent", "RAG"], "arxiv"
-    )
+    text = _generate_why_relevant([])
     assert text
     assert _contains_chinese(text)
 

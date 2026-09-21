@@ -191,7 +191,7 @@ def _seed_cards_for_bucket(
         if score.get("filtered"):
             continue
 
-        card = generate_feed_card(info_item, score, profile)
+        card = generate_feed_card(info_item, score, profile, semantic_memories=semantic_memories)
         card["info_item_id"] = info_item.id
         card["source_url"] = info_item.source_url or ""
         card["content_hash"] = info_item.content_hash or ""
@@ -276,7 +276,7 @@ def ensure_bucket_minimums(
 # ── main refresh_feed (with full try/except, always logs completed/failed) ──
 
 def refresh_feed(db: Session, user_id: int, limit: int | None = None, batch_id: str | None = None) -> dict:
-    profile = _profile_with_defaults(ProfileRepository(db).get_or_create_default(user_id))
+    profile = ProfileRepository(db).get_or_create_default(user_id)
     total_limit = limit if limit else settings.feed_refresh_total_limit
     current_batch_id = batch_id or uuid.uuid4().hex[:12]
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -439,6 +439,7 @@ def refresh_feed(db: Session, user_id: int, limit: int | None = None, batch_id: 
                 "summary": card["summary"],
                 "original_title": card.get("original_title", card["title"]),
                 "why_relevant": card.get("why_relevant", card.get("why_you", "")),
+                "personalization_evidence": card.get("personalization_evidence", []),
                 "benefit": card.get("benefit", ""),
                 "next_action": card.get("next_action", ""),
                 "is_complete_batch": is_complete,
@@ -712,7 +713,7 @@ def list_home_cards(db: Session, user_id: int) -> dict:
 
 def list_cards(db: Session, user_id: int, status: str | None = None, exposure_bucket: str | None = None, limit: int = 20, offset: int = 0, source_type: str | None = None, domain: str | None = None, all: bool = False) -> dict:
     """Read-only: list feed cards for a user. Never triggers refresh."""
-    profile = _profile_with_defaults(ProfileRepository(db).get_or_create_default(user_id))
+    profile = ProfileRepository(db).get_or_create_default(user_id)
     feed_repo = FeedRepository(db)
 
     latest_batch = feed_repo.latest_batch_id(user_id)
@@ -887,7 +888,7 @@ def _process_items_into_cards(
             score = {"filtered": True}
         if score.get("filtered"):
             continue
-        card = generate_feed_card(info_item, score, profile)
+        card = generate_feed_card(info_item, score, profile, semantic_memories=semantic_memories)
         card["info_item_id"] = info_item.id
         card["source_url"] = info_item.source_url or ""
         card["content_hash"] = info_item.content_hash or ""
@@ -898,18 +899,6 @@ def _process_items_into_cards(
         card["search_bucket"] = meta.get("search_bucket", "")
         candidate_cards.append(card)
     return candidate_cards, created_info, updated_info
-
-
-def _profile_with_defaults(profile):
-    if not profile.explicit_interests:
-        profile.explicit_interests = ["LangGraph", "LangChain", "RAG", "MCP", "Agent"]
-    if not profile.goals:
-        profile.goals = ["开发个人信息差 Agent OS", "二开 Open Deep Research"]
-    if not profile.adjacent_domains:
-        profile.adjacent_domains = ["Agent UI", "AI 浏览器", "知识库", "自动化工作流"]
-    if not profile.far_domains:
-        profile.far_domains = ["创业机会", "行业情报", "投资研究", "教育产品"]
-    return profile
 
 
 def _safe_get_semantic_memories(user_id: int, db: Session) -> list[dict[str, Any]]:

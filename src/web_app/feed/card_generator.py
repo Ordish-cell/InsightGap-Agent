@@ -2,6 +2,8 @@ import re
 from hashlib import sha256
 from typing import Any
 
+from src.web_app.feed.personalization import match_user_facts, render_relevance
+
 _DOMAIN_CN = {
     "agent": "Agent",
     "rag": "RAG",
@@ -11,163 +13,48 @@ _DOMAIN_CN = {
     "ai": "AI",
 }
 
-_INTEREST_CN_MAP = {
-    "agent": "Agent 技术",
-    "rag": "RAG 检索增强",
-    "mcp": "MCP 协议",
-    "langgraph": "LangGraph 工作流",
-    "langchain": "LangChain 框架",
-    "skill": "Skill 复用",
-    "memory": "Memory 记忆",
-    "feed": "Feed 推荐",
-    "deep research": "Deep Research",
-    "devtools": "开发工具链",
-    "research": "AI 研究",
-    "startup": "产品机会",
-}
-
+# Templates describe the signal or suggest verification, never the reader's identity.
 _BENEFIT_TEMPLATES = {
-    "agent": [
-        "你可以用「{title}」的思路检查当前 Agent OS 的 Skill 自动生成和质量评估模块是否需要调整。",
-        "「{title}」能为你的 Agent 运行时增加一种新的上下文组织或工具调用思路。",
-        "「{title}」对 Agent 的自主决策和质量评估有直接参考价值。",
-        "从这个工作出发，你可以检查当前 Memory 和 Skill 系统是否需要适配。",
-        "它提供的方法可以迁移到你的 Agent OS（{domain_cn}场景），可能替换或增强现有模块。",
-        "它的设计决策可以帮助你避免在类似问题上踩坑，加速 Agent OS 迭代。",
-    ],
-    "rag": [
-        "你可以用「{title}」改进 RAG 检索精度和上下文拼接策略。",
-        "「{title}」能启发你在 Qdrant + LangChain 方案上做更精准的 chunk 设计和召回。",
-        "「{title}」对知识库产品的检索体验提升有直接帮助。",
-        "你可以对照这条信息，检查当前 RAG pipeline 的 chunk→embed→retrieve 三阶段。",
-        "它的方案可能直接替换你现有检索链路中的某个薄弱环节。",
-    ],
-    "devtools": [
-        "「{title}」可以帮助你优化开发工作流或选择更合适的技术组件。",
-        "「{title}」能减少重复造轮子，直接复用社区已验证的工程方案。",
-        "「{title}」对 FastAPI + Vite + React 技术栈的稳定性或性能有提升。",
-        "你可以评估是否将其纳入 Agent OS 的工具链，替代当前自研方案。",
-    ],
-    "startup": [
-        "「{title}」可以帮助你发现信息差 Agent OS 的产品差异化机会。",
-        "「{title}」能让你更早判断某个方向的竞争格局和入场时机。",
-        "「{title}」对产品定位和功能优先级排序有参考价值。",
-        "你可以把这条信号纳入产品路线图讨论，判断是否影响下一阶段优先级。",
-    ],
-    "research": [
-        "「{title}」可以帮助你判断某个技术路线是否值得深入研究或集成。",
-        "「{title}」能让你在技术选型时少走弯路，直接参考最新基准结果。",
-        "「{title}」对 Agent OS 的底层能力（推理、检索、评估）有提升潜力。",
-        "你可以把它的结论作为 Deep Research 模块的输入，生成一篇专题研究报告。",
-    ],
-    "ai": [
-        "「{title}」可以帮助你把握 AI 领域的整体趋势，发现跨领域的产品灵感。",
-        "「{title}」能让你在信息差 Agent OS 的规划中保持技术敏感度。",
-        "「{title}」对理解用户需求和市场方向有帮助。",
-    ],
-    # far_domain 专属 benefit —— 不写 Agent 技术
-    "far_domain": [
-        "「{title}」能帮你理解非技术领域的信号捕捉和反馈回路设计，这是 Feed 远域启发模块的核心能力。",
-        "「{title}」可以用于设计远域启发卡的评分与解释规则，把市场/用户信号转成可行动判断。",
-        "「{title}」在信号筛选和机会发现上的思路，可以迁移到 Feed 的非同温层信息采集流程中。",
-        "「{title}」展示的反馈回路机制，可以帮助你把信息差从技术资讯扩展为机会发现系统。",
-    ],
+    domain: [
+        "「{title}」可作为了解{domain_cn}方向的参考资料，具体价值需结合原文判断。",
+        "可从「{title}」中核对方法、适用条件和限制，作为{domain_cn}方向的研究素材。",
+    ]
+    for domain in (*_DOMAIN_CN, "far_domain")
 }
 
 _GAP_TEMPLATES = {
-    "agent": [
-        "多数人只把「{title}」当一篇 Agent 论文看，但它提出的方法可以直接影响 Agent OS 的 Skill 自动生成和质量评估体系。",
-        "表面上「{title}」在讨论 Agent 评估，实际上它揭示了一种可复用的能力沉淀模式，这正是你的 Skill 系统需要的。",
-        "「{title}」看起来是学术研究，但它的核心思路可以反向指导 Agent 运行时的上下文组织和工具选择策略。",
-        "大部分人忽略了「{title}」中对自主决策链路的设计，而这恰好是 Agent OS 区别于普通 Chatbot 的关键。",
-    ],
-    "rag": [
-        "多数人只关注「{title}」里的检索速度，但它的核心贡献在于上下文质量——这直接影响 Agent 回答的准确性。",
-        "表面上「{title}」是一篇检索论文，但它的分块和重排序策略可以迁移到你的知识库产品中。",
-        "大部分人忽略了「{title}」对多源异构文档的处理方式，而这恰好是 Agent OS 知识库的痛点。",
-    ],
-    "devtools": [
-        "多数人把「{title}」当普通开源项目看，但它解决的工作流自动化问题正是 Agent OS 开发效率的关键。",
-        "表面上「{title}」是个工具，但它背后的设计模式可以复用到你的 Agent 工具链中。",
-        "大部分人只关注「{title}」的功能列表，忽略了它的架构决策对类似系统的参考价值。",
-    ],
-    "startup": [
-        "多数人把「{title}」当行业新闻消费，但它背后反映的用户需求变化可能直接影响你的产品方向。",
-        "表面上「{title}」是一个融资或产品发布消息，但它验证的市场需求和你正在做的信息差 Agent OS 高度相关。",
-        "大部分人会忽略「{title}」对竞争格局的暗示，但早期信号往往藏在这样的信息里。",
-    ],
-    "research": [
-        "多数人只把「{title}」当一篇论文存档，但它提出的方法和你的 Deep Research 能力直接相关。",
-        "表面上「{title}」在讨论基准测试，但它揭示的能力瓶颈恰好是你下一步要优化的方向。",
-        "大部分人关注「{title}」的结果数字，但它的实验设计和消融研究对工程落地更有启发。",
-    ],
-    "ai": [
-        "多数人只会扫一眼「{title}」的标题，但它背后的技术趋势可能在未来几个月影响你的产品决策。",
-        "表面上「{title}」是一条普通的 AI 动态，但它连接了多个你关注的技术领域。",
-        "大部分人看过「{title}」就忘，但如果你把它和 Agent OS 的路线图对照，会发现有价值的技术信号。",
-    ],
-    # far_domain 专属 —— 不写 Agent 直接相关
-    "far_domain": [
-        "多数人把「{title}」当一条普通行业信息消费，但它展示的信号筛选和机会发现模式可以直接启发 Feed 远域模块的设计。",
-        "表面上「{title}」和你做的 Agent 系统没有直接关系，但它的反馈回路和信号捕捉机制值得远域启发模块借鉴。",
-        "「{title}」本身不属于 Agent/RAG 圈，但展示了弱信号如何被产品化捕捉和放大。",
-        "远域启发点不在技术栈，而在信号筛选、反馈回路和机会发现流程——这正是「{title}」的价值所在。",
-    ],
+    domain: [
+        "围绕「{title}」，值得进一步核对原始证据、适用条件及尚未解决的问题。",
+        "「{title}」提供了一条待验证的信息线索，可对照相关来源检查结论与局限。",
+    ]
+    for domain in (*_DOMAIN_CN, "far_domain")
 }
 
 _NEXT_ACTIONS = [
-    "把「{title}」带入对话，让 Agent 分析这条信息对你当前阶段的具体启发。",
-    "对「{title}」做一次深度研究，输出可迁移到 Agent OS 的 3 个设计点。",
-    "保存「{title}」到知识库，作为后续 Skill 设计或技术决策的参考素材。",
-    "让 Agent 从「{title}」中提炼可复用的方法论，沉淀为 Skill。",
-    "对照「{title}」检查当前 Agent OS 的相关模块是否有改进空间。",
-    "将「{title}」的核心发现记录到记忆系统，供后续对话自动引用。",
+    "把「{title}」带入对话，分析原文中的主要观点与证据。",
+    "对「{title}」做一次深度研究，核对来源、适用条件和限制。",
+    "保存「{title}」作为后续研究的参考素材。",
+    "对照其他来源验证「{title}」的结论。",
 ]
 
 _VALUE_PREFIXES = {
-    "agent": ["这条信息揭示了 Agent 系统设计的一个新思路：", "它提示你 Agent 能力可以这样扩展：", "这项研究为 Agent 产品化提供了一个新角度：", "它展示了一种可以迁移到 Agent OS 的方法："],
-    "rag": ["这条信息展示了 RAG 技术的一个改进方向：", "它提示你检索增强可以从这个维度优化：", "这项研究为知识库产品提供了一个新思路：", "它提供了一种提升检索质量的方法："],
-    "devtools": ["这个项目展示了一种更高效的开发方式：", "它提供了一个可以集成到 Agent OS 的工具思路：", "这个工具解决了一个开发效率痛点：", "它可能替代你当前工具链中的某个环节："],
-    "startup": ["这条信息暗示了一个产品机会：", "它验证了市场对某类 AI 产品的需求：", "这个动态可能影响你的产品优先级：", "它揭示了一个值得关注的竞争信号："],
-    "research": ["这项研究的结论值得关注：", "它揭示了一个可能改变技术路线的新发现：", "这个研究方向可能成为下一个能力突破点：", "它的实验结论对工程落地有直接启发："],
-    "ai": ["这条信息标记了一个值得关注的趋势：", "它连接了多个你关注的技术方向：", "这个动态可能影响 AI 产品的下一阶段演进：", "它提供了一个跨领域的灵感信号："],
-    # far_domain 专属 —— 非 Agent 语言
-    "far_domain": [
-        "这条来自远域的信息展示了一种信号捕捉模式：",
-        "它来自非技术领域，但反馈机制值得借鉴：",
-        "这条信息标记了一个容易被技术圈忽略的机会信号：",
-        "它展示了如何把市场变化转成可行动的判断依据：",
-    ],
-}
-
-_WHY_RELEVANT_PREFIXES = {
-    "agent": ["与你正在构建的 Agent OS 直接相关，", "你的 Agent 运行时架构可以从「{title}」中借鉴思路，", "你当前阶段的 Agent 能力建设正好需要这类方案，"],
-    "rag": ["你的知识库产品依赖 RAG 能力，", "你的 Agent 检索和上下文构建正好需要「{title}」里的优化，", "你基于 Qdrant 的 RAG 方案可以从「{title}」中获得改进灵感，"],
-    "devtools": ["你的 FastAPI + Vite + React 技术栈可以从「{title}」中受益，", "「{title}」解决的工作流问题正是你开发效率的关键，", "「{title}」可以减少你在工具链上的试错成本，"],
-    "startup": ["你正在做的信息差 Agent OS 属于这个赛道，", "「{title}」能帮你判断产品定位是否准确，", "「{title}」可能影响你下一步的功能优先级决策，"],
-    "research": ["你的 Deep Research 能力可以从「{title}」中获得方法升级，", "「{title}」和你的 Agent OS 研究模块高度相关，", "「{title}」的结论可能影响你的技术路线选择，"],
-    "ai": ["「{title}」和你关注的多个技术方向都有交集，", "「{title}」能帮你保持对 AI 趋势的敏感度，", "「{title}」可能启发你的产品规划或技术选型，"],
-    # far_domain 专属 —— 不以 Agent 技术为核心
-    "far_domain": [
-        "它不是你当前技术栈的直接内容，但能启发 Feed 如何发现非同温层机会，",
-        "它能帮助你把信息差从技术资讯扩展为机会发现系统，",
-        "这条信息来自远域，价值不在于技术栈匹配，而在于信号捕捉和反馈回路设计，",
-    ],
+    domain: ["一条值得核对的信息线索：", "可进一步阅读的资料："]
+    for domain in (*_DOMAIN_CN, "far_domain")
 }
 
 
-def generate_feed_card(info_item: Any, score: dict[str, Any], user_profile: Any) -> dict[str, Any]:
+def generate_feed_card(info_item: Any, score: dict[str, Any], user_profile: Any, semantic_memories: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     domain = (info_item.raw_metadata or {}).get("domain", "ai")
     tags = (info_item.raw_metadata or {}).get("tags", info_item.topics or [])
     source_type = info_item.source_type or "web"
-    interests = getattr(user_profile, "explicit_interests", None) or ["Agent", "RAG"]
     original_title = info_item.title
     relation_type = score.get("relation_type", "far_domain")
     source_kind = (info_item.raw_metadata or {}).get("source_kind", "")
 
     chinese_title = _generate_chinese_title(original_title, source_type, tags, domain, relation_type, source_kind)
     one_sentence_value = _generate_one_sentence_value(original_title, domain, tags, source_type, relation_type)
-    why_relevant = _generate_why_relevant(original_title, domain, tags, interests, source_type, relation_type)
+    personalization_evidence = match_user_facts(info_item, user_profile, semantic_memories or [])
+    why_relevant = _generate_why_relevant(personalization_evidence)
     benefit = _generate_benefit(domain, tags, original_title, relation_type)
     information_gap = _generate_information_gap(domain, tags, source_type, original_title, relation_type)
     next_action = _generate_next_action(domain, source_type, original_title)
@@ -201,6 +88,7 @@ def generate_feed_card(info_item: Any, score: dict[str, Any], user_profile: Any)
         "confidence": score["confidence"],
         "status": "active",
         "why_relevant": why_relevant,
+        "personalization_evidence": personalization_evidence,
         "benefit": benefit,
         "next_action": next_action,
         "original_title": original_title,
@@ -229,6 +117,8 @@ def validate_card_quality(card: dict[str, Any]) -> dict[str, Any]:
         issues.append("why_relevant_empty")
     if not benefit:
         issues.append("benefit_empty")
+    if not next_action:
+        issues.append("next_action_empty")
     if not evidence:
         issues.append("evidence_empty")
 
@@ -237,13 +127,16 @@ def validate_card_quality(card: dict[str, Any]) -> dict[str, Any]:
         display_name = original_title or title or "未命名信息差"
         card["title"] = f"{display_name}——{domain_cn}领域新信号"
         if not info_gap:
-            card["information_gap"] = f"这条来自{domain_cn}领域的信息「{display_name}」值得关注，建议带入对话让 Agent 分析其与你当前系统的关联。"
+            card["information_gap"] = f"这条来自{domain_cn}领域的信息「{display_name}」值得关注，可进一步核对原文证据和适用条件。"
         if not why_relevant:
-            card["why_relevant"] = f"「{display_name}」涉及{domain_cn}方向，与你的信息差 Agent OS 技术路线可能存在交集。"
+            card["why_relevant"] = render_relevance(card.get("personalization_evidence") or [])
         if not benefit:
-            card["benefit"] = f"理解「{display_name}」可以帮助你判断{domain_cn}方向的技术选型和产品决策。"
+            card["benefit"] = f"「{display_name}」可作为了解{domain_cn}方向的参考资料。"
+        if not next_action:
+            card["next_action"] = f"核对「{display_name}」的原始来源与证据。"
         card["_quality_issues"] = issues
 
+    card["why_you"] = card["why_relevant"]
     return card
 
 
@@ -423,16 +316,16 @@ def _github_title(title: str, domain: str, tags: list[str]) -> str:
 
 
 def _far_domain_title(title: str, domain: str, tags: list[str], source_kind: str = "") -> str:
-    """Generate a far_domain title — NEVER mention Agent/GitHub/RAG/MCP directly."""
+    """Describe a discovery signal while preserving the source's entity names."""
     entity = _extract_entity_name(title)
     topic = _build_cn_topic(title, tags, domain)
     # For bucket_seed far_domain, use clean generic templates
     templates = [
-        f"「{entity}」——远域信号捕捉模式",
-        f"从「{entity}」看非技术领域的反馈回路",
-        f"「{entity}」：弱信号如何被产品化捕捉",
-        f"远域启发：「{entity}」中的机会发现思路",
-        f"「{entity}」——信号筛选与行动判断",
+        f"「{entity}」——待探索的远域信号",
+        f"远域阅读线索：「{entity}」",
+        f"「{entity}」：可进一步核对的资料",
+        f"远域探索：「{entity}」的观点与证据",
+        f"「{entity}」——信息来源与适用条件",
         f"来自{topic}领域的远域信号：「{entity}」",
     ]
     idx = _stable_hash(title) % len(templates)
@@ -474,30 +367,11 @@ def _generate_one_sentence_value(title: str, domain: str, tags: list[str], sourc
     idx = _stable_hash(title + "value") % len(prefixes)
     keywords = _extract_keywords(title, tags)
     entity = _extract_entity_name(title)
-    suffix_templates = [
-        f"「{entity}」可能改变你对{keywords}的理解和技术选型。",
-        f"「{entity}」提供了一种可复用的思路，能直接改进你的{_DOMAIN_CN.get(domain, 'AI')}模块。",
-        f"「{entity}」标记了一个容易被忽略但实际很重要的技术信号。",
-        f"「{entity}」把{keywords}和你当前的产品方向连接了起来。",
-        f"「{entity}」的核心变化在于：它可能影响你现有{_DOMAIN_CN.get(domain, 'AI')}系统的设计决策。",
-    ]
-    suffix_idx = _stable_hash(title + "suffix") % len(suffix_templates)
-    return prefixes[idx] + suffix_templates[suffix_idx]
+    return prefixes[idx] + f"「{entity}」涉及{keywords}，具体观点与证据见原始来源。"
 
 
-def _generate_why_relevant(title: str, domain: str, tags: list[str], interests: list[str], source_type: str, relation_type: str = "") -> str:
-    template_key = "far_domain" if relation_type == "far_domain" else domain
-    prefixes = _WHY_RELEVANT_PREFIXES.get(template_key, _WHY_RELEVANT_PREFIXES["ai"])
-    idx = _stable_hash(title + "why") % len(prefixes)
-    matched = [t for t in tags if t.lower() in " ".join(interests).lower()]
-    entity = _extract_entity_name(title)
-    if relation_type == "far_domain":
-        suffix = f"它和你当前的技术栈没有直接关系，但价值在于信号捕捉和机会发现的方法。"
-    elif matched:
-        suffix = f"尤其涉及你关注的 {matched[0]}。"
-    else:
-        suffix = f"「{entity}」和你的信息差 Agent OS 技术路线有交集。"
-    return prefixes[idx].format(title=entity) + suffix
+def _generate_why_relevant(evidence: list[dict[str, Any]]) -> str:
+    return render_relevance(evidence)
 
 
 def _generate_benefit(domain: str, tags: list[str], title: str, relation_type: str = "") -> str:
@@ -527,7 +401,7 @@ def _generate_chinese_summary(original_title: str, summary: str, domain: str) ->
     if summary and len(summary) > 20:
         return summary[:200]
     domain_cn = _DOMAIN_CN.get(domain, "AI")
-    return f"这条来自{domain_cn}领域的信息值得进一步研究，可能对你的产品和技术决策有参考价值。"
+    return f"这条来自{domain_cn}领域的信息值得进一步研究，具体观点与适用条件需查阅原始来源。"
 
 
 def _extract_keywords(text: str, tags: list[str]) -> str:
