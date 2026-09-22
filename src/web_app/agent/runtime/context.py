@@ -167,6 +167,8 @@ async def bootstrap(nodes, state):
         k: bool(request.get(k)) and k in explicit
         for k in ("save_artifact", "write_memory", "create_skill_draft")
     }
+    from src.web_app.memory.basic_facts import prepare
+    prepare(nodes.db, state)
     return state
 
 
@@ -197,6 +199,9 @@ def bounded_prompt(state, system, limit):
                 }
                 for r in state.get("observations", [])
             ],
+            **({"basic_memory": state["basic_memory"],
+                "basic_memory_instruction": "Basic facts are handled after your answer. Do not save, claim saved, or ask confirmation for these facts yourself."}
+               if state.get("basic_memory", {}).get("facts") or state.get("basic_memory", {}).get("blocked") else {}),
             "save_policy": state.get("save_policy", {}),
             "writes_denied": state.get("writes_denied", False),
         },

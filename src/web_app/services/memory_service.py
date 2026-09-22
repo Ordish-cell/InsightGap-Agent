@@ -84,6 +84,12 @@ class MemoryService:
             metadata = source_type
             source_type = ""
 
+        metadata = dict(metadata or {})
+        metadata.setdefault("status", "active")
+        metadata.setdefault("visible_in_long_term_memory", memory_type in self._QDRANT_MEMORY_TYPES)
+        if memory_type == "working":
+            metadata["visible_in_long_term_memory"] = False
+
         if db:
             from src.web_app.services.deletion_guard import check_conversation
             from src.web_app.agent.runtime.chat_control import execution
@@ -104,54 +110,7 @@ class MemoryService:
                 source_type=source_type,
                 metadata_json=metadata or {},
             )
-            qdrant_point_id = None
-            qdrant_indexed = False
-            qdrant_error = None
-            # ── Fire-and-forget Qdrant upsert ─────────────────────────
-            store = self._get_qdrant_store() if memory_type in self._QDRANT_MEMORY_TYPES else None
-            if store is not None:
-                try:
-                    qdrant_point_id = store.upsert_memory(
-                        memory_id=item.id,
-                        user_id=user_id,
-                        content=content,
-                        memory_type=memory_type,
-                        importance=importance,
-                        source_type=source_type,
-                        metadata=metadata,
-                    )
-                    qdrant_indexed = True
-                    # Mark as indexed in PG metadata (best-effort)
-                    try:
-                        MemoryRepository(db).update(
-                            item,
-                            qdrant_point_id=qdrant_point_id,
-                            metadata_json={
-                                **(item.metadata_json or {}),
-                                "qdrant_indexed": True,
-                            },
-                        )
-                    except Exception:
-                        pass  # metadata update is non-critical
-                except Exception as exc:
-                    qdrant_error = str(exc)[:200]
-                    logger.warning("memory.qdrant_upsert_failed", exc_info=True)
-            result = self._to_dict(item)
-            result.update({
-                "ok": True,
-                "qdrant_point_id": qdrant_point_id,
-                "qdrant_indexed": qdrant_indexed,
-                "deduped": False,
-                "updated_existing": False,
-                "error": qdrant_error,
-                "category": (metadata or {}).get("category", ""),
-                "status": (metadata or {}).get("status", "active"),
-            })
-            graph_result = self._sync_memory_graph(user_id, item)
-            if graph_result.get("warning"):
-                result["graph_warning"] = graph_result["warning"]
-            result["graph_indexed"] = bool(graph_result.get("synced"))
-            return result
+            return self._index_saved(item, db)
         item = {
             "id": len(self._items) + 1,
             "user_id": user_id,
@@ -170,6 +129,115 @@ class MemoryService:
         }
         self._items.append(item)
         return item
+
+    def _index_saved(self, item, db):
+        user_id, content, memory_type = item.user_id, item.content, item.memory_type
+        importance, source_type, metadata = item.importance, item.source_type, item.metadata_json
+        result = self._to_dict(item)
+        qdrant_point_id = None
+        qdrant_indexed = False
+        qdrant_error = None
+        # PostgreSQL is authoritative; vector indexing is best-effort.
+        store = self._get_qdrant_store() if memory_type in self._QDRANT_MEMORY_TYPES else None
+        if store is not None:
+            try:
+                qdrant_point_id = store.upsert_memory(
+                    memory_id=item.id,
+                    user_id=user_id,
+                    content=content,
+                    memory_type=memory_type,
+                    importance=importance,
+                    source_type=source_type,
+                    metadata=metadata,
+                )
+                qdrant_indexed = True
+                # Mark as indexed in PG metadata (best-effort)
+                try:
+                    MemoryRepository(db).update(
+                        item,
+                        qdrant_point_id=qdrant_point_id,
+                        metadata_json={
+                            **(item.metadata_json or {}),
+                            "qdrant_indexed": True,
+                        },
+                    )
+                    result["metadata"] = {**metadata, "qdrant_indexed": True}
+                except Exception:
+                    db.rollback()  # The memory transaction already committed.
+            except Exception as exc:
+                qdrant_error = str(exc)[:200]
+                logger.warning("memory.qdrant_upsert_failed", exc_info=True)
+        result.update({
+            "ok": True,
+            "qdrant_point_id": qdrant_point_id,
+            "qdrant_indexed": qdrant_indexed,
+            "deduped": False,
+            "updated_existing": False,
+            "error": qdrant_error,
+            "category": (metadata or {}).get("category", ""),
+            "status": (metadata or {}).get("status", "active"),
+        })
+        graph_result = self._sync_memory_graph(user_id, item)
+        if graph_result.get("warning"):
+            result["graph_warning"] = graph_result["warning"]
+        result["graph_indexed"] = bool(graph_result.get("synced"))
+        return result
+
+    @guarded_transition
+    def save_basic_fact(self, user_id, fact, provenance, db):
+        """Serialize per user and atomically replace a fixed key before indexing."""
+        from sqlalchemy import select
+        from src.web_app.models.orm import Memory, User
+        from src.web_app.memory.basic_facts import LABELS, content_for
+        from src.web_app.services.deletion_guard import check_conversation
+        if fact.get("key") not in LABELS or not fact.get("value"):
+            raise ValueError("invalid_basic_fact")
+        check_conversation(db, user_id, provenance.get("conversation_id"), require_exists=bool(provenance.get("conversation_id")))
+        db.execute(select(User).where(User.id == user_id).with_for_update()).scalar_one()
+        rows = MemoryRepository(db).list_by_user(user_id)
+        active = [m for m in rows if (m.metadata_json or {}).get("fact_key") == fact["key"]
+                  and (m.metadata_json or {}).get("status", "active") == "active"]
+        same = next((m for m in active if m.metadata_json.get("fact_value") == fact["value"]), None)
+        if same:
+            return {**self._to_dict(same), "ok": True, "deduped": True,
+                    "qdrant_indexed": bool(same.metadata_json.get("qdrant_indexed"))}
+        meta = {**provenance, "fact_key": fact["key"], "fact_value": fact["value"],
+                "category": fact["key"], "confirmed": True, "confidence": 1.0,
+                "status": "active", "visible_in_long_term_memory": True, "stability": "long_term"}
+        item = Memory(user_id=user_id, content=content_for(fact), memory_type="semantic",
+                      importance=0.95, source_type="confirmed_basic_fact", metadata_json=meta)
+        try:
+            db.add(item)
+            db.flush()
+            for old in active:
+                old.metadata_json = {**old.metadata_json, "status": "superseded", "superseded_by": item.id}
+            db.commit()
+            db.refresh(item)
+        except Exception:
+            db.rollback()
+            raise
+        return self._index_saved(item, db)
+
+    @guarded_transition
+    def restore_memory(self, user_id, item, db):
+        """Restoring a fixed-key fact also replaces its current active value."""
+        from sqlalchemy import select
+        from src.web_app.models.orm import User
+        meta = dict(item.metadata_json or {})
+        key = meta.get("fact_key")
+        if key:
+            db.execute(select(User).where(User.id == user_id).with_for_update()).scalar_one()
+            for other in MemoryRepository(db).list_by_user(user_id):
+                previous = other.metadata_json or {}
+                if other.id != item.id and previous.get("fact_key") == key and previous.get("status", "active") == "active":
+                    other.metadata_json = {**previous, "status": "superseded", "superseded_by": item.id}
+        meta.pop("superseded_by", None)
+        item.metadata_json = {**meta, "status": "active"}
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
 
     def add_with_dedup(
         self,
@@ -190,6 +258,8 @@ class MemoryService:
     def _find_similar(self, user_id: int, content: str, memory_type: str, db: Session) -> Any:
         existing = MemoryRepository(db).search_by_type(user_id, memory_type=memory_type, min_importance=0.3)
         for mem in existing:
+            if (mem.metadata_json or {}).get("fact_key"):
+                continue  # Fixed-key facts must never be merged by text similarity.
             if self._similarity(content, mem.content) >= 0.55:
                 return mem
         return None
@@ -293,7 +363,7 @@ class MemoryService:
                 s = (m.metadata_json or {}).get("status", "active")
             else:
                 s = (m.get("metadata", {}) or {}).get("status", "active")
-            return s not in ("superseded", "archived")
+            return s == "active"
 
         def _effective_importance(mem_dict: dict) -> float:
             imp = float(mem_dict.get("importance", 0) or 0)
@@ -422,39 +492,27 @@ class MemoryService:
 
         Read-only by contract: no writes, no consolidation, no importance updates.
         """
+        from src.web_app.memory.basic_facts import LABELS
         allowed = set(categories or {
-            "name_preference", "language_preference", "tone_preference",
-            "answer_preference", "project_goal", "tech_stack", "boundary",
-            "workflow_pattern",
+            "name_preference", "language_preference", "tone_preference", "answer_preference",
+            "project_goal", "tech_stack", "boundary", "workflow_pattern", *LABELS,
         })
-        if not db:
-            items = [
-                item for item in self._items
-                if item.get("user_id") == user_id
-                and item.get("memory_type") == "semantic"
-                and float(item.get("importance") or 0) >= min_importance
-                and ((item.get("metadata") or {}).get("category", "") in allowed)
-            ]
-            return sorted(items, key=lambda item: float(item.get("importance") or 0), reverse=True)[:limit]
-
-        repo = MemoryRepository(db)
-        rows = repo.list_recent_important(
-            user_id=user_id,
-            memory_type="semantic",
-            min_importance=min_importance,
-            limit=max(limit * 3, limit),
-        )
-        results: list[dict[str, Any]] = []
-        for row in rows:
-            meta = row.metadata_json or {}
-            if meta.get("status", "active") in {"superseded", "archived"}:
+        items = ([self._to_dict(m) for m in MemoryRepository(db).search_by_type(user_id, "semantic", min_importance)]
+                 if db else [m for m in self._items if m.get("user_id") == user_id and m.get("memory_type") == "semantic"])
+        eligible = []
+        for item in items:
+            meta = item.get("metadata") or {}
+            if (float(item.get("importance") or 0) < min_importance
+                or meta.get("status", "active") != "active"
+                or not meta.get("visible_in_long_term_memory", True)
+                or float(meta.get("confidence", 1) or 0) < 0.55
+                or meta.get("category") not in allowed):
                 continue
-            if meta.get("category", "") not in allowed:
+            if meta.get("category") in LABELS and not meta.get("confirmed"):
                 continue
-            results.append(self._to_dict(row))
-            if len(results) >= limit:
-                break
-        return results
+            eligible.append(item)
+        return sorted(eligible, key=lambda m: (not bool(m["metadata"].get("confirmed") and m["metadata"].get("fact_key") in LABELS),
+                      -float(m["importance"]), -int(m["id"])))[:limit]
 
     def get_semantic_memories(self, user_id: int, db: Session, min_importance: float = 0.3) -> list[dict[str, Any]]:
         return [self._to_dict(item) for item in MemoryRepository(db).search(user_id, memory_type="semantic", min_importance=min_importance)]

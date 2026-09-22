@@ -160,6 +160,11 @@ class LocalMCPProvider:
         return {"memories": memory_service.search_memory(user_id, query=query, db=db)[:limit]}
 
     def _add_memory(self, db: Session, user_id: int, payload: dict[str, Any], agent_run_id: int | None) -> dict[str, Any]:
+        from src.web_app.memory.basic_facts import authorized_fact, content_for
+        grant = authorized_fact.get()
+        if grant and grant["user_id"] == user_id and grant["run_id"] == agent_run_id and payload.get("content") == content_for(grant["fact"]):
+            memory = memory_service.save_basic_fact(user_id, grant["fact"], grant["provenance"], db)
+            return {"memory_id": memory["id"], "memory": memory}
         memory = memory_service.add_memory(user_id=user_id, content=str(payload.get("content", "")), memory_type=str(payload.get("memory_type", "episodic")), importance=float(payload.get("importance", 0.5)), metadata={"source_type": "mcp_tool", "agent_run_id": agent_run_id}, db=db)
         return {"memory_id": memory["id"], "memory": memory}
 

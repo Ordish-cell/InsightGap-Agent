@@ -226,7 +226,13 @@ class SupervisorNodes:
         else:
             budget["steps"] += 1
         try:
-            result, actions = await self.model_turn(state, tools_enabled=not limited)
+            # A facts-only turn uses its deterministic save hook, not model-selected writes.
+            request = state.get("request", {})
+            basic_turn = bool(state.get("basic_memory", {}).get("facts")) and (
+                request.get("route") in {None, "chat", "memory"}
+                and not request.get("tool_name") and not request.get("attachment_ids")
+            )
+            result, actions = await self.model_turn(state, tools_enabled=not limited and not basic_turn)
             state.pop("native_protocol_error", None)
         except (NativeProtocolError, ValidationError) as exc:
             budget["consecutive_failures"] += 1
@@ -249,7 +255,7 @@ class SupervisorNodes:
             from .hooks import save_outputs
             from .policy import check_answer
             await save_outputs(self, state, result.text)
-            note = check_answer(self, state, result.text)
+            note = "\n\n".join(n for n in (check_answer(self, state, result.text), state.get("basic_memory_note")) if n)
             return finish(self, state, result.text + ("\n\n" + note if note else ""))
         call = result.tool_call
         kind, args = actions[call["name"]], call["args"]

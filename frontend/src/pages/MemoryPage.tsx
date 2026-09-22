@@ -68,7 +68,8 @@ export function MemoryPage() {
   const [ltPageSize] = useState(20)
   const [ltType, setLtType] = useState('')
   const [ltCategory, setLtCategory] = useState('')
-  const [ltStatus, setLtStatus] = useState('')
+  const [ltStatus, setLtStatus] = useState('active')
+  const [actionMessage, setActionMessage] = useState('')
   const [ltQuery, setLtQuery] = useState('')
   const [ltLoading, setLtLoading] = useState(false)
   const [ltError, setLtError] = useState('')
@@ -78,6 +79,7 @@ export function MemoryPage() {
 
   async function load() {
     setLoading(true)
+    setError('')
     try {
       const [s, p] = await Promise.all([
         fetchMemorySummary() as Promise<SummaryLike>,
@@ -118,7 +120,8 @@ export function MemoryPage() {
 
   async function loadSearch() {
     try {
-      setSearchItems(await search({ query }))
+      setSearchItems((await search({ query })).filter(item =>
+        ['semantic', 'episodic'].includes(item.memory_type || '') && item.metadata?.visible_in_long_term_memory !== false))
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : '搜索失败')
     }
@@ -142,24 +145,35 @@ export function MemoryPage() {
     return map[s] || ''
   }
 
-  async function handleReflect() { await apiRequest('/memory/reflect', { method: 'POST', body: {} }); await load() }
-  async function handleForget(id: number) { await forget({ memory_id: id }); await load() }
-
-  // ── Long-term actions ──
-  async function handleArchive(id: number) {
-    try { await archiveMemory(id); void loadLongTerm() } catch (e) { setLtError(e instanceof Error ? e.message : '归档失败') }
+  async function runAction(action: () => Promise<unknown>, message: string) {
+    setActionMessage('')
+    setError('')
+    try {
+      const result = await action() as Record<string, unknown> | undefined
+      const detail = typeof result?.total_promoted === 'number'
+        ? `已整理 ${result.total_promoted} 条记忆。`
+        : Array.isArray(result?.summaries) && Array.isArray(result?.archived)
+          ? `生成 ${result.summaries.length} 条汇总，归档 ${result.archived.length} 条碎片。`
+          : message
+      setActionMessage(result?.reason === 'not_enough_memories' ? '可整理的记忆不足，未作修改。' : detail)
+      await Promise.all([load(), loadLongTerm()])
+      if (tab === 'search') await loadSearch()
+    } catch (exc) {
+      setError(exc instanceof Error ? exc.message : '记忆操作失败')
+    }
   }
-  async function handleRestore(id: number) {
-    try { await restoreMemory(id); void loadLongTerm() } catch (e) { setLtError(e instanceof Error ? e.message : '恢复失败') }
-  }
+  async function handleReflect() { await runAction(() => apiRequest('/memory/reflect', { method: 'POST', body: {} }), '碎片整理完成。') }
+  async function handleForget(id: number) { await runAction(() => forget({ memory_id: id }), '记忆已删除。') }
+  async function handleArchive(id: number) { await runAction(() => archiveMemory(id), '记忆已归档。') }
+  async function handleRestore(id: number) { await runAction(() => restoreMemory(id), '记忆已恢复。') }
   function handleDeleteClick(id: number) {
     setConfirm({
       title: '删除记忆', message: '确定要永久删除这条记忆吗？此操作不可撤销。', danger: true,
-      action: async () => { try { await deleteMemory(id); void loadLongTerm() } catch (e) { setLtError(e instanceof Error ? e.message : '删除失败') } finally { setConfirm(null) } },
+      action: async () => { await runAction(() => deleteMemory(id), '记忆已删除。'); setConfirm(null) },
     })
   }
   async function handleImportanceChange(id: number, value: number) {
-    try { await updateMemory(id, { importance: Math.max(0, Math.min(1, value)) }); void loadLongTerm() } catch { /* ignore */ }
+    await runAction(() => updateMemory(id, { importance: Math.max(0, Math.min(1, value)) }), '重要性已更新。')
   }
 
   const totalPages = Math.max(1, Math.ceil(ltTotal / ltPageSize))
@@ -168,14 +182,17 @@ export function MemoryPage() {
     <section className="workbench-page memory-page">
       <PageHeader
         title="Agent 已记住的长期设定"
-        description="Agent 从你的对话和行为中持续提炼长期设定。这里不是偏好设置页面——设定会随你的使用自动成长和演变。"
+        description="称呼、回答语言和简繁偏好经你确认后跨会话保存；其他内容按明确请求保存。"
         actions={
           <div style={{ display: 'flex', gap: 8 }}>
             <button className="button secondary" onClick={handleReflect}>整理碎片</button>
-            <button className="button secondary" onClick={() => consolidate().then(load)}>整理记忆</button>
+            <button className="button secondary" onClick={() => runAction(consolidate, '记忆整理完成。')}>整理记忆</button>
           </div>
         }
       />
+      {error && <ErrorState message={error} />}
+      {actionMessage && <p role="status">{actionMessage}</p>}
+      <p className="muted small">统计范围：当前用户可见且生效中的长期设定与行为事件。</p>
       <div className="metric-row">
         <div className="metric-card"><strong>{profile?.semantic_count ?? summary?.semantic_count ?? '-'}</strong><span>长期设定</span></div>
         <div className="metric-card"><strong>{profile?.episodic_count ?? summary?.episodic_count ?? '-'}</strong><span>行为事件</span></div>
@@ -199,6 +216,9 @@ export function MemoryPage() {
             </select>
             <select className="input" value={ltCategory} onChange={e => { setLtCategory(e.target.value); setLtPage(1) }} style={{ width: 140 }}>
               <option value="">全部分类</option>
+              <option value="preferred_name">称呼</option>
+              <option value="response_language">回答语言</option>
+              <option value="script_preference">简繁偏好</option>
               <option value="tech_stack">技术栈</option>
               <option value="preference">产品偏好</option>
               <option value="project_goal">项目目标</option>
@@ -208,7 +228,7 @@ export function MemoryPage() {
               <option value="uncategorized">其他</option>
             </select>
             <select className="input" value={ltStatus} onChange={e => { setLtStatus(e.target.value); setLtPage(1) }} style={{ width: 120 }}>
-              <option value="">全部状态</option>
+              <option value="all">全部状态</option>
               <option value="active">生效中</option>
               <option value="archived">已归档</option>
               <option value="superseded">已替代</option>
@@ -223,7 +243,7 @@ export function MemoryPage() {
 
           {ltError && <ErrorState message={ltError} />}
           {ltLoading ? <LoadingState title="正在加载长期记忆" /> : !ltItems.length ? (
-            <EmptyState title="暂无长期记忆" description="Agent 运行、深度研究和工具调用会逐步形成可控记忆。" />
+            <EmptyState title="暂无长期记忆" description="你可以说“我叫常”，确认后保存；也可以直接说“记住，我叫常”。" />
           ) : (
             <>
               <div className="memory-list">
@@ -286,7 +306,7 @@ export function MemoryPage() {
             <button className="button">搜索</button>
           </form>
           {error ? <ErrorState message={error} /> : loading ? <LoadingState title="正在加载记忆" /> : !searchItems.length ? (
-            <EmptyState title="暂无匹配记忆" description="Agent 运行、深度研究和工具调用会逐步形成可控记忆。" />
+            <EmptyState title="暂无匹配记忆" description="你可以说“我叫常”，确认后保存；也可以直接说“记住，我叫常”。" />
           ) : (
             <div className="memory-list">
               {searchItems.map((item) => (
@@ -308,7 +328,7 @@ export function MemoryPage() {
       {tab === 'growth' && (
         <>
           {error ? <ErrorState message={error} /> : loading ? <LoadingState title="正在加载长期设定" /> : !profile?.categories?.length ? (
-            <EmptyState title="Agent 还没记住你的长期设定" description="多和 Agent 对话，让它帮你做研究、生成 Artifact、管理 Feed。设定会逐渐从你的行为中自动提炼。" />
+            <EmptyState title="Agent 还没记住你的长期设定" description="称呼、回答语言和简繁偏好经确认后保存，其他内容按你的明确请求保存。" />
           ) : (
             <div className="growth-categories">
               {profile.categories.map((cat) => (

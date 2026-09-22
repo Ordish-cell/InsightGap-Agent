@@ -120,6 +120,15 @@ export interface ResearchRun {
   [key: string]: unknown
 }
 
+export interface MemoryProposal {
+  facts: Array<{ key: 'preferred_name' | 'response_language' | 'script_preference'; value: string }>
+  source_run_id: number
+}
+
+export interface AgentFinalResponse extends UnknownRecord {
+  memory_proposal?: MemoryProposal
+}
+
 export interface AgentRun {
   can_interrupt?: boolean
   can_steer?: boolean
@@ -135,8 +144,8 @@ export interface AgentRun {
   answer?: string
   final_answer?: string
   final_output?: string
-  final_response?: UnknownRecord
-  final_payload?: UnknownRecord
+  final_response?: AgentFinalResponse
+  final_payload?: AgentFinalResponse
   pipeline_steps?: unknown[]
   visible_thoughts?: unknown[]
   thinking_summary?: string[]

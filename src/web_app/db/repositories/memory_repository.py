@@ -63,7 +63,7 @@ class MemoryRepository(BaseRepository[Memory]):
         return list(self.db.execute(stmt).scalars())
 
     def list_long_term(self, user_id, memory_type=None, category=None, status=None, query=None, page=1, page_size=20) -> tuple:
-        """Paginated long-term memories (semantic+episodic, visible, not superseded by default)."""
+        """Paginated visible long-term memories; active by default, status=all includes inactive."""
         # Defensive int cast — query params may arrive as strings
         page = max(1, int(page) if page else 1)
         page_size = max(1, min(100, int(page_size) if page_size else 20))
@@ -72,16 +72,14 @@ class MemoryRepository(BaseRepository[Memory]):
         if memory_type and memory_type in types: stmt = stmt.where(Memory.memory_type == memory_type)
         if query: stmt = stmt.where(Memory.content.ilike(f"%{query}%"))
         rows = list(self.db.execute(stmt).scalars())
-        show_superseded = status == "superseded"
-        explicit_status = status
+        explicit_status = status or "active"
         filtered = []
         for m in rows:
             meta = m.metadata_json or {}
-            if not meta.get("visible_in_long_term_memory", False): continue
+            if not meta.get("visible_in_long_term_memory", True): continue
             mem_status = meta.get("status", "active")
-            if mem_status == "superseded" and not show_superseded: continue
-            if not explicit_status and mem_status != "active": continue
-            if explicit_status and mem_status != explicit_status: continue
+            if mem_status == "deleting": continue
+            if explicit_status != "all" and mem_status != explicit_status: continue
             if category and meta.get("category") != category: continue
             filtered.append(m)
         total = len(filtered)

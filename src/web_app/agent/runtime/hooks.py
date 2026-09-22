@@ -12,9 +12,14 @@ async def save_outputs(nodes, state, answer):
         state.get("termination_reason")
         or state.get("writes_denied")
         or state.get("error")
+        or state.get("approval_required")
+        or state.get("status") in {"failed", "cancelled", "interrupted", "waiting_approval", "terminated"}
     ):
         return
-    policy = state.get("save_policy", {})
+    await save_basic_facts(nodes, state)
+    policy = dict(state.get("save_policy", {}))
+    if state.get("basic_memory", {}).get("facts") or state.get("basic_memory", {}).get("blocked"):
+        policy["write_memory"] = False
     if any(policy.values()):
         from src.web_app.agent.runtime.chat_control import disable_control
 
@@ -107,3 +112,43 @@ async def save_outputs(nodes, state, answer):
             )
         finally:
             state["current_action"] = original
+
+
+async def save_basic_facts(nodes, state):
+    from src.web_app.memory.basic_facts import authorized_fact, content_for, LABELS
+    from src.web_app.agent.runtime.chat_control import disable_control
+    plan = state.get("basic_memory") or {}
+    facts = plan.get("facts") or []
+    if not facts or plan.get("blocked") or state.get("approval_required"):
+        return
+    if not plan.get("authorized"):
+        state["memory_proposal"] = {"facts": facts, "source_run_id": plan["source_run_id"]}
+        description = "、".join(f"{LABELS[f['key']]}为「{f['value']}」" for f in facts)
+        state["basic_memory_note"] = f"是否将{description}保存为跨会话记忆？回复“确认记住”即可保存。"
+        return
+    disable_control(nodes.db, state["run_id"])
+    notes = []
+    for fact in facts:
+        if state.get("writes_denied") or state["runtime_budget"]["tool_calls"] >= settings.agent_max_tool_calls:
+            notes.append(f"{LABELS[fact['key']]}未保存：本轮无法继续写入。")
+            continue
+        inputs = {"content": content_for(fact), "memory_type": "semantic", "importance": 0.95}
+        original = state.get("current_action")
+        state["current_action"] = {"action": "memory_write", "arguments": inputs,
+            "action_id": uuid5(NAMESPACE_URL, f"insightgap:{state['run_id']}:basic:{fact['key']}").hex}
+        token = authorized_fact.set({"user_id": state["user_id"], "run_id": state["run_id"], "fact": fact,
+            "provenance": {"run_id": state["run_id"], "conversation_id": state["conversation_id"],
+                "source_run_id": plan["source_run_id"], "proposal_message_id": plan.get("proposal_message_id"),
+                "confirmation": plan["confirmation"]}})
+        state["runtime_budget"]["tool_calls"] += 1
+        try:
+            result = await execute_tool(nodes, state, "memory_mcp.add", inputs)
+            observe(nodes, state, result)
+            notes.append(f"已保存跨会话记忆：{LABELS[fact['key']]}为「{fact['value']}」。" if result.status == "ok"
+                         else f"{LABELS[fact['key']]}未确认保存成功：{result.status}。")
+        except Exception as exc:
+            notes.append(f"{LABELS[fact['key']]}保存失败（{type(exc).__name__}）。")
+        finally:
+            authorized_fact.reset(token)
+            state["current_action"] = original
+    state["basic_memory_note"] = "\n".join(notes)

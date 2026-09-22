@@ -20,6 +20,14 @@ from .policy import public_result
 
 
 def save_allowed(state, name):
+    if name in {"memory_mcp.add", "memory_mcp.extract"} and state.get("basic_memory"):
+        from src.web_app.memory.basic_facts import authorized_fact, EXPLICIT_CONFIRMATIONS
+        plan = state["basic_memory"]
+        if plan.get("blocked") or (not plan.get("facts") and state["user_input"].strip().rstrip("。！.! ") in EXPLICIT_CONFIRMATIONS):
+            return False
+        if plan.get("facts"):
+            grant = authorized_fact.get()
+            return bool(name == "memory_mcp.add" and grant and grant["run_id"] == state["run_id"] and grant["user_id"] == state["user_id"])
     if name == "memory_mcp.extract":
         name = "memory_mcp.add"
     rules = {

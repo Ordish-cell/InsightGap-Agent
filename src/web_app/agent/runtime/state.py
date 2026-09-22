@@ -147,6 +147,9 @@ class AgentRuntimeState(TypedDict, total=False):
     research_authorized: bool
     research_confirmed: bool
     research_query: str
+    basic_memory: dict
+    memory_proposal: dict | None
+    basic_memory_note: str
     save_policy: dict
     termination_reason: str
     finalization_started: bool

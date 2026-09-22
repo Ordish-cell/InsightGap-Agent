@@ -46,12 +46,12 @@ def reflect_memory(payload: dict, user_id: int = Depends(get_current_user_id), d
 def growth_profile(user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     """Return the user's dynamic growth profile — categorized long-term settings
     with effective importance, grouped by category, with status indicators."""
-    all_semantic = user_growth_service.get_memories_with_effective_importance(
-        user_id, db, memory_type="semantic", min_effective=0.0,
-    )
-    all_episodic = user_growth_service.get_memories_with_effective_importance(
-        user_id, db, memory_type="episodic", min_effective=0.0,
-    )[:10]
+    visible = [_enrich_long_term_memory(m) for m in MemoryRepository(db).list_by_user(user_id)
+               if m.memory_type in {"semantic", "episodic"}
+               and (m.metadata_json or {}).get("visible_in_long_term_memory", True)
+               and (m.metadata_json or {}).get("status", "active") == "active"]
+    all_semantic = [m for m in visible if m["memory_type"] == "semantic"]
+    all_episodic = [m for m in visible if m["memory_type"] == "episodic"]
 
     # Group semantic by category
     by_category: dict[str, list[dict]] = {}
@@ -74,6 +74,7 @@ def growth_profile(user_id: int = Depends(get_current_user_id), db: Session = De
         })
 
     category_labels: dict[str, str] = {
+        "preferred_name": "称呼", "response_language": "回答语言", "script_preference": "简繁偏好",
         "project_goal": "项目目标",
         "project_goal_summary": "项目目标（总结）",
         "tech_stack": "技术栈",
@@ -124,7 +125,7 @@ def _enrich_long_term_memory(m) -> dict:
     d["status"] = meta.get("status", "active")
     d["evidence_count"] = meta.get("evidence_count", 1)
     d["last_seen_at"] = meta.get("last_seen_at", "")
-    d["visible_in_long_term_memory"] = meta.get("visible_in_long_term_memory", False)
+    d["visible_in_long_term_memory"] = meta.get("visible_in_long_term_memory", m.memory_type in {"semantic", "episodic"})
     d["effective_importance"] = user_growth_service.compute_effective_importance(d)
     d["created_at"] = str(m.created_at) if m.created_at else None
     d["updated_at"] = str(m.updated_at) if m.updated_at else None
@@ -190,8 +191,7 @@ def restore_memory(memory_id: int, user_id=Depends(get_current_user_id), db=Depe
     repo = MemoryRepository(db)
     item = repo.get_by_id(memory_id)
     if not item or item.user_id != user_id: return fail("not_found", f"Memory {memory_id} not found")
-    meta = dict(item.metadata_json or {}); meta["status"] = "active"
-    repo.update(item, metadata_json=meta)
+    memory_service.restore_memory(user_id, item, db)
     return ok({"memory_id": memory_id, "status": "active"})
 
 @router.post("/forget/by-importance")

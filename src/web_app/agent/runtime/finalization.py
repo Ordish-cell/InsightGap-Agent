@@ -36,6 +36,8 @@ def recover_answer(nodes, state):
         elif row.event_type == "answer_completed":
             answer = payload.get("answer", answer)
             completed = True
+            if payload.get("memory_proposal"):
+                state["memory_proposal"] = payload["memory_proposal"]
             state["_answer_completed_emitted"] = True
             if payload.get("failed"):
                 state["error"] = "answer_generation_failed"
@@ -80,7 +82,7 @@ def finish(nodes, state, answer, *, failed=False):
         emit(nodes, state, "answer_delta", {"text": answer})
         state["_answer_delta_emitted"] = True
     if not state.get("_answer_completed_emitted"):
-        emit(nodes, state, "answer_completed", {"answer": answer, "failed": failed})
+        emit(nodes, state, "answer_completed", {"answer": answer, "failed": failed, **({"memory_proposal": state["memory_proposal"]} if state.get("memory_proposal") and not failed else {})})
         state["_answer_completed_emitted"] = True
     state.update(
         final_answer=answer,
@@ -109,6 +111,8 @@ def finish(nodes, state, answer, *, failed=False):
         "evaluation": state.get("evaluation", {}),
         "capability_results": public_result(state.get("observations", [])),
     }
+    if state.get("memory_proposal") and not failed:
+        state["final_payload"]["memory_proposal"] = state["memory_proposal"]
     return state
 
 

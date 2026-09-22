@@ -39,3 +39,21 @@ test('other run or other message cannot update the current bubble', () => {
   assert.deepEqual(projectChatEvent(start, { ...event(1, 'agent_text_started', { text_id: 'a' }), run_id: 2 }), start)
   assert.deepEqual(projectChatEvent(start, event(1, 'agent_text_started', { text_id: 'a', message_id: 'other' })), start)
 })
+
+
+test('memory confirmation and save receipt suffix survive live projection and replay', () => {
+  for (const suffix of ['是否保存为跨会话记忆？', '已保存跨会话记忆：称呼为「常」。', '称呼未确认保存成功。']) {
+    const answer = `好的。\n\n${suffix}`
+    const events = [
+      event(1, 'agent_text_started', { text_id: 'fact' }),
+      event(2, 'agent_text_delta', { text_id: 'fact', text: '好的。' }),
+      event(3, 'agent_text_completed', { text_id: 'fact', role: 'final', text: '好的。' }),
+      event(4, 'answer_completed', { text_id: 'fact', answer }),
+      event(5, 'run_completed', { answer }),
+    ]
+    const live = events.reduce(projectChatEvent, initial())
+    assert.equal(live.content, answer)
+    assert.equal(restoreChatMessage(initial(), events).content, answer)
+    assert.equal(restoreChatMessage(live, events).content, answer)
+  }
+})
