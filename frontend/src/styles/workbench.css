@@ -2571,6 +2571,7 @@ details[open] > :not(summary) {
 }
 
 /* Feed is a reading surface: a lead signal, then spacious supporting stories. */
+.feed-item-story, .feed-item-summary, .feed-item-relevance, .feed-item-gap { min-width: 0; overflow-wrap: anywhere; }
 @media (min-width: 821px) {
 .feed-page .page-header h1 { font-size: clamp(30px, 3.2vw, 42px); }
 .feed-page .metric-row { gap: 0; background: #fff; border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
@@ -2650,12 +2651,42 @@ details[open] > :not(summary) {
 .home-feed-peek-label { display: flex; align-items: center; gap: 6px; flex-shrink: 0; color: var(--accent); font-size: 12px; font-weight: 700; }
 .home-feed-peek strong { flex: 1; min-width: 0; font-size: 14px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .home-feed-peek-action { display: flex; align-items: center; gap: 6px; flex-shrink: 0; font-size: 12px; color: var(--accent); }
-.floating-feed-grid { gap: 16px; }
-.floating-feed-card { min-height: 225px; padding: 22px; border-radius: 16px; display: flex; flex-direction: column; transition: transform 200ms var(--ease), border-color 200ms, box-shadow 200ms; }
-.floating-feed-card:hover { transform: translateY(-3px); border-color: #b9cdf5; box-shadow: 0 12px 28px #24447a14; }
-.floating-feed-card h3 { font-size: 18px; line-height: 1.4; }
-.floating-feed-card > p { font-size: 13px; line-height: 1.55; }
-.floating-feed-card-actions { margin-top: auto; padding-top: 16px; }
+.floating-feed-grid { gap: 14px; }
+.floating-feed-card {
+  --signal-color: #3267e8;
+  --signal-tint: #edf3ff;
+  position: relative;
+  min-height: 218px;
+  padding: 19px 20px 17px;
+  border-radius: 15px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: transform 200ms var(--ease), border-color 200ms, box-shadow 200ms, background-color 200ms;
+}
+.floating-feed-card.adjacent { --signal-color: #7954b7; --signal-tint: #f5f0fb; }
+.floating-feed-card.far { --signal-color: #087c8d; --signal-tint: #eaf7f8; }
+.floating-feed-card::before { content: ''; position: absolute; top: 0; left: 0; width: 100%; height: 3px; background: var(--signal-color); transform: scaleX(.16); transform-origin: left; transition: transform 220ms var(--ease); }
+.floating-feed-card:hover { transform: translateY(-3px); border-color: #b5c6e7; box-shadow: 0 12px 28px #24447a18; }
+.floating-feed-card:hover::before, .floating-feed-card.is-selected::before { transform: scaleX(1); }
+.floating-feed-card.is-selected { border-color: var(--signal-color); background: color-mix(in srgb, var(--signal-tint) 36%, white); box-shadow: 0 0 0 2px color-mix(in srgb, var(--signal-color) 15%, transparent); }
+.floating-feed-card-top { margin-bottom: 12px; }
+.floating-feed-card-top .eyebrow { border-radius: 999px; padding: 4px 9px; background: var(--signal-tint); color: var(--signal-color); font-size: 11px; font-weight: 650; }
+.floating-feed-card-index { color: #9aa8bf; font-size: 12px; font-weight: 650; letter-spacing: .1em; }
+.floating-feed-card h3 { font-size: 19px; line-height: 1.38; font-weight: 650; letter-spacing: -.01em; margin-bottom: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.floating-feed-card > p { font-size: 13px; line-height: 1.55; -webkit-line-clamp: 2; margin-bottom: 0; }
+.floating-feed-card-source { color: var(--muted); font-size: 11px; margin-top: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.floating-feed-card-actions { margin-top: auto; padding-top: 13px; }
+.home-feed-disclosure.is-open .floating-feed-card { animation: home-card-enter 230ms var(--ease) both; }
+.home-feed-disclosure.is-open .floating-feed-card:nth-child(2) { animation-delay: 35ms; }
+.home-feed-disclosure.is-open .floating-feed-card:nth-child(3) { animation-delay: 70ms; }
+@keyframes home-card-enter { from { opacity: .3; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+.home-page:has(.home-feed-disclosure.is-open) .initial-composer-stage { justify-content: flex-start; padding-top: 18px; padding-bottom: 12px; }
+.home-page:has(.home-feed-disclosure.is-open) .chat-welcome-mark { width: 54px; height: 54px; border-radius: 17px; margin-bottom: 15px; }
+.home-page:has(.home-feed-disclosure.is-open) .initial-composer-stage h1 { font-size: 44px; }
+.home-page:has(.home-feed-disclosure.is-open) .chat-welcome-description { margin-bottom: 19px; font-size: 14px; }
+.home-page:has(.home-feed-disclosure.is-open) .codex-composer textarea { min-height: 78px; }
+.home-page:has(.home-feed-disclosure.is-open) .chat-prompt-starters { margin-top: 12px; }
 
 /* A stronger opening scene, with interactions that remain useful without motion. */
 .initial-composer-stage { padding-bottom: 3vh; }

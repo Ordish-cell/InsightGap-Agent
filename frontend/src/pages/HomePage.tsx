@@ -158,11 +158,12 @@ export function HomePage() {
         <div><section className="home-feed-content" aria-label="今日精选">
           <div className="section-title"><div><strong>值得关注的信号</strong><p className="muted small">从一条信息开始，形成自己的判断。</p></div><Link className="text-link" to="/feed">全部信息流 <Icon name="arrow" size={16} /></Link></div>
           <ActionNotice message={feedError} error />
-          {feedLoading ? <div className="feed-skeleton" aria-label="正在加载精选"><span /><span /><span /></div> : !homeFeeds.length ? <p className="muted">暂无精选信息，可以前往信息流刷新。</p> : <div className="floating-feed-grid">{homeFeeds.map(({ card: c, label }) => <article className="floating-feed-card" key={c.id}>
-            <div className="floating-feed-card-top"><span className="eyebrow">{label}</span><span className="muted small">{c.domain || '来源未标记'}</span></div>
+          {feedLoading ? <div className="feed-skeleton" aria-label="正在加载精选"><span /><span /><span /></div> : !homeFeeds.length ? <p className="muted">暂无精选信息，可以前往信息流刷新。</p> : <div className="floating-feed-grid">{homeFeeds.map(({ card: c, label, className }, index) => <article className={`floating-feed-card ${className} ${selectedFeedCardId === Number(c.id) ? 'is-selected' : ''}`} key={c.id}>
+            <div className="floating-feed-card-top"><span className="eyebrow">{label}</span><span className="floating-feed-card-index">{String(index + 1).padStart(2, '0')}</span></div>
             <Link to={`/feed/${c.id}`} className="feed-title-link"><h3>{c.display_title || c.title || '未命名卡片'}</h3></Link>
             <p>{c.one_sentence_value || c.summary || '暂无摘要。'}</p>
-            <div className="floating-feed-card-actions"><button className={`button small ${selectedFeedCardId === Number(c.id) ? '' : 'secondary'}`} onClick={() => setSelectedFeedCardId(Number(c.id))}>{selectedFeedCardId === Number(c.id) ? '已带入对话' : '带入对话'}</button><button className="button ghost small" onClick={() => void startResearch(Number(c.id))} disabled={researchingCardId !== null}>{researchingCardId === Number(c.id) ? '创建中…' : '深度研究'}<Icon name="arrow" size={14} /></button></div>
+            <div className="floating-feed-card-source">{c.domain || '来源未标记'}</div>
+            <div className="floating-feed-card-actions"><button className={`button small ${selectedFeedCardId === Number(c.id) ? '' : 'secondary'}`} aria-pressed={selectedFeedCardId === Number(c.id)} onClick={() => setSelectedFeedCardId(current => current === Number(c.id) ? null : Number(c.id))}>{selectedFeedCardId === Number(c.id) ? '取消带入' : '带入对话'}</button><button className="button ghost small" onClick={() => void startResearch(Number(c.id))} disabled={researchingCardId !== null}>{researchingCardId === Number(c.id) ? '创建中…' : '深度研究'}<Icon name="arrow" size={14} /></button></div>
           </article>)}</div>}
         </section></div>
       </div>
