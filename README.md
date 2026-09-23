@@ -14,7 +14,7 @@ InsightGap-Agent 是一个基于 FastAPI、React 和 LangGraph 的全栈 Agent �
 
 深度研究能力集成自 [LangChain Open Deep Research](https://github.com/langchain-ai/open_deep_research)。本项目在其基础上扩展 Web 工作台、单一原生 Supervisor、模型连接管理、工具权限与人工审批、RAG、长期记忆和运行审计。Python 包名仍保留 `open_deep_research`。
 
-![首页工作台](images/index.jpg)
+![对话工作台](images/workbench/home.png)
 
 ## 目录
 
@@ -306,30 +306,38 @@ npm run build
 
 ## 界面预览
 
-截图展示已有界面，实际布局以当前前端为准。
+以下界面截图使用演示数据，展示当前桌面浏览器工作台。
 
 <details>
 <summary>信息流与信息差卡片</summary>
 
-![信息流](images/information.jpg)
-![今日精选信息差](images/feedcard.jpg)
-![信息详情](images/xiangxi.jpg)
+![信息流与大卡片](images/workbench/feed.png)
+![首页今日精选](images/workbench/featured.png)
+![信息详情](images/workbench/feed-detail.png)
 
 </details>
 
 <details>
 <summary>深度研究与成果库</summary>
 
-![深度研究](images/deepresearch.jpg)
-![成果库](images/artifacts.jpg)
+![深度研究](images/workbench/research.png)
+![成果库](images/workbench/artifacts.png)
 
 </details>
 
 <details>
 <summary>长期记忆与技能库</summary>
 
-![长期记忆](images/memory.jpg)
-![技能库](images/skills.jpg)
+![长期记忆](images/workbench/memory.png)
+![技能库](images/workbench/skills.png)
+
+</details>
+
+<details>
+<summary>设置与审批</summary>
+
+![设置](images/workbench/settings.png)
+![审批](images/workbench/approvals.png)
 
 </details>
 

@@ -569,6 +569,7 @@ export function AgentChatPanel({
 
   const [attachments, setAttachments] = useState<LocalChatAttachment[]>([])
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null)
   const [dragActive, setDragActive] = useState(false)
   const lastPasteAtRef = useRef(0)
   const [isComposing, setIsComposing] = useState(false)
@@ -1594,6 +1595,7 @@ export function AgentChatPanel({
       {dragActive ? <div className="composer-drop-hint">松开以上传文件</div> : null}
 
       <textarea
+        ref={composerInputRef}
         value={userInput}
         onChange={(event) => setUserInput(event.target.value)}
         onPaste={handlePaste}
@@ -1640,6 +1642,10 @@ export function AgentChatPanel({
           <h1>{initialTitle}</h1>
           <p className="chat-welcome-description">梳理信息、深入研究，把想法变成可用的成果。</p>
           {composer}
+          {source === 'home_chat' && locale === 'zh' ? <div className="chat-prompt-starters" aria-label="提问示例">
+            <span>可以这样开始</span>
+            {['帮我查证一条信息', '梳理一个研究想法', '总结上传的资料'].map((prompt) => <button key={prompt} type="button" onClick={() => { setUserInput(prompt); composerInputRef.current?.focus() }}>{prompt}<Icon name="arrow" size={14} /></button>)}
+          </div> : null}
         </div>
       ) : (
         <>

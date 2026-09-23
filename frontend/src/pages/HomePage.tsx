@@ -66,6 +66,7 @@ export function HomePage() {
   const [researchingCardId, setResearchingCardId] = useState<number | null>(null)
 
   const homeFeeds = useMemo(() => pickHomeFeeds(cards), [cards])
+  const firstHomeFeed = homeFeeds[0]
   const selectedFeedCard = useMemo(
     () => cards.find((card) => card?.id === selectedFeedCardId),
     [cards, selectedFeedCardId],
@@ -152,6 +153,7 @@ export function HomePage() {
   return (
     <section className="home-page">
       <header className="home-topbar"><span className="home-context"><Icon name="chat" size={17} />对话工作台</span><button className={`feed-toggle ${feedOpen ? 'active' : ''}`} aria-expanded={feedOpen} onClick={() => setFeedOpen(value => !value)}><Icon name="feed" size={17} />今日精选<span className="count-label">{homeFeeds.length}</span><Icon name="chevron" size={14} style={{ transform: feedOpen ? 'rotate(90deg)' : undefined }} /></button></header>
+      {!feedOpen && firstHomeFeed ? <button className="home-feed-peek" type="button" onClick={() => setFeedOpen(true)} aria-label={`展开今日信号：${firstHomeFeed.card.display_title || firstHomeFeed.card.title}`}><span className="home-feed-peek-label"><Icon name="spark" size={16} />今日信号</span><strong>{firstHomeFeed.card.display_title || firstHomeFeed.card.title}</strong><span className="home-feed-peek-action">展开精选 <Icon name="arrow" size={16} /></span></button> : null}
       <div className={`home-feed-disclosure ${feedOpen ? 'is-open' : ''}`} inert={!feedOpen}>
         <div><section className="home-feed-content" aria-label="今日精选">
           <div className="section-title"><div><strong>值得关注的信号</strong><p className="muted small">从一条信息开始，形成自己的判断。</p></div><Link className="text-link" to="/feed">全部信息流 <Icon name="arrow" size={16} /></Link></div>

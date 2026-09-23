@@ -13,7 +13,9 @@ import { LoadingState } from '../components/common/LoadingState'
 import { PageHeader } from '../components/common/PageHeader'
 import { ScoreBadge } from '../components/common/ScoreBadge'
 import { StatusPill } from '../components/common/StatusPill'
-import { relationLabel, sourceTypeLabel } from '../utils/labels'
+import { sourceTypeLabel } from '../utils/labels'
+
+const noPersonalizationEvidence = '目前没有足够的用户资料或已保存记忆，能够说明这条信息与你的具体关联。'
 
 const buckets = [
   { value: 'all', label: '全部' },
@@ -90,11 +92,27 @@ export function FeedPage() {
       </div>
       {error ? <ErrorState message={error} /> : loading ? <LoadingState title="正在整理信息差" /> : !cards.length ? <EmptyState title="暂无信息差卡片" description="点击刷新信息流，系统会重新抓取来源并生成信息差卡片。" /> : (
         <div className="feed-list" ref={listMotion}>
-          {cards.map((card) => (
-            <article className="feed-item-card" key={card.id} data-entry={card.id}>
-              <div className="feed-item-top"><div className="row"><ScoreBadge score={card.final_score || 0} /><StatusPill value={card.exposure_bucket || card.relation_type} />{card.low_confidence ? <StatusPill value="低置信" /> : null}</div><span className="muted small">证据 {card.evidence?.length || 0} 条 · {sourceTypeLabel(card.source_type)} · {card.domain || '未标记域名'}</span></div>
-              <div className="feed-item-body"><h2 title={card.original_title || card.title}>{card.title}</h2><p>{card.one_sentence_value || card.summary || '暂无摘要。'}</p><div className="info-two-col"><div className="soft-info-box"><strong>信息差</strong><span>{card.information_gap || '暂无信息差说明。'}</span></div><div className="soft-info-box muted-box"><strong>为什么与你有关</strong><span>{card.why_you || `当前归类为${relationLabel(card.exposure_bucket || card.relation_type)}，暂无更细画像原因。`}</span></div></div></div>
-              <div className="feed-item-actions"><Link className="button secondary" to={`/feed/${card.id}`}>详情</Link><button className="button" onClick={() => action.run(() => research(card.id))} disabled={action.busy}>{researchingCardId === card.id ? '研究中...' : '深度研究'}</button><FeedFeedback cardId={card.id} /></div>
+          {cards.map((card, index) => (
+            <article className={`feed-item-card ${index === 0 ? 'featured' : ''}`} key={card.id} data-entry={card.id} onPointerMove={(event) => {
+              if (event.pointerType !== 'mouse') return
+              const rect = event.currentTarget.getBoundingClientRect()
+              event.currentTarget.style.setProperty('--pointer-x', `${event.clientX - rect.left}px`)
+              event.currentTarget.style.setProperty('--pointer-y', `${event.clientY - rect.top}px`)
+            }}>
+              <div className="feed-item-top">
+                <div className="feed-item-kicker"><span className="feed-item-index">{String(index + 1).padStart(2, '0')}</span><StatusPill value={card.exposure_bucket || card.relation_type} />{card.low_confidence ? <StatusPill value="低置信" /> : null}</div>
+                <div className="feed-item-source"><span>{sourceTypeLabel(card.source_type)} · {card.domain || '未标记领域'}</span><span>证据 {card.evidence?.length || 0} 条</span></div>
+              </div>
+              <div className="feed-item-content">
+                <div className="feed-item-story">
+                  <div className="feed-item-score"><ScoreBadge score={card.final_score || 0} /><span>信号评分</span></div>
+                  <h2 title={card.original_title || card.title}><Link to={`/feed/${card.id}`}>{card.title}</Link></h2>
+                  <p className="feed-item-summary">{card.one_sentence_value || card.summary || '暂无摘要。'}</p>
+                  <div className="feed-item-gap"><span>值得留意</span><p>{card.information_gap || '暂无信息差说明。'}</p></div>
+                </div>
+                <div className="feed-item-relevance"><div className="feed-item-relevance-icon" aria-hidden="true">✦</div><span className="feed-item-relevance-label">与你的关联</span><p>{card.why_you || noPersonalizationEvidence}</p></div>
+              </div>
+              <div className="feed-item-actions"><Link className="button secondary" to={`/feed/${card.id}`}>查看详情 <span aria-hidden="true">↗</span></Link><button className="button" onClick={() => action.run(() => research(card.id))} disabled={action.busy}>{researchingCardId === card.id ? '研究中...' : '深度研究'}</button><FeedFeedback cardId={card.id} /></div>
             </article>
           ))}
         </div>
