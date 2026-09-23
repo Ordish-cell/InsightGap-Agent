@@ -134,6 +134,75 @@ async def test_multiple_calls_execute_nothing_then_repair(env, monkeypatch):
     assert any(isinstance(m, ToolMessage) for m in model.requests[1])
     assert not any(isinstance(m, ToolMessage) for m in model.requests[2])
     assert "Invalid single-action JSON" not in str(model.requests[2])
+    assert "Earlier successful tool results remain valid" in str(model.requests[2])
+    assert result["native_protocol_error"] == ""
+
+
+@pytest.mark.asyncio
+async def test_empty_stream_after_search_repairs_without_reexecuting_tool(env, monkeypatch):
+    from src.web_app.agent.runtime.capabilities import observe
+    from src.web_app.agent.runtime.state import CapabilityResult
+    from sqlalchemy import select
+    from src.web_app.models.orm import LLMCall
+
+    class EmptyOnce(Model):
+        async def astream(self, messages):
+            self.requests.append(messages)
+            for chunk in next(self.turns):
+                if isinstance(chunk, Exception):
+                    raise chunk
+                yield chunk
+
+    model = EmptyOnce([[call("web.search", {"query": "news"})], [ValueError("No generation chunks were returned")], [AIMessageChunk(content="News summary")]])
+    executed = []
+    with env.factory() as db:
+        nodes = SupervisorNodes(db, {})
+        configure(nodes, model, monkeypatch)
+        async def search(s):
+            executed.append(s["current_action"]["action_id"])
+            return observe(nodes, s, CapabilityResult(action_id=executed[-1], capability="tool", status="ok", summary="Search fact"))
+        monkeypatch.setattr(nodes, "tool_runtime", search)
+        result = await build_graph(nodes).ainvoke(state(env))
+        logs = list(db.scalars(select(LLMCall).where(LLMCall.run_id == env.run, LLMCall.status == "failed")))
+    assert result["status"] == "completed" and len(executed) == 1
+    assert result["native_protocol_error"] == ""
+    assert "Search fact" in str(model.requests[-1])
+    assert logs and "No generation chunks were returned" in logs[-1].metadata_json["error_diagnostic"]
+
+
+@pytest.mark.asyncio
+async def test_persistent_empty_stream_stops_at_existing_budget(env, monkeypatch):
+    class Empty(Model):
+        async def astream(self, messages):
+            self.requests.append(messages)
+            raise ValueError("No generation chunks were returned")
+            yield
+    model = Empty([])
+    with env.factory() as db:
+        nodes = SupervisorNodes(db, {})
+        configure(nodes, model, monkeypatch)
+        result = await build_graph(nodes).ainvoke(state(env))
+    assert result["status"] == "failed" and result["error"] == "model_stream_empty"
+    assert len(model.requests) <= 4
+    assert "模型服务未返回有效内容" in result["final_answer"]
+
+
+@pytest.mark.asyncio
+async def test_upstream_input_rejection_is_terminal_and_has_public_explanation(env, monkeypatch):
+    from src.web_app.agent.llm.errors import ProviderStreamError
+    class Rejected(Model):
+        async def astream(self, messages):
+            self.requests.append(messages)
+            raise ProviderStreamError("model_input_rejected")
+            yield
+    model = Rejected([])
+    with env.factory() as db:
+        nodes = SupervisorNodes(db, {})
+        configure(nodes, model, monkeypatch)
+        result = await build_graph(nodes).ainvoke(state(env))
+    assert len(model.requests) == 1
+    assert result["error"] == "model_input_rejected"
+    assert "模型服务拒绝处理本轮输入" in result["final_answer"]
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,16 @@ const { projectChatEvent, restoreChatMessage } = await import(`data:text/javascr
 const initial = () => ({ role: 'assistant', run_id: 1, message_id: 'm1', content: '', status: 'running' })
 const event = (id, event_type, payload = {}) => ({ id, event_seq: id, run_id: 1, event_type, payload })
 
+test('failed runs preserve the server explanation and partial answer rather than the error code', () => {
+  const failure = event(2, 'run_failed', { error: 'supervisor_unavailable', answer: '模型调用未完成，已有结果已保留。' })
+  const live = projectChatEvent(initial(), failure)
+  assert.equal(live.content, failure.payload.answer)
+  assert.equal(live.error_message, 'supervisor_unavailable')
+  assert.equal(restoreChatMessage(live, [failure]).content, live.content)
+  assert.equal(projectChatEvent({ ...initial(), content: 'Partial' }, event(3, 'run_failed', { error: 'supervisor_unavailable' })).content, 'Partial')
+  assert.equal(projectChatEvent(initial(), event(3, 'run_failed', { error: 'supervisor_unavailable' })).content, '本次回复未完成，请稍后重试。')
+})
+
 test('live duplicate deltas are ignored and unfinished snapshots can be replayed afresh', () => {
   const events = [event(1, 'agent_text_started', { text_id: 'a' }), event(2, 'agent_text_delta', { text_id: 'a', text: 'Partial' })]
   const live = [...events, events[1]].reduce(projectChatEvent, initial())

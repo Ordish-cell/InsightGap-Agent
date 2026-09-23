@@ -9,8 +9,8 @@ from src.web_app.core.config import get_settings
 
 
 def get_chat_model(purpose: ModelPurpose | str, complexity: str = "normal", temperature: float | None = None, streaming: bool = False) -> Any:
-    del purpose, complexity
-    return build_chat_model(get_model_context(), temperature=temperature, streaming=streaming)
+    del complexity
+    return build_chat_model(get_model_context(), temperature=temperature, streaming=streaming, validate_native_stream=purpose == "supervisor" and streaming)
 
 
 def get_chat_model_by_name(model: str, temperature: float | None = None, timeout_seconds: int | None = None, streaming: bool = False) -> Any:
@@ -19,7 +19,7 @@ def get_chat_model_by_name(model: str, temperature: float | None = None, timeout
     return build_chat_model(context, temperature=temperature, timeout_seconds=timeout_seconds, streaming=streaming)
 
 
-def build_chat_model(context: ModelExecutionContext, *, temperature: float | None = 0.2, timeout_seconds: int | None = None, streaming: bool = False) -> Any:
+def build_chat_model(context: ModelExecutionContext, *, temperature: float | None = 0.2, timeout_seconds: int | None = None, streaming: bool = False, validate_native_stream: bool = False) -> Any:
     settings = get_settings()
     timeout = timeout_seconds or settings.llm_timeout_seconds
     retries = settings.llm_max_retries
@@ -72,6 +72,9 @@ def build_chat_model(context: ModelExecutionContext, *, temperature: float | Non
             kwargs["default_headers"] = headers
         if protocol == "openai_responses":
             kwargs["use_responses_api"] = True
+        if validate_native_stream and protocol != "openai_responses":
+            from src.web_app.agent.llm.stream_model import NativeStreamChatOpenAI
+            return NativeStreamChatOpenAI(**kwargs)
         return ChatOpenAI(**kwargs)
     except Exception as exc:
         raise LLMUnavailableError(f"Failed to initialize {context.provider}/{context.model}: {exc}") from exc

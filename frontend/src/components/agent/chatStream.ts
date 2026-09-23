@@ -28,7 +28,7 @@ export function projectChatEvent(message: AgentChatMessage, event: AgentEvent): 
     case 'run_interrupted':
       return { ...message, status: 'interrupted', content: String(payload.answer ?? message.content ?? ''), error_message: String(payload.error || '') }
     case 'run_failed':
-      return { ...message, status: 'failed', error_message: String(payload.error || ''), content: String(payload.answer ?? message.content ?? '') }
+      return { ...message, status: 'failed', error_message: String(payload.error || ''), content: String(payload.answer || message.content || '本次回复未完成，请稍后重试。') }
     case 'run_completed':
       return { ...message, status: 'completed', content: String(payload.answer ?? message.content ?? '') }
     case 'run_paused':

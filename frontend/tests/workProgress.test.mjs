@@ -43,3 +43,10 @@ test('concrete tool replaces its generic lifecycle without a duplicate completio
   const events = [start, progress, e(4, 'node_started', { step_id: 'x', display_name: '执行工具', status: 'running' }, 'tool_runtime'), e(5, 'tool_call_started', { tool_call_id: 't', tool_name: 'web.search' }), e(6, 'tool_call_completed', { tool_call_id: 't', tool_name: 'web.search' }), e(7, 'node_completed', { step_id: 'x', display_name: '执行工具', status: 'completed' }, 'tool_runtime')]
   assert.equal(project(message, events, '').blocks.filter(b => b.kind === 'tool').length, 1)
 })
+
+test('protocol repair and generic lifecycle stay in execution details', () => {
+  const events = [start, progress, e(4, 'node_started', { step_id: 'repair', display_name: '处理请求', status: 'running' }, 'capability'), e(5, 'node_completed', { step_id: 'repair', display_name: '处理请求', status: 'completed' }, 'capability')]
+  const trace = project(message, events, '')
+  assert.deepEqual(trace.blocks.map(b => b.kind), ['text'])
+  assert.equal(trace.steps[0].text, '处理请求')
+})

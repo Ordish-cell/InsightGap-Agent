@@ -93,6 +93,56 @@ async def test_partial_stream_failure_preserves_visible_text_and_closes():
 
 
 @pytest.mark.asyncio
+async def test_langchain_empty_stream_is_classified_but_other_value_errors_are_not():
+    with pytest.raises(NativeProtocolError, match="model_stream_empty"):
+        await collect_native_turn(Model([ValueError("No generation chunks were returned")]), [], CATALOG, lambda _: None)
+    for chunks in ([ValueError("unrelated")], [AIMessageChunk(content="Partial"), ValueError("No generation chunks were returned")]):
+        with pytest.raises(ValueError):
+            await collect_native_turn(Model(chunks), [], CATALOG, lambda _: None)
+
+
+def test_error_diagnostics_keep_safe_cause_and_stack_without_provider_body():
+    from src.web_app.agent.llm.diagnostics import error_diagnostics
+    try:
+        try:
+            raise ValueError("No generation chunks were returned")
+        except ValueError as exc:
+            raise NativeProtocolError("model_stream_empty") from exc
+    except NativeProtocolError as exc:
+        diagnostic = error_diagnostics(exc)["error_diagnostic"]
+    assert "model_stream_empty" in diagnostic and "No generation chunks were returned" in diagnostic
+    assert "test_native_turn.py" in diagnostic
+    assert "secret-token" not in str(error_diagnostics(ValueError('Authorization: secret-token; private prompt')))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("partial", [False, True])
+async def test_responses_failure_on_chat_completions_is_not_lost_by_sdk(partial):
+    import httpx
+    import json
+    from src.web_app.agent.llm.stream_model import NativeStreamChatOpenAI
+    from src.web_app.agent.llm.errors import ProviderStreamError
+    from src.web_app.agent.llm.diagnostics import error_diagnostics
+    chunks = []
+    if partial:
+        chunks.append({"id": "c", "object": "chat.completion.chunk", "model": "isolated", "created": 1,
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": "Partial"}, "finish_reason": None}]})
+    chunks.append({"type": "response.failed", "response": {"status": "failed", "error": {
+        "code": "server_error", "message": "<400> InternalError.Algo.DataInspectionFailed: secret-token private-input"}}})
+    body = "".join("data: " + json.dumps(c) + "\n\n" for c in chunks)
+    def handle(request):
+        assert json.loads(request.content)["parallel_tool_calls"] is False
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, text=body)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as client:
+        model = NativeStreamChatOpenAI(model="isolated", api_key="isolated", http_async_client=client, max_retries=0)
+        visible = []
+        with pytest.raises(ProviderStreamError, match="model_input_rejected") as caught:
+            await collect_native_turn(model, [], CATALOG, visible.append)
+    assert visible == (["Partial"] if partial else [])
+    assert "secret-token" not in str(error_diagnostics(caught.value))
+
+
+@pytest.mark.asyncio
 async def test_reasoning_is_not_visible_answer():
     chunk = AIMessageChunk(content=[{"type": "reasoning", "summary": []}, {"type": "text", "text": "Answer"}])
     visible = []

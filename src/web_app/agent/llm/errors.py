@@ -12,3 +12,7 @@ class LLMInvocationError(RuntimeError):
 
 class LLMParseError(RuntimeError):
     """Raised when a model response cannot be parsed or validated."""
+
+
+class ProviderStreamError(RuntimeError):
+    """A stable code for an upstream failure; never contains the raw body."""

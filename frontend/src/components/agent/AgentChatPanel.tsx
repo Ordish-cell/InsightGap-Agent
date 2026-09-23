@@ -1022,9 +1022,7 @@ export function AgentChatPanel({
                   }
 
                   return {
-                    ...item,
-                    status: 'failed',
-                    content: failText,
+                    ...projectChatEvent(item, parsed),
                     trace_events: appendTraceEvent(item.trace_events, parsed),
                   }
                 }
@@ -1379,15 +1377,14 @@ export function AgentChatPanel({
           }
 
           if (parsed.event_type === 'run_failed') {
-            const failedText = String(payload.error || payload.answer || text(locale, zh.agentFailed, 'Agent run failed. Please try again.'))
             setMessages((items) =>
               items.map((item) =>
                 item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
-                  ? { ...item, status: 'failed', content: failedText, error_message: failedText, trace_events: appendTraceEvent(item.trace_events, parsed) }
+                  ? { ...projectChatEvent({ ...item, message_id: liveAssistantMessageId, run_id: liveRunId || item.run_id }, parsed), trace_events: appendTraceEvent(item.trace_events, parsed) }
                   : item
               )
             )
-            setError(failedText)
+            setError('')
             setRunning(false)
             return
           }

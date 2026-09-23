@@ -10,8 +10,8 @@ const runs = new Map(), ledgers = new Map(), streams = new Map()
 let nextRun = 0, seq = 0
 const messages = []
 const connection = { id: 1, provider: 'custom', protocol: 'openai_chat_completions', display_name: '隔离测试模型', status: 'active', last_test_status: 'passed', fields: {}, secrets: {}, models: [{ id: 11, connection_id: 1, model_id: 'fake', display_name: '测试模型', enabled: true, capabilities: { streaming: true } }] }
-function emit(runId, event_type, payload = {}) {
-  const event = { id: ++seq, event_seq: seq, run_id: runId, event_type, payload, created_at: new Date().toISOString() }
+function emit(runId, event_type, payload = {}, node_name = '') {
+  const event = { id: ++seq, event_seq: seq, run_id: runId, event_type, payload, node_name, created_at: new Date().toISOString() }
   ledgers.get(runId).push(event)
   streams.get(runId)?.write(`id: ${seq}\nevent: ${event_type}\ndata: ${JSON.stringify(event)}\n\n`)
   return event
@@ -121,6 +121,34 @@ try {
   await page.getByText('主要等待来自意图识别。', { exact: true }).waitFor()
   assert.equal(await page.locator('.work-text-block').count(), 3)
   assert.equal(await page.locator('.work-tool-row').count(), 1)
+  // A real server failure carries both a public answer and an internal code.
+  // The code must not replace the answer or produce a second global error.
+  await page.locator('textarea').fill('今天有什么新闻'); await page.locator('textarea').press('Enter')
+  while (!streams.has(3)) await new Promise(r => setTimeout(r, 10))
+  emit(3, 'agent_text_started', { message_id: 'assistant-3', text_id: 'search-3' })
+  emit(3, 'agent_text_delta', { message_id: 'assistant-3', text_id: 'search-3', text: '我先查询新闻来源。' })
+  emit(3, 'agent_text_completed', { message_id: 'assistant-3', text_id: 'search-3', role: 'progress', text: '我先查询新闻来源。' })
+  emit(3, 'node_completed', { step_id: 'repair-3', display_name: '处理请求', status: 'completed' }, 'capability')
+  emit(3, 'tool_call_started', { tool_call_id: 'search-tool-3', tool_name: 'web.search' })
+  emit(3, 'tool_call_completed', { tool_call_id: 'search-tool-3', tool_name: 'web.search' })
+  emit(3, 'agent_text_started', { message_id: 'assistant-3', text_id: 'empty-3' })
+  emit(3, 'agent_text_completed', { message_id: 'assistant-3', text_id: 'empty-3', role: 'interrupted', text: '' })
+  const failureAnswer = '模型调用未完成，已有结果已保留。'
+  const failedRun = runs.get(3)
+  Object.assign(failedRun, { status: 'failed', can_interrupt: false, answer: failureAnswer, error_message: 'supervisor_unavailable' })
+  Object.assign(failedRun.assistant_message, { status: 'failed', content: failureAnswer, error_message: 'supervisor_unavailable' })
+  emit(3, 'answer_completed', { answer: failureAnswer, failed: true })
+  emit(3, 'run_failed', { answer: failureAnswer, error: 'supervisor_unavailable' }); streams.get(3).end()
+  await page.getByText(failureAnswer, { exact: true }).waitFor()
+  assert.equal(await page.getByText(failureAnswer, { exact: true }).count(), 1)
+  assert.equal(await page.getByText('supervisor_unavailable', { exact: true }).count(), 0)
+  assert.equal(await page.locator('.work-tool-row').filter({ hasText: '处理请求' }).count(), 0)
+  await page.reload()
+  await page.getByText(failureAnswer, { exact: true }).waitFor()
+  assert.equal(await page.getByText(failureAnswer, { exact: true }).count(), 1)
+  assert.equal(await page.getByText('我先查询新闻来源。', { exact: true }).count(), 1)
+  assert.equal(await page.getByText('supervisor_unavailable', { exact: true }).count(), 0)
+  await page.screenshot({ path: join(output, 'failure-preserved.png') })
   assert.deepEqual(errors, [])
   const p95 = samples.sort((a, b) => a - b)[28]
   assert.ok(p95 <= 300, `SSE-to-paint p95 ${p95} ms`)

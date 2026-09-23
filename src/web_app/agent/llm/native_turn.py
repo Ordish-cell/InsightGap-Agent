@@ -97,6 +97,12 @@ async def collect_native_turn(
                 await stream.aclose()
     except TimeoutError as exc:
         raise NativeProtocolError("model_stream_timeout") from exc
+    except ValueError as exc:
+        # LangChain raises before yielding when the provider closes an empty
+        # stream. Treat only this exact, output-free case as an empty response.
+        if response is None and str(exc) == "No generation chunks were returned":
+            raise NativeProtocolError("model_stream_empty") from exc
+        raise
 
     if response is None:
         raise NativeProtocolError("model_stream_empty")

@@ -10,6 +10,8 @@ from src.web_app.core.config import settings
 from pydantic import ValidationError
 
 from src.web_app.agent.llm.factory import get_chat_model
+from src.web_app.agent.llm.diagnostics import error_diagnostics
+from src.web_app.agent.llm.errors import ProviderStreamError
 from src.web_app.agent.llm.native_turn import collect_native_turn, NativeProtocolError, compile_tools
 from src.web_app.agent.prompts import gap_system_message
 from src.web_app.agent.runtime.chat_control import check_active
@@ -21,6 +23,7 @@ from .capabilities import observe
 
 NATIVE_SYSTEM = """You are InsightGap's single Supervisor. Answer the latest request directly,
 or call one provided tool when evidence or action is needed. Never print tool-call JSON as an answer.
+Return at most ONE tool call per turn, then wait for its result. Do not issue parallel calls.
 Before using a tool, give a brief public update explaining what you will do and why it helps
 the current request. After receiving results, mention material findings or the next action
 when useful, then continue or answer. Keep updates concise, grounded in actual observations,
@@ -74,7 +77,7 @@ class SupervisorNodes:
             pass
         return limit
 
-    def _usage(self, state, started, purpose, response=None, error=""):
+    def _usage(self, state, started, purpose, response=None, error="", diagnostics=None):
         from src.web_app.agent.llm.usage import record_llm_call
 
         model = state.get("model_context", {})
@@ -92,6 +95,7 @@ class SupervisorNodes:
             latency_ms=int((perf_counter() - started) * 1000),
             status="failed" if error else "completed",
             error_message=error,
+            metadata=diagnostics,
             input_tokens=usage.get("input_tokens"),
             output_tokens=usage.get("output_tokens"),
             total_tokens=usage.get("total_tokens"),
@@ -174,7 +178,8 @@ class SupervisorNodes:
                 followup = [AIMessage(content=state.get("native_preamble", ""), tool_calls=[call]),
                     ToolMessage(content=json.dumps({k: receipt[k] for k in ("status", "summary", "error")}, ensure_ascii=False), tool_call_id=call["id"])]
         if state.get("native_protocol_error"):
-            system += "\nPrevious call was rejected without execution: " + state["native_protocol_error"]
+            system += "\nThe immediately preceding model turn produced no executable action: " + state["native_protocol_error"]
+            system += "\nReturn at most one tool call or a final answer. Earlier successful tool results remain valid. Do not describe this rejection as the cause of an earlier run's failure."
         import tiktoken
         encoding = tiktoken.get_encoding("cl100k_base")
         definitions, _ = compile_tools(catalog)
@@ -191,7 +196,7 @@ class SupervisorNodes:
             visible.append(delta)
             emit(self, state, "agent_text_delta", {**identity, "text": delta})
         started = perf_counter()
-        result, error = None, ""
+        result, error, diagnostics = None, "", None
         try:
             model = await asyncio.to_thread(get_chat_model, "supervisor", temperature=0, streaming=True)
             emit(self, state, "chat_latency", {"stage": "model_started", "elapsed_ms": (perf_counter() - started) * 1000})
@@ -200,8 +205,9 @@ class SupervisorNodes:
             check_active(state["run_id"])
         except BaseException as exc:
             error = type(exc).__name__
+            diagnostics = error_diagnostics(exc)
             repairable = isinstance(exc, NativeProtocolError) and str(exc) in {
-                "invalid_tool_arguments", "multiple_tool_calls_not_allowed", "unknown_tool_name", "tool_call_id_missing", "model_response_empty",
+                "invalid_tool_arguments", "multiple_tool_calls_not_allowed", "unknown_tool_name", "tool_call_id_missing", "model_response_empty", "model_stream_empty",
             }
             role = "progress" if repairable else "interrupted"
             emit(self, state, "agent_text_completed", {**identity, "role": role, "text": "".join(visible)})
@@ -210,7 +216,7 @@ class SupervisorNodes:
                 state["native_final_text_id"] = turn_id
             raise
         finally:
-            self._usage(state, started, "native_supervisor", result.message if result else None, error)
+            self._usage(state, started, "native_supervisor", result.message if result else None, error, diagnostics)
         emit(self, state, "agent_text_completed", {**identity, "role": result.text_role, "text": result.text})
         if result.tool_call is None:
             state["native_final_text_id"] = turn_id
@@ -237,7 +243,9 @@ class SupervisorNodes:
                 and not request.get("tool_name") and not request.get("attachment_ids")
             )
             result, actions = await self.model_turn(state, tools_enabled=not limited and not basic_turn)
-            state.pop("native_protocol_error", None)
+            # LangGraph merges returned keys; deleting a key would retain the
+            # previous checkpoint's error and keep injecting a stale warning.
+            state["native_protocol_error"] = ""
         except (NativeProtocolError, ValidationError) as exc:
             budget["consecutive_failures"] += 1
             state["native_protocol_error"] = str(exc)[:180]
@@ -249,7 +257,9 @@ class SupervisorNodes:
             state["current_action"] = {"action": "invalid", "action_id": uuid4().hex}
             return state
         except Exception as exc:
-            if isinstance(exc, ValueError) and str(exc) == "context_budget_exceeded_by_required_input":
+            if isinstance(exc, ProviderStreamError):
+                code = str(exc)
+            elif isinstance(exc, ValueError) and str(exc) == "context_budget_exceeded_by_required_input":
                 code = "context_budget_exhausted"
             else:
                 code = "model_provider_access_denied" if getattr(exc, "status_code", None) in {401, 403} else "supervisor_unavailable"
@@ -308,7 +318,14 @@ class SupervisorNodes:
 
     def fail_native(self, state, code):
         state["error"] = state["termination_reason"] = code
-        return finish(self, state, state.get("final_answer") or self._partial_result(state, "模型调用未完成，已有结果已保留。"), failed=True)
+        notice = "模型调用未完成，已有结果已保留。"
+        if code in {"model_stream_empty", "model_response_empty"}:
+            notice = "模型服务未返回有效内容，本次回复未完成。已有结果已保留，可稍后重试。"
+        elif code == "model_input_rejected":
+            notice = "模型服务拒绝处理本轮输入，可能涉及对话或检索内容的内容检查。本次回复未完成，已有结果已保留。"
+        elif code == "model_provider_stream_failed":
+            notice = "模型服务在生成过程中返回错误，本次回复未完成。已有结果已保留，可稍后重试。"
+        return finish(self, state, state.get("final_answer") or self._partial_result(state, notice), failed=True)
 
     def recover_native_text(self, state):
         """An unfinished visible stream is terminal; completed progress is not."""

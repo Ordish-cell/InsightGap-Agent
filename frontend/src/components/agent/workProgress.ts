@@ -43,7 +43,7 @@ export function projectWorkProgress(message: AgentChatMessage, events: AgentEven
       const step: WorkBlock = { id: key, kind: 'tool', text: String(p.display_name || event.node_name), role: '', status: String(p.status || 'running') }
       steps.set(key, step)
       if (kind === 'node_started') lastStep = key
-      if (!concreteToolSteps.has(key) && ['document_read', 'deep_research', 'capability', 'tool_runtime'].includes(event.node_name || '')) blocks.set(key, step)
+      if (!concreteToolSteps.has(key) && ['document_read', 'deep_research'].includes(event.node_name || '')) blocks.set(key, step)
     }
     if (['tool_call_started', 'tool_call_completed', 'tool_call_failed'].includes(kind)) {
       const key = `${event.run_id}:tool:${p.tool_call_id || p.toolCallId || p.tool_call_record_id || p.id || p.tool_name || p.toolName}`
