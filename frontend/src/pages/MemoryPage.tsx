@@ -1,4 +1,7 @@
-import { FormEvent, useCallback, useEffect, useState } from 'react'
+import { ActionNotice } from '../components/common/ActionNotice'
+import { Tabs } from '../components/common/Tabs'
+import { useListMotion } from '../components/common/motion'
+import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
 
 import { apiRequest } from '../api/client'
 import type { Query } from '../api/client'
@@ -53,6 +56,10 @@ interface GrowthProfile {
 type TabId = 'long-term' | 'growth' | 'search'
 
 export function MemoryPage() {
+  const actionLock = useRef(false)
+  const [actionBusy, setActionBusy] = useState(false)
+  const listMotion = useListMotion()
+  const requestId = useRef(0)
   const [tab, setTab] = useState<TabId>('long-term')
   const [summary, setSummary] = useState<SummaryLike | null>(null)
   const [profile, setProfile] = useState<GrowthProfile | null>(null)
@@ -94,7 +101,8 @@ export function MemoryPage() {
     }
   }
 
-  const loadLongTerm = useCallback(async (page?: number, useSearchEndpoint?: boolean) => {
+  const loadLongTerm = useCallback(async (page?: number, useSearchEndpoint?: boolean, queryOverride?: string) => {
+    const request = ++requestId.current
     setLtLoading(true)
     setLtError('')
     const p = page ?? ltPage
@@ -103,18 +111,20 @@ export function MemoryPage() {
       if (ltType) params.type = ltType
       if (ltCategory) params.category = ltCategory
       if (ltStatus) params.status = ltStatus
-      if (ltQuery) params.query = ltQuery
+      const queryValue = queryOverride ?? ltQuery
+      if (queryValue) params.query = queryValue
 
       const result = useSearchEndpoint
         ? await searchLongTermMemories(params)
         : await listLongTermMemories(params)
+      if (request !== requestId.current) return
       setLtItems(result.items || [])
       setLtTotal(result.total || 0)
       setLtPage(result.page || p)
     } catch (exc) {
-      setLtError(exc instanceof Error ? exc.message : '长期记忆加载失败')
+      if (request === requestId.current) setLtError(exc instanceof Error ? exc.message : '长期记忆加载失败')
     } finally {
-      setLtLoading(false)
+      if (request === requestId.current) setLtLoading(false)
     }
   }, [ltPage, ltPageSize, ltType, ltCategory, ltStatus, ltQuery])
 
@@ -146,6 +156,9 @@ export function MemoryPage() {
   }
 
   async function runAction(action: () => Promise<unknown>, message: string) {
+    if (actionLock.current) return
+    actionLock.current = true
+    setActionBusy(true)
     setActionMessage('')
     setError('')
     try {
@@ -160,7 +173,7 @@ export function MemoryPage() {
       if (tab === 'search') await loadSearch()
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : '记忆操作失败')
-    }
+    } finally { actionLock.current = false; setActionBusy(false) }
   }
   async function handleReflect() { await runAction(() => apiRequest('/memory/reflect', { method: 'POST', body: {} }), '碎片整理完成。') }
   async function handleForget(id: number) { await runAction(() => forget({ memory_id: id }), '记忆已删除。') }
@@ -181,34 +194,30 @@ export function MemoryPage() {
   return (
     <section className="workbench-page memory-page">
       <PageHeader
-        title="Agent 已记住的长期设定"
+        title="长期记忆"
         description="称呼、回答语言和简繁偏好经你确认后跨会话保存；其他内容按明确请求保存。"
         actions={
           <div style={{ display: 'flex', gap: 8 }}>
-            <button className="button secondary" onClick={handleReflect}>整理碎片</button>
-            <button className="button secondary" onClick={() => runAction(consolidate, '记忆整理完成。')}>整理记忆</button>
+            <button className="button secondary" disabled={actionBusy} onClick={handleReflect}>整理碎片</button>
+            <button className="button secondary" disabled={actionBusy} onClick={() => runAction(consolidate, '记忆整理完成。')}>整理记忆</button>
           </div>
         }
       />
       {error && <ErrorState message={error} />}
-      {actionMessage && <p role="status">{actionMessage}</p>}
+      <ActionNotice message={actionMessage || (actionBusy ? '正在处理…' : '')} />
       <p className="muted small">统计范围：当前用户可见且生效中的长期设定与行为事件。</p>
       <div className="metric-row">
         <div className="metric-card"><strong>{profile?.semantic_count ?? summary?.semantic_count ?? '-'}</strong><span>长期设定</span></div>
         <div className="metric-card"><strong>{profile?.episodic_count ?? summary?.episodic_count ?? '-'}</strong><span>行为事件</span></div>
         <div className="metric-card"><strong>{profile?.categories?.length ?? 0}</strong><span>设定分类</span></div>
       </div>
-      <div className="view-tabs" style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
-        <button className={`button ${tab === 'long-term' ? '' : 'ghost'}`} onClick={() => setTab('long-term')}>长期记忆</button>
-        <button className={`button ${tab === 'growth' ? '' : 'ghost'}`} onClick={() => setTab('growth')}>长期设定</button>
-        <button className={`button ${tab === 'search' ? '' : 'ghost'}`} onClick={() => setTab('search')}>搜索记忆</button>
-      </div>
+      <Tabs value={tab} onChange={setTab} label="记忆视图" items={[{ value: 'long-term', label: '长期记忆' }, { value: 'growth', label: '长期设定' }, { value: 'search', label: '搜索记忆' }]} />
 
       {/* ── Long-Term Tab ── */}
       {tab === 'long-term' && (
         <>
           {/* Filter bar */}
-          <div className="lt-filter-bar" style={{ display: 'flex', gap: 8, marginBottom: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+          <div className="filter-bar">
             <select className="input" value={ltType} onChange={e => { setLtType(e.target.value); setLtPage(1) }} style={{ width: 120 }}>
               <option value="">全部类型</option>
               <option value="semantic">长期设定</option>
@@ -237,7 +246,7 @@ export function MemoryPage() {
             <form onSubmit={handleLtSearch} style={{ display: 'flex', gap: 8, flex: 1, minWidth: 200 }}>
               <input className="input" value={ltQuery} onChange={e => setLtQuery(e.target.value)} placeholder="搜索记忆内容..." style={{ flex: 1 }} />
               <button className="button secondary" type="submit">搜索</button>
-              {ltQuery && <button className="button ghost" type="button" onClick={() => { setLtQuery(''); void loadLongTerm(1, false) }}>清除</button>}
+              {ltQuery && <button className="button ghost" type="button" onClick={() => { setLtQuery(''); void loadLongTerm(1, false, '') }}>清除</button>}
             </form>
           </div>
 
@@ -246,9 +255,9 @@ export function MemoryPage() {
             <EmptyState title="暂无长期记忆" description="你可以说“我叫常”，确认后保存；也可以直接说“记住，我叫常”。" />
           ) : (
             <>
-              <div className="memory-list">
+              <div className="memory-list" ref={listMotion}>
                 {ltItems.map((item) => (
-                  <article className="memory-card" key={item.id}>
+                  <article className="memory-card" key={item.id} data-entry={item.id}>
                     <div className="memory-card-head" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 6 }}>
                       <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                         <StatusPill value={item.memory_type} />
@@ -266,7 +275,7 @@ export function MemoryPage() {
                       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                         <span className="muted small">重要性</span>
                         <input
-                          type="number" min={0} max={1} step={0.05}
+                          disabled={actionBusy} aria-label="重要性" type="number" min={0} max={1} step={0.05}
                           className="input" style={{ width: 72, textAlign: 'center' }}
                           value={item.importance ?? 0}
                           onChange={e => handleImportanceChange(item.id, parseFloat(e.target.value) || 0)}
@@ -276,11 +285,11 @@ export function MemoryPage() {
                       </div>
                       <div style={{ display: 'flex', gap: 6 }}>
                         {item.status === 'archived' || item.status === 'superseded' ? (
-                          <button className="button ghost small" onClick={() => handleRestore(item.id)}>恢复</button>
+                          <button className="button ghost small" disabled={actionBusy} onClick={() => handleRestore(item.id)}>恢复</button>
                         ) : (
-                          <button className="button ghost small" onClick={() => handleArchive(item.id)}>归档</button>
+                          <button className="button ghost small" disabled={actionBusy} onClick={() => handleArchive(item.id)}>归档</button>
                         )}
-                        <button className="button ghost small danger" onClick={() => handleDeleteClick(item.id)}>删除</button>
+                        <button className="button ghost small danger" disabled={actionBusy} onClick={() => handleDeleteClick(item.id)}>删除</button>
                       </div>
                     </div>
                   </article>
@@ -308,15 +317,15 @@ export function MemoryPage() {
           {error ? <ErrorState message={error} /> : loading ? <LoadingState title="正在加载记忆" /> : !searchItems.length ? (
             <EmptyState title="暂无匹配记忆" description="你可以说“我叫常”，确认后保存；也可以直接说“记住，我叫常”。" />
           ) : (
-            <div className="memory-list">
+            <div className="memory-list" ref={listMotion}>
               {searchItems.map((item) => (
-                <article className="memory-card" key={item.id}>
+                <article className="memory-card" key={item.id} data-entry={item.id}>
                   <div className="memory-card-head">
                     <StatusPill value={item.memory_type} />
                     <span className="muted small">重要性 {item.importance ?? 0}</span>
                   </div>
                   <p>{item.content}</p>
-                  <button className="button ghost" onClick={() => handleForget(item.id)}>忘记这条</button>
+                  <button className="button ghost" disabled={actionBusy} onClick={() => handleForget(item.id)}>忘记这条</button>
                 </article>
               ))}
             </div>
@@ -349,7 +358,7 @@ export function MemoryPage() {
                         </div>
                         <p>{mem.content}</p>
                         <div className="growth-memory-actions">
-                          <button className="button ghost small" onClick={() => handleForget(mem.id)}>忘记</button>
+                          <button className="button ghost small" disabled={actionBusy} onClick={() => handleForget(mem.id)}>忘记</button>
                         </div>
                       </div>
                     ))}
@@ -367,7 +376,7 @@ export function MemoryPage() {
         title={confirm?.title || ''}
         message={confirm?.message || ''}
         danger={confirm?.danger}
-        onConfirm={() => confirm?.action()}
+        onConfirm={() => { const action = confirm?.action; setConfirm(null); action?.() }}
         onCancel={() => setConfirm(null)}
       />
     </section>

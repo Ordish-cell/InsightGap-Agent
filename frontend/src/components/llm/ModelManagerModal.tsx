@@ -1,3 +1,4 @@
+import { usePresence } from '../common/motion'
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import * as llm from '../../api/llm'
@@ -8,9 +9,10 @@ import './models.css'
 
 type Props = { open: boolean; onClose: () => void; onChanged?: () => void; initialProvider?: string }
 export function ModelManagerModal(props: Props) {
-  return props.open ? createPortal(<ModelManagerContent {...props} />, document.body) : null
+  const present = usePresence(props.open)
+  return present ? createPortal(<ModelManagerContent {...props} />, document.body) : null
 }
-function ModelManagerContent({ onClose, onChanged, initialProvider }: Props) {
+function ModelManagerContent({ open, onClose, onChanged, initialProvider }: Props) {
   const dialog = useRef<HTMLDivElement>(null)
   const initialized = useRef(false)
   const [catalog, setCatalog] = useState<LlmProviderDefinition[]>([])
@@ -58,12 +60,13 @@ function ModelManagerContent({ onClose, onChanged, initialProvider }: Props) {
     return () => { active = false }
   }, [])
   useEffect(() => {
+    if (!open) return
     const previous = document.activeElement as HTMLElement | null
     dialog.current?.focus()
     const overflow = document.body.style.overflow
     document.body.style.overflow = 'hidden'
     return () => { document.body.style.overflow = overflow; previous?.focus() }
-  }, [])
+  }, [open])
   async function act(label: string, action: () => Promise<string | void>) {
     if (busy) return
     setBusy(label); setError(''); setNotice('')
@@ -90,7 +93,7 @@ function ModelManagerContent({ onClose, onChanged, initialProvider }: Props) {
   }
   const filtered = connections.filter(item => `${item.display_name} ${item.provider}`.toLowerCase().includes(query.trim().toLowerCase()))
   const models = (selected?.models || []).filter(item => `${item.display_name} ${item.model_id}`.toLowerCase().includes(modelQuery.trim().toLowerCase()))
-  return <div className="mc-backdrop" onMouseDown={event => { if (event.target === event.currentTarget && !busy) onClose() }}>
+  return <div inert={!open} className={`mc-backdrop ${open ? 'is-open' : 'is-closing'}`} onMouseDown={event => { if (event.target === event.currentTarget && !busy) onClose() }}>
     <div className="mc-dialog" role="dialog" aria-modal="true" aria-labelledby="mc-title" tabIndex={-1} ref={dialog} onKeyDown={event => {
       if (event.key === 'Escape' && !busy) { event.stopPropagation(); onClose() }
       if (event.key === 'Tab') {

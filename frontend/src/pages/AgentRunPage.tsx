@@ -4,8 +4,8 @@ import { PageHeader } from '../components/common/PageHeader'
 export function AgentRunPage() {
   return (
     <section className="workbench-page agent-debug-page">
-      <PageHeader title="Agent debug" description="Compatibility entry for direct Agent Runtime runs, streaming events, and step inspection." />
-      <AgentChatPanel source="agent_page" pageContext={{ page: 'agent' }} placeholder="Enter a read-only or local-write Agent task" initialTitle="Run an Agent task" debug />
+      <PageHeader title="Agent 调试" description="查看运行事件、步骤与工具执行详情。" />
+      <AgentChatPanel source="agent_page" pageContext={{ page: 'agent' }} placeholder="输入需要调试的任务…" initialTitle="运行一个任务" locale="zh" debug />
     </section>
   )
 }

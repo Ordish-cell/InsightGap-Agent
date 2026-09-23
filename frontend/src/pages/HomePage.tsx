@@ -3,6 +3,8 @@ import { Link, useNavigate } from 'react-router-dom'
 
 import * as feed from '../api/feed'
 import type { FeedCard } from '../api/types'
+import { Icon } from '../components/common/Icon'
+import { ActionNotice } from '../components/common/ActionNotice'
 import { AgentChatPanel } from '../components/agent/AgentChatPanel'
 
 // Module-level cache to survive component remounts during hot reload / StrictMode
@@ -50,10 +52,11 @@ function getInitialFeedOpen() {
     if (saved === 'false') return false
     if (saved === 'true') return true
   } catch { /* localStorage not available */ }
-  return true
+  return false
 }
 
 export function HomePage() {
+  const researchLock = useRef(false)
   const navigate = useNavigate()
   const [cards, setCards] = useState<FeedCard[]>([])
   const [feedLoading, setFeedLoading] = useState(true)
@@ -127,8 +130,10 @@ export function HomePage() {
   }, [feedOpen])
 
   async function startResearch(cardId: number) {
-    if (researchingCardId) return
+    if (researchLock.current) return
+    researchLock.current = true
     setResearchingCardId(cardId)
+    setFeedError('')
     try {
       const result = await feed.startResearch(cardId)
       if (result?.id) {
@@ -137,110 +142,30 @@ export function HomePage() {
         throw new Error('研究任务创建成功但没有返回 run_id')
       }
     } catch (err) {
-      console.error('Deep research creation failed:', err)
+      setFeedError(err instanceof Error ? err.message : '研究创建失败，请重试。')
     } finally {
+      researchLock.current = false
       setResearchingCardId(null)
     }
   }
 
-  const isLoading = feedLoading
-  const hasCards = homeFeeds.length > 0
-  const hasError = !!feedError && !hasCards
-
   return (
     <section className="home-page">
-      <div className={feedOpen ? 'floating-feed open' : 'floating-feed closed'}>
-        <div className="floating-feed-head">
-          <div>
-            <h2>今日精选信息差</h2>
-            <p>按显性相关、邻近机会和远域启发混合呈现的三条信号。</p>
-          </div>
-          <div className="floating-feed-actions">
-            <Link className="soft-button" to="/feed">
-              完整信息流
-            </Link>
-            <button className="soft-button ghost" onClick={() => setFeedOpen((value) => !value)}>
-              {feedOpen ? '收起' : '展开'}
-            </button>
-          </div>
-        </div>
-        {feedOpen ? (
-          <div className="floating-feed-grid">
-            {isLoading ? (
-              <article className="floating-feed-card explicit">
-                <h3>正在加载真实信息差</h3>
-                <p className="feed-value-line">正在读取数据库并按配置尝试刷新真实来源。</p>
-              </article>
-            ) : null}
-            {!isLoading && hasError ? (
-              <article className="floating-feed-card explicit">
-                <h3>加载失败</h3>
-                <p className="feed-value-line">{feedError || '未知错误'}</p>
-                <Link className="light-mini-button" to="/feed">去信息流查看</Link>
-              </article>
-            ) : null}
-            {!isLoading && !hasError && !hasCards ? (
-              <article className="floating-feed-card explicit">
-                <h3>今日信息正在生成</h3>
-                <p className="feed-value-line">系统正在整理今日信息差，请稍后刷新或点击下方按钮重试。</p>
-                <Link className="light-mini-button" to="/feed">去信息流手动刷新</Link>
-              </article>
-            ) : null}
-            {homeFeeds.map((item, index) => {
-              const c = item?.card
-              if (!c) return null
-              return (
-                <article className={`floating-feed-card ${item.className}`} style={{ animationDelay: `${index * 140}ms` }} key={`${item.label}-${c.id || index}`}>
-                  <div className="floating-feed-card-top">
-                    <span className="mix-pill">{item.percent}</span>
-                    <span className="mini-pill">{item.label}</span>
-                    <span className="mini-pill score">分数：{Math.round((c.final_score ?? 0) * 100)}</span>
-                  </div>
-                  <h3 title={c.original_title || c.display_title || c.title || ''}>
-                    {c.display_title || c.title || '未命名卡片'}
-                  </h3>
-                  <p className="feed-value-line">{c.one_sentence_value || c.summary || '这条信号可能带来新的判断角度。'}</p>
-                  <div className="feed-relevance-line">
-                    <strong>相关</strong>
-                    <span>{c.why_relevant || c.why_you || '与你当前关注的方向有交集。'}</span>
-                  </div>
-                  <div className="feed-benefit-line">
-                    <strong>好处</strong>
-                    <span>{c.benefit || '可能对你的产品和技术决策有参考价值。'}</span>
-                  </div>
-                  <div className="mini-insight">
-                    <strong>信息差</strong>
-                    <span>{c.information_gap || '暂无明确信息差说明，可由后续研究补全。'}</span>
-                  </div>
-                  <div className="floating-feed-card-actions">
-                    <button className="light-mini-button" onClick={() => setSelectedFeedCardId(c.id as unknown as number)}>
-                      带入对话
-                    </button>
-                    <button className="dark-mini-button" onClick={() => startResearch(c.id as unknown as number)} disabled={researchingCardId === (c.id as unknown as number)}>
-                      {researchingCardId === (c.id as unknown as number) ? '研究中...' : '深度研究'}
-                    </button>
-                    <Link className="light-mini-button" to={`/feed/${c.id}`}>
-                      详情
-                    </Link>
-                  </div>
-                </article>
-              )
-            })}
-          </div>
-        ) : null}
+      <header className="home-topbar"><span className="home-context"><Icon name="chat" size={17} />对话工作台</span><button className={`feed-toggle ${feedOpen ? 'active' : ''}`} aria-expanded={feedOpen} onClick={() => setFeedOpen(value => !value)}><Icon name="feed" size={17} />今日精选<span className="count-label">{homeFeeds.length}</span><Icon name="chevron" size={14} style={{ transform: feedOpen ? 'rotate(90deg)' : undefined }} /></button></header>
+      <div className={`home-feed-disclosure ${feedOpen ? 'is-open' : ''}`} inert={!feedOpen}>
+        <div><section className="home-feed-content" aria-label="今日精选">
+          <div className="section-title"><div><strong>值得关注的信号</strong><p className="muted small">从一条信息开始，形成自己的判断。</p></div><Link className="text-link" to="/feed">全部信息流 <Icon name="arrow" size={16} /></Link></div>
+          <ActionNotice message={feedError} error />
+          {feedLoading ? <div className="feed-skeleton" aria-label="正在加载精选"><span /><span /><span /></div> : !homeFeeds.length ? <p className="muted">暂无精选信息，可以前往信息流刷新。</p> : <div className="floating-feed-grid">{homeFeeds.map(({ card: c, label }) => <article className="floating-feed-card" key={c.id}>
+            <div className="floating-feed-card-top"><span className="eyebrow">{label}</span><span className="muted small">{c.domain || '来源未标记'}</span></div>
+            <Link to={`/feed/${c.id}`} className="feed-title-link"><h3>{c.display_title || c.title || '未命名卡片'}</h3></Link>
+            <p>{c.one_sentence_value || c.summary || '暂无摘要。'}</p>
+            <div className="floating-feed-card-actions"><button className={`button small ${selectedFeedCardId === Number(c.id) ? '' : 'secondary'}`} onClick={() => setSelectedFeedCardId(Number(c.id))}>{selectedFeedCardId === Number(c.id) ? '已带入对话' : '带入对话'}</button><button className="button ghost small" onClick={() => void startResearch(Number(c.id))} disabled={researchingCardId !== null}>{researchingCardId === Number(c.id) ? '创建中…' : '深度研究'}<Icon name="arrow" size={14} /></button></div>
+          </article>)}</div>}
+        </section></div>
       </div>
-      {!feedOpen ? (
-        <button className="floating-feed-reopen" onClick={() => setFeedOpen(true)}>
-          今日精选
-        </button>
-      ) : null}
-      <AgentChatPanel
-        source="home_chat"
-        pageContext={{ page: 'home', selected_feed_card_id: selectedFeedCardId, selected_feed_card_title: selectedFeedCard?.title || '' }}
-        placeholder={selectedFeedCard ? `围绕这张卡片提问：${selectedFeedCard.title}` : '让 Agent 帮你研究、生成成果、总结信息，或沉淀成可复用 Skill'}
-        initialTitle="我们该构建或研究什么？"
-        locale="zh"
-      />
+      {selectedFeedCard && <div className="selected-feed-context" role="status"><Icon name="feed" size={16} /><span>围绕「{selectedFeedCard.title}」对话</span><button className="icon-button" aria-label="取消带入卡片" onClick={() => setSelectedFeedCardId(null)}><Icon name="close" size={16} /></button></div>}
+      <AgentChatPanel source="home_chat" pageContext={{ page: 'home', selected_feed_card_id: selectedFeedCardId, selected_feed_card_title: selectedFeedCard?.title || '' }} placeholder={selectedFeedCard ? `围绕这张卡片提问：${selectedFeedCard.title}` : '提出问题，或上传文件一起探索…'} initialTitle="今天，想探索什么？" locale="zh" />
     </section>
   )
 }

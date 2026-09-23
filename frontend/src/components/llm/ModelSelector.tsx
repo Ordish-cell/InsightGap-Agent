@@ -1,3 +1,4 @@
+import { usePresence } from '../common/motion'
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 
@@ -14,6 +15,8 @@ export function ModelSelector({ value, onChange, disabled }: Props) {
   const [query, setQuery] = useState('')
   const [error, setError] = useState('')
   const [open, setOpen] = useState(false)
+  const present = usePresence(open)
+  const pickerRef = useRef<HTMLDivElement>(null)
   const [managerOpen, setManagerOpen] = useState(false)
   const [position, setPosition] = useState({ left: 0, bottom: 0 })
   const [defaultModelId, setDefaultModelId] = useState<number | null>(null)
@@ -30,7 +33,16 @@ export function ModelSelector({ value, onChange, disabled }: Props) {
   useEffect(() => { void reload().catch(exc => setError(readableError(exc))) }, [])
   useEffect(() => {
     if (!open) return
-    const handleKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') { setOpen(false); buttonRef.current?.focus() } }
+    pickerRef.current?.querySelector<HTMLInputElement>('input')?.focus()
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') { setOpen(false); buttonRef.current?.focus() }
+      if (event.key === 'Tab') {
+        const targets = pickerRef.current?.querySelectorAll<HTMLElement>('button:not(:disabled), input')
+        const first = targets?.[0], last = targets?.[targets.length - 1]
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last?.focus() }
+        if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first?.focus() }
+      }
+    }
     const handleResize = () => setOpen(false)
     window.addEventListener('keydown', handleKeyDown)
     window.addEventListener('resize', handleResize)
@@ -61,11 +73,12 @@ export function ModelSelector({ value, onChange, disabled }: Props) {
   function choose(model: LlmModelConfig) {
     onChange(model.id)
     setOpen(false)
+    buttonRef.current?.focus()
   }
 
   return <>
     <button ref={buttonRef} type="button" className="composer-model-button" title={selected ? `${selected.connection.display_name} · ${selected.model.model_id}` : '选择模型连接'} onClick={toggle} disabled={disabled} aria-haspopup="dialog" aria-expanded={open}><span className={selected ? 'model-status-dot ready' : 'model-status-dot'} />{selected?.model.display_name || (value ? '模型不可用，请重选' : '选择模型')}<span aria-hidden="true">⌄</span></button>
-    {open ? createPortal(<><button type="button" className="model-selector-scrim" aria-label="关闭模型选择" onClick={() => setOpen(false)} /><div className="model-selector-popover mc-picker" style={{ left: position.left, bottom: position.bottom }} role="dialog" aria-label="选择本次使用的模型">
+    {present ? createPortal(<><button type="button" inert={!open} className="model-selector-scrim" aria-label="关闭模型选择" onClick={() => { setOpen(false); buttonRef.current?.focus() }} /><div ref={pickerRef} inert={!open} className={`model-selector-popover mc-picker ${open ? 'is-open' : 'is-closing'}`} style={{ left: position.left, bottom: position.bottom }} role="dialog" aria-label="选择本次使用的模型">
       <div className="model-selector-heading"><strong>本次任务使用</strong><small>切换只影响下一次发送</small></div>
       <input autoFocus className="mc-search" aria-label="搜索供应商或模型" placeholder="搜索供应商或模型…" value={query} onChange={event => setQuery(event.target.value)} />
       {error ? <p className="mc-feedback error" role="alert">{error}</p> : null}

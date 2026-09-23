@@ -1,3 +1,5 @@
+import { Icon } from '../components/common/Icon'
+import { Tabs } from '../components/common/Tabs'
 import { FormEvent, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
@@ -44,29 +46,25 @@ export function LoginPage() {
   }
 
   return (
-    <main className="simple-login-page">
+    <main className="login-page">
       <div className="login-glow glow-one" />
       <div className="login-glow glow-two" />
-      <section className="simple-login-card" data-mode={mode}>
-        <div className="simple-login-brand">
-          <span className="simple-login-logo">OS</span>
-          <div><strong>信息差 Agent OS</strong><small>{mode === 'login' ? '登录' : '注册'}后进入工作台</small></div>
+      <section className="login-card" data-mode={mode}>
+        <div className="login-brand">
+          <span className="login-brand-icon"><Icon name="spark" /></span>
+          <div><strong className="login-brand-name">InsightGap</strong><small className="login-brand-sub">{mode === 'login' ? '登录' : '注册'}后进入工作台</small></div>
         </div>
 
-        <div className="simple-login-tabs" role="tablist" aria-label="登录注册切换">
-          <span className="simple-login-tab-indicator" />
-          <button className={mode === 'login' ? 'active' : ''} type="button" onClick={() => setMode('login')}>登录</button>
-          <button className={mode === 'register' ? 'active' : ''} type="button" onClick={() => setMode('register')}>注册</button>
-        </div>
+        <Tabs value={mode} onChange={setMode} label="登录注册切换" items={[{ value: 'login', label: '登录' }, { value: 'register', label: '注册' }]} />
 
-        <form className="simple-login-form" onSubmit={submit}>
+        <form className="login-form" onSubmit={submit}>
           {error ? <ErrorState message={error} /> : null}
-          <label>邮箱<input className="input" value={email} onChange={(event) => setEmail(event.target.value)} type="email" placeholder="输入邮箱" required /></label>
-          <label>密码<input className="input" value={password} onChange={(event) => setPassword(event.target.value)} type="password" placeholder="输入密码" required /></label>
-          <div className={mode === 'register' ? 'nickname-field open' : 'nickname-field'}>
-            <label>昵称<input className="input" value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="可选" /></label>
-          </div>
-          <button className={canSubmit ? 'simple-login-submit active' : 'simple-login-submit'} disabled={!canSubmit}>{loading ? '处理中...' : mode === 'login' ? '登录' : '注册'}</button>
+          <label className="login-field">邮箱<input className="input" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" type="email" placeholder="输入邮箱" required /></label>
+          <label className="login-field">密码<input className="input" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={mode === 'login' ? 'current-password' : 'new-password'} type="password" placeholder="输入密码" required /></label>
+          <div inert={mode !== 'register'} className={mode === 'register' ? 'login-nickname-wrap show' : 'login-nickname-wrap'}><div>
+            <label className="login-field">昵称<input className="input" value={nickname} onChange={(event) => setNickname(event.target.value)} placeholder="可选" /></label>
+          </div></div>
+          <button className={canSubmit ? 'login-submit active' : 'login-submit'} disabled={!canSubmit}>{loading ? '处理中...' : mode === 'login' ? '登录' : '注册'}</button>
         </form>
       </section>
     </main>

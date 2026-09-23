@@ -1,4 +1,8 @@
 /* Model workspace: compact controls, quiet surfaces, explicit selection. */
+.mc-backdrop.is-open { animation: fadeIn var(--motion); }
+.mc-backdrop.is-open .mc-dialog { animation: popoverIn var(--motion) var(--ease); }
+.mc-backdrop.is-closing { animation: fadeOut 160ms forwards; }
+.mc-backdrop.is-closing .mc-dialog, .model-selector-popover.mc-picker.is-closing { animation: popoverOut 160ms forwards; }
 .mc-backdrop { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 24px; background: rgb(20 26 34 / 35%); }
 .mc-dialog { width: min(1040px, 100%); height: min(740px, calc(100dvh - 48px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid #d6dde5; border-radius: 16px; background: #fff; color: #1c2530; box-shadow: 0 24px 80px rgb(16 28 45 / 20%); font-size: 14px; }
 .mc-dialog button, .mc-picker button { transition: background-color 160ms ease-out, border-color 160ms ease-out; }

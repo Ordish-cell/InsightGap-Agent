@@ -1,3 +1,4 @@
+import { Icon } from '../common/Icon'
 import { FormEvent, useEffect, useRef, useState } from 'react'
 
 import type { AgentChatMessage, AgentEvent, AgentRun, AgentRunStep, ChatAttachment, UnknownRecord } from '../../api/types'
@@ -506,7 +507,7 @@ function AgentMessageItem({
                     />
                   ) : (
                     <div className="message-attachment-file">
-                      <span className="message-attachment-file-icon">📄</span>
+                      <span className="message-attachment-file-icon"><Icon name="artifact" /></span>
                       <span className="message-attachment-file-name">{item.filename}</span>
                     </div>
                   )}
@@ -1542,10 +1543,10 @@ export function AgentChatPanel({
                     fallbackText={item.filename}
                   />
                 ) : (
-                  <div className="composer-attachment-file-icon">🖼</div>
+                  <div className="composer-attachment-file-icon"><Icon name="artifact" /></div>
                 )
               ) : (
-                <div className="composer-attachment-file-icon">📄</div>
+                <div className="composer-attachment-file-icon"><Icon name="artifact" /></div>
               )}
 
               <div className="composer-attachment-info">
@@ -1581,7 +1582,7 @@ export function AgentChatPanel({
                 type="button"
                 className="composer-attachment-remove"
                 onClick={() => removeAttachment(item.localId)}
-                aria-label="Remove attachment"
+                aria-label="移除附件"
               >
                 ×
               </button>
@@ -1611,14 +1612,11 @@ export function AgentChatPanel({
         <div className="composer-tools">
           <button
             type="button"
-            aria-label="Upload files"
+            aria-label="上传文件" title="上传文件"
             onClick={() => fileInputRef.current?.click()}
           >
             +
           </button>
-          <span>{text(locale, zh.research, 'Research')}</span>
-          <span>{text(locale, zh.artifact, 'Artifact')}</span>
-          <span>{text(locale, zh.skillDraft, 'Skill')}</span>
           <ModelSelector value={selectedModelConfigId} onChange={setSelectedModelConfigId} disabled={running} />
         </div>
         <button
@@ -1637,7 +1635,10 @@ export function AgentChatPanel({
     <div className={hasConversation ? 'codex-chat-page has-chat' : 'codex-chat-page initial'}>
       {!hasConversation ? (
         <div className="initial-composer-stage">
+          <span className="chat-welcome-mark" aria-hidden="true"><Icon name="spark" size={28} /></span>
+          <p className="eyebrow">INSIGHTGAP · 你的思考空间</p>
           <h1>{initialTitle}</h1>
+          <p className="chat-welcome-description">梳理信息、深入研究，把想法变成可用的成果。</p>
           {composer}
         </div>
       ) : (

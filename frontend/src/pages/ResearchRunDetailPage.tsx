@@ -1,3 +1,5 @@
+import { ActionNotice } from '../components/common/ActionNotice'
+import { useAction } from '../components/common/useAction'
 import { useEffect, useRef, useState } from 'react'
 import { Link, useParams, useNavigate } from 'react-router-dom'
 
@@ -40,7 +42,7 @@ export function ResearchRunDetailPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [pollingError, setPollingError] = useState('')
-  const [retrying, setRetrying] = useState(false)
+  const retry = useAction()
 
   // Refs to prevent double-polling from StrictMode / effect re-runs
   const timerRef = useRef<number | null>(null)
@@ -121,8 +123,7 @@ export function ResearchRunDetailPage() {
 
   async function handleRetry() {
     if (!run) return
-    setRetrying(true)
-    try {
+    await retry.run(async () => {
       const payload: Record<string, unknown> = {
         query: run.query,
         source: run.metadata?.source || 'manual',
@@ -133,13 +134,12 @@ export function ResearchRunDetailPage() {
       }
       const newRun = await research.createRun(payload)
       if (newRun?.id) navigate(`/research/${newRun.id}`)
-    } catch {
-      setRetrying(false)
-    }
+    })
   }
 
   if (loading) return <LoadingState title="正在加载研究详情" />
   if (error) return <ErrorState message={error} />
+  if (!run && pollingError) return <ErrorState message={pollingError} />
   if (!run) return <EmptyState title="未找到研究记录" />
 
   const meta = run.metadata as ResearchRunMetadata | undefined
@@ -147,7 +147,6 @@ export function ResearchRunDetailPage() {
   const isRunning = run.status === 'running'
   const isFailed = run.status === 'failed'
   const isFallback = meta?.used_fallback === true
-  const isOdr = meta?.source === 'open_deep_research' || meta?.engine === 'open_deep_research'
 
   return (
     <section className="workbench-page research-detail-page">
@@ -159,36 +158,28 @@ export function ResearchRunDetailPage() {
               {engine.text}
             </span>
             <StatusPill value={run.status || 'pending'} />
-            {isOdr && <span className="badge odr-verified">真实 ODR</span>}
             {isFallback && <span className="badge fallback-warn">降级报告</span>}
           </span>
         }
         actions={
           <>
             {(isFailed || isFallback) && (
-              <button className="button" onClick={handleRetry} disabled={retrying}>
-                {retrying ? '重试中...' : '重新使用 Open Deep Research 研究'}
+              <button className="button" onClick={handleRetry} disabled={retry.busy}>
+                {retry.busy ? '重试中…' : '重新研究'}
               </button>
             )}
           </>
         }
       />
 
+      <ActionNotice message={retry.message || pollingError} error={retry.failed || !!pollingError} />
       {isRunning && (
         <div className="panel running-panel">
           <div className="running-indicator">
             <span className="spinner" />
             <span>正在执行深度研究...</span>
           </div>
-          <div className="running-steps">
-            <p>研究引擎正在执行以下步骤：</p>
-            <ul>
-              <li className={meta?.source ? 'done' : ''}>初始化研究引擎</li>
-              <li>拆解研究问题</li>
-              <li>多源并行检索资料</li>
-              <li>整合证据并生成报告</li>
-            </ul>
-          </div>
+          <p className="muted small">研究正在后台运行，报告完成后会自动显示。</p>
           {pollingError && (
             <p className="muted small" style={{ marginTop: 12 }}>{pollingError}</p>
           )}
@@ -279,8 +270,8 @@ export function ResearchRunDetailPage() {
           </div>
 
           {meta && (
-            <div className="panel">
-              <h3>研究引擎信息</h3>
+            <details className="panel">
+              <summary>研究引擎信息</summary>
               <table className="kv-table">
                 <tbody>
                   <tr><td>引擎</td><td>{meta.engine || meta.source || '未知'}</td></tr>
@@ -294,7 +285,7 @@ export function ResearchRunDetailPage() {
                   )}
                 </tbody>
               </table>
-            </div>
+            </details>
           )}
 
           <details className="panel">
