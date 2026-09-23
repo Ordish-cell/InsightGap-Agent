@@ -35,7 +35,7 @@ InsightGap-Agent 是一个基于 FastAPI、React 和 LangGraph 的全栈 Agent �
 | 能力 | 当前实现 |
 | --- | --- |
 | 信息差发现 | 汇集 GitHub、arXiv、RSS、DuckDuckGo、Tavily、SerpAPI 和手动种子，进行去重、评分和卡片生成；结合画像解释显性相关、邻近机会与远域启发 |
-| Agent 对话 | 同一 Supervisor 直接流式回答或发起原生工具调用，读取结果后继续；支持运行记录、进展事件、取消和适用阶段的追加指令 |
+| Agent 对话 | 同一 Supervisor 直接流式回答或发起原生工具调用，读取结果后继续；模型说明与实际工具状态按时间顺序展示，支持运行记录、取消和适用阶段的追加指令 |
 | 模型连接 | 在设置页管理供应商连接、协议、地址、加密密钥与自定义 Headers；获取或手动添加模型，测试生成并选择会话模型 |
 | 会话文件 | 读取已发送附件，同一会话跨轮追问；直接读取与按需检索结合，记录文件范围、证据与内容覆盖情况 |
 | RAG 验证 | 结构化 Parent / Child 切分、文档摘要、Dense + Sparse/BM25 检索、RRF 融合、可选模型重排与证据组装 |
@@ -76,7 +76,7 @@ flowchart TD
 
 - **模型选择固定**：当前任务使用选定模型，工具任务需要模型支持原生 tool calling。
 - **有界执行**：默认最多 12 次 Supervisor 决策、8 次工具执行、1 次深度研究，连续失败上限为 3 次；单个原生模型回合默认超时 60 秒。
-- **流式可追踪**：通过 `agent_text_started/delta/completed` 发布文本，结合事件账本恢复展示；使用 `text_id` 去重，断流时保留部分答案。
+- **流式可追踪**：模型生成的任务说明在文本增量到达时显示，工具活动穿插其中，最终回答接续展示；节点记录收在执行详情中。事件账本与 `text_id` 支持去重和刷新回放，停止或断流时保留已收到的文字。
 - **控制有边界**：普通聊天和直接文档读取支持运行中追加指令；进入其他业务能力前关闭该类控制。
 
 实现入口见 [运行图](src/web_app/agent/runtime/graph_builder.py)、[Supervisor](src/web_app/agent/runtime/nodes.py) 和 [原生模型流协议](src/web_app/agent/llm/native_turn.py)。详细边界见 [原生运行架构](docs/native_runtime.md)。
@@ -307,6 +307,12 @@ npm run build
 ## 界面预览
 
 以下界面截图使用演示数据，展示当前桌面浏览器工作台。
+
+### 对话工作台
+
+模型的实时说明、实际工具状态和后续回答沿同一条时间线展示；权限检查等节点记录可在「执行详情」中展开。下图为运行中的演示会话。
+
+![对话实时工作进展](images/workbench/chat-progress.png)
 
 <details>
 <summary>信息流与信息差卡片</summary>
