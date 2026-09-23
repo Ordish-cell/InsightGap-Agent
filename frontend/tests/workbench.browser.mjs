@@ -23,6 +23,7 @@ const cards = ['explicit_related', 'adjacent_domain', 'far_domain'].map((bucket,
 }))
 const runs = [{ id: 'r1', query: '小团队如何建立可靠的信息研究流程？', status: 'completed', artifact_id: 1, summary: '以证据为基础，保留判断过程。', markdown_report: '# 研究结论\n\n研究应从明确的问题开始，而后逐步收集证据。\n\n## 实施建议\n\n- 保留信息来源\n- 定期核对假设\n\n| 阶段 | 产出 |\n| --- | --- |\n| 检索 | 证据清单 |\n| 综合 | 可追溯报告 |', metadata: { engine: 'open_deep_research' } }]
 let memories = [{ id: 1, content: '用户希望被称呼为小常。', memory_type: 'semantic', category: 'preferred_name', status: 'active', importance: .8, effective_importance: .8, confidence: 1 }]
+let conversations = []
 let skills = [{ id: 1, name: '资料核验与报告整理', description: '核对来源，整合关键信息，形成有依据的报告。', trigger_text: '当需要整理研究材料时', status: 'draft', safety_level: 'L1' }, { id: 2, name: '研究摘要', description: '将长文转化为可阅读的摘要。', status: 'approved', safety_level: 'L1' }]
 let approvals = [{ id: 1, title: '保存整理后的研究材料', description: '核对以下操作后决定是否继续。', status: 'pending', payload: { permission_level: 'L3' } }, { id: 2, title: '已处理的操作', status: 'approved', payload: { permission_level: 'L3' } }, { id: 3, title: '受限操作', status: 'pending', payload: { permission_level: 'L4' } }]
 await page.route('**/api/v1/**', async route => {
@@ -55,7 +56,11 @@ await page.route('**/api/v1/**', async route => {
   if (path === '/mcp/tools') data = mode === 'empty' ? [] : [{ name: 'search_documents', description: '检索已保存的资料，返回相关片段与引用。', safety_level: 'L0' }]
   if (path === '/mcp/tool-calls') data = mode === 'empty' ? [] : [{ id: 1, tool_name: 'search_documents', status: 'completed', safety_level: 'L0', input: { query: '研究方法' }, output: { results: 3 } }]
   if (path === '/llm/preferences') data = { default_model_config_id: null }
-  if (path === '/agent/conversations') data = { items: [], total: 0 }
+  if (path === '/agent/conversations') data = { items: conversations, total: conversations.length }
+  if (path === '/agent/conversations/delete-test/hard' && method === 'DELETE') {
+    conversations = []
+    data = { id: 1, conversation_id: 'delete-test', status: 'completed', phase: 'done', attempts: 1, error_message: '' }
+  }
   await route.fulfill({ json: { success: true, data } })
 })
 const routes = ['/', '/feed', '/feed/1', '/research', '/research/r1', '/artifacts', '/memory', '/skills', '/approvals', '/mcp', '/settings', '/profile', '/agent']
@@ -73,6 +78,20 @@ try {
   }
   await page.setViewportSize({ width: 1440, height: 1000 })
   await visit('/')
+  conversations = [{ conversation_id: 'delete-test', title: '一条很长的会话标题，用于验证删除按钮始终可见', last_message_preview: '这是一段同样很长的消息预览，不能把删除入口挤出侧栏。' }]
+  await page.getByRole('button', { name: '最近会话' }).click()
+  const deleteRow = page.locator('.sidebar-conversation-item-row').first()
+  const deleteButton = deleteRow.getByRole('button', { name: /删除会话/ })
+  await deleteButton.waitFor()
+  const rowBounds = await deleteRow.boundingBox(), buttonBounds = await deleteButton.boundingBox()
+  assert.ok(rowBounds && buttonBounds && buttonBounds.x + buttonBounds.width <= rowBounds.x + rowBounds.width + 1, 'delete button should remain inside the sidebar row')
+  await screenshot('conversation-delete-entry')
+  await deleteButton.click()
+  await page.getByRole('alertdialog', { name: '删除会话' }).waitFor()
+  await page.getByRole('alertdialog').getByRole('button', { name: '彻底删除' }).click()
+  await page.getByText('还没有会话', { exact: true }).waitFor()
+  assert.ok(writes.includes('/agent/conversations/delete-test/hard'))
+  await page.getByRole('button', { name: '最近会话' }).click()
   assert.equal(await page.locator('.home-feed-disclosure').getAttribute('inert'), '')
   await page.getByRole('button', { name: /展开今日信号/ }).click()
   assert.equal(await page.locator('.home-feed-disclosure').getAttribute('inert'), null)

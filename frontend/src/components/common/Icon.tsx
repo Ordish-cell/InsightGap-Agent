@@ -17,6 +17,7 @@ const paths: Record<string, string> = {
   plus: 'M12 5v14M5 12h14',
   menu: 'M4 6h16M4 12h16M4 18h16',
   close: 'm6 6 12 12M6 18 18 6',
+  trash: 'M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v6m4-6v6',
   chevron: 'm9 5 7 7-7 7',
   arrow: 'M5 12h14m-6-6 6 6-6 6',
   collapse: 'M4 4h16v16H4V4Zm5 0v16m7-13-3 3 3 3',

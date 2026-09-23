@@ -229,10 +229,11 @@ export function Sidebar() {
                   <button
                     className="sidebar-conversation-delete"
                     type="button"
+                    aria-label={`删除会话：${item.title || '未命名会话'}`}
                     title="彻底删除会话"
                     onClick={(e) => { e.stopPropagation(); setDeleteTarget(item) }}
                   >
-                    ✕
+                    <Icon name="trash" size={16} />
                   </button>
                 </div>
               ))}

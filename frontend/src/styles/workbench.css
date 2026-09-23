@@ -510,19 +510,39 @@ input[type='checkbox'] {
   gap: 4px;
 }
 .sidebar-conversation-item-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 36px;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
   border-radius: 8px;
 }
 .sidebar-conversation-item-row:hover {
   background: #e5ebf5;
 }
 .sidebar-conversation-item {
-  flex: 1;
+  width: 100%;
   min-width: 0;
   border: 0;
   background: transparent;
   text-align: left;
   padding: 8px;
+}
+.sidebar-conversation-delete {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 8px;
+  color: var(--danger);
+  background: #fff7f6;
+  border: 1px solid #f1d8d5;
+}
+.sidebar-conversation-delete:hover,
+.sidebar-conversation-delete:focus-visible {
+  color: var(--danger);
+  background: #fcefee;
 }
 .sidebar-conversation-item strong,
 .sidebar-conversation-item span {
