@@ -9,6 +9,13 @@ const { projectChatEvent, restoreChatMessage } = await import(`data:text/javascr
 const initial = () => ({ role: 'assistant', run_id: 1, message_id: 'm1', content: '', status: 'running' })
 const event = (id, event_type, payload = {}) => ({ id, event_seq: id, run_id: 1, event_type, payload })
 
+test('live duplicate deltas are ignored and unfinished snapshots can be replayed afresh', () => {
+  const events = [event(1, 'agent_text_started', { text_id: 'a' }), event(2, 'agent_text_delta', { text_id: 'a', text: 'Partial' })]
+  const live = [...events, events[1]].reduce(projectChatEvent, initial())
+  assert.equal(live.content, 'Partial')
+  assert.equal(restoreChatMessage(live, events).content, 'Partial')
+})
+
 test('native text is immediate, progress is removed from final answer, final projection does not duplicate', () => {
   let message = initial()
   const apply = (e) => { message = projectChatEvent(message, e) }

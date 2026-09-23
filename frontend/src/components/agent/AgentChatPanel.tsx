@@ -5,6 +5,7 @@ import type { AgentChatMessage, AgentEvent, AgentRun, AgentRunStep, ChatAttachme
 import * as agent from '../../api/agent'
 import { ApiError } from '../../api/client'
 import { projectChatEvent, restoreChatMessage } from './chatStream'
+import { NativeWorkProgress } from './NativeWorkProgress'
 import { fetchDocumentBlobUrl, retryDocumentIngest, toApiUrl, uploadChatAttachment, waitForDocumentReady } from '../../api/documents'
 import { JsonBlock } from '../common/JsonBlock'
 import { MarkdownRenderer } from '../common/MarkdownRenderer'
@@ -473,6 +474,7 @@ function AgentMessageItem({
   onReject: (approvalId: number) => void
 }) {
   const visibleContent = getUserVisibleMessageContent(message)
+  const nativeProgress = !debug && (message.trace_events || []).some(event => event.event_type?.startsWith('agent_text_'))
 
   const messageAttachments: ChatAttachment[] =
     message.attachments ||
@@ -523,18 +525,18 @@ function AgentMessageItem({
   return (
     <article className="chat-message assistant">
       <div className="assistant-run-message">
-        {debug ? (
+        {nativeProgress ? <NativeWorkProgress message={message} answer={visibleContent && !isApprovalPlaceholder(visibleContent) ? visibleContent : ''} locale={locale} onApprove={onApprove} onReject={onReject} /> : debug ? (
           <AgentRunTraceBlock message={message} locale={locale} onApprove={onApprove} onReject={onReject} />
         ) : (
           <AgentThoughtStream message={message} locale={locale} onApprove={onApprove} onReject={onReject} />
         )}
-        <div className="message-bubble answer-content">
+        {!nativeProgress && <div className="message-bubble answer-content">
           {visibleContent && !isApprovalPlaceholder(visibleContent) ? (
             <MarkdownRenderer content={visibleContent} />
           ) : message.status === 'thinking' || message.status === 'streaming' || message.status === 'created' || message.status === 'running' || message.status === 'queued' || message.status === 'interrupted' || message.status === 'waiting_approval' ? null : (
             text(locale, zh.noAnswer, 'No answer to display.')
           )}
-        </div>
+        </div>}
         {message.status === 'interrupted' ? <small>{text(locale, '已中断 · 已保留部分回复', 'Interrupted · partial reply saved')}</small> : null}
         {message.status === 'queued' ? <small>{text(locale, '已接收，等待旧回复结束', 'Accepted, waiting for the previous reply to stop')}</small> : null}
       </div>
@@ -1301,7 +1303,7 @@ export function AgentChatPanel({
           if (parsed.event_type?.startsWith('agent_text_') || (parsed.event_type === 'answer_delta' && payload.text_id)) {
             setMessages((items) => items.map((item) =>
               item.role === 'assistant' && (item.message_id === liveAssistantMessageId || item.message_id === localAssistant.message_id)
-                ? { ...projectChatEvent({ ...item, run_id: liveRunId || item.run_id }, parsed), trace_events: appendTraceEvent(item.trace_events, parsed) }
+                ? { ...projectChatEvent({ ...item, message_id: liveAssistantMessageId, run_id: liveRunId || item.run_id }, parsed), trace_events: appendTraceEvent(item.trace_events, parsed) }
                 : item))
             return
           }

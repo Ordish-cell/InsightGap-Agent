@@ -2591,6 +2591,14 @@ details[open] > :not(summary) {
 }
 
 /* Feed is a reading surface: a lead signal, then spacious supporting stories. */
+.native-work-progress { display: grid; gap: 18px; min-width: 0; }
+.work-text-block { min-width: 0; overflow-wrap: anywhere; }
+.work-text-block > :first-child { margin-top: 0; }
+.work-text-block > :last-child { margin-bottom: 0; }
+.work-tool-row, .work-live-status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.work-tool-row small { margin-left: 4px; }
+.work-tool-row.failed { color: var(--danger); }
+.native-work-progress .live-progress-details { font-size: 12px; }
 .feed-item-story, .feed-item-summary, .feed-item-relevance, .feed-item-gap { min-width: 0; overflow-wrap: anywhere; }
 @media (min-width: 821px) {
 .feed-page .page-header h1 { font-size: clamp(30px, 3.2vw, 42px); }

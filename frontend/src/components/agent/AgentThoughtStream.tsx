@@ -400,7 +400,7 @@ function collectActivityTrace(message: AgentThoughtStreamProps['message'], local
   return { items, runningTools, completedTools, failedTools, sawAnswer, sawDone }
 }
 
-function approvalFrom(
+export function approvalFrom(
   message: AgentThoughtStreamProps['message'],
   locale: AgentThoughtStreamProps['locale'],
 ): { approvalId: number; cardData: ApprovalCardData } {

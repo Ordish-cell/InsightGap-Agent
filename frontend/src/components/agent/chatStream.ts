@@ -6,6 +6,9 @@ export function projectChatEvent(message: AgentChatMessage, event: AgentEvent): 
   const payload = (event.payload || {}) as Record<string, unknown>
   if (payload.message_id && payload.message_id !== message.message_id) return message
   if (['interrupted', 'failed'].includes(String(message.status))) return message
+  const seq = Number(event.event_seq || event.id || 0)
+  if (seq && seq <= Number(message.metadata?.chat_event_seq || 0)) return message
+  if (seq) message = { ...message, metadata: { ...message.metadata, chat_event_seq: seq } }
   switch (event.event_type) {
     case 'agent_text_started':
       return { ...message, content: '', metadata: { ...message.metadata, native_text_id: payload.text_id }, status: 'streaming' }
@@ -41,7 +44,7 @@ export function restoreChatMessage(message: AgentChatMessage, events: AgentEvent
   // Final database snapshots already contain all text. Replay is only needed
   // for an unfinished snapshot (the service persists its body at completion).
   if (['completed', 'interrupted', 'failed', 'waiting_approval'].includes(String(message.status))) return message
-  let restored = { ...message, content: '' }
+  let restored = { ...message, content: '', metadata: { ...message.metadata, chat_event_seq: 0 } }
   const seen = new Set<number>()
   for (const event of events) {
     const seq = Number(event.event_seq || event.id || 0)
