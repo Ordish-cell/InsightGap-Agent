@@ -142,6 +142,8 @@ async def execute_capability(nodes, state, runtime_config=None):
                 state["user_id"],
                 args["query"],
                 limit=args["top_k"],
+                conversation_id=state["conversation_id"],
+                use_memory=state.get("memory_policy", {}).get("use_memory", True),
             )
             result = CapabilityResult(
                 action_id=action_id,

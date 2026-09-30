@@ -48,11 +48,12 @@ def prepare(db, state):
     from src.web_app.db.repositories.agent_repository import AgentChatMessageRepository
     request = state.get("request", {})
     explicit_fields = request.get("_explicit_fields", request.keys())
+    automatic = bool(state.get("memory_policy", {}).get("generate_memory"))
     blocked = ("write_memory" in explicit_fields and request.get("write_memory") is False) or bool(
         re.search(r"不要记住|不用记住|别记住|不要保存|不保存", state["user_input"]))
     facts, direct = parse_facts(state["user_input"])
-    plan = {"facts": facts, "authorized": direct and not blocked, "blocked": bool(blocked),
-            "source_run_id": state["run_id"], "confirmation": "explicit_request" if direct else "pending"}
+    plan = {"facts": facts, "authorized": (direct or automatic) and not blocked, "blocked": bool(blocked),
+            "source_run_id": state["run_id"], "confirmation": "explicit_request" if direct else "automatic_opt_in" if automatic else "pending"}
     text = state["user_input"].strip().rstrip("。！.! ")
     if not facts and not blocked and db is not None and text in EXPLICIT_CONFIRMATIONS | SHORT_CONFIRMATIONS:
         rows = AgentChatMessageRepository(db).list_recent_by_conversation(state["user_id"], state["conversation_id"], limit=8)

@@ -1,4 +1,5 @@
 import { ActionNotice } from '../components/common/ActionNotice'
+import { MemoryControls } from '../components/agent/MemoryControls'
 import { Tabs } from '../components/common/Tabs'
 import { useListMotion } from '../components/common/motion'
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react'
@@ -7,6 +8,7 @@ import { apiRequest } from '../api/client'
 import type { Query } from '../api/client'
 import {
   archiveMemory,
+  confirmMemory,
   consolidate,
   deleteMemory,
   forget,
@@ -76,6 +78,7 @@ export function MemoryPage() {
   const [ltType, setLtType] = useState('')
   const [ltCategory, setLtCategory] = useState('')
   const [ltStatus, setLtStatus] = useState('active')
+  const [ltScope, setLtScope] = useState('')
   const [actionMessage, setActionMessage] = useState('')
   const [ltQuery, setLtQuery] = useState('')
   const [ltLoading, setLtLoading] = useState(false)
@@ -111,6 +114,7 @@ export function MemoryPage() {
       if (ltType) params.type = ltType
       if (ltCategory) params.category = ltCategory
       if (ltStatus) params.status = ltStatus
+      if (ltScope) params.scope = ltScope
       const queryValue = queryOverride ?? ltQuery
       if (queryValue) params.query = queryValue
 
@@ -126,7 +130,7 @@ export function MemoryPage() {
     } finally {
       if (request === requestId.current) setLtLoading(false)
     }
-  }, [ltPage, ltPageSize, ltType, ltCategory, ltStatus, ltQuery])
+  }, [ltPage, ltPageSize, ltType, ltCategory, ltStatus, ltScope, ltQuery])
 
   async function loadSearch() {
     try {
@@ -140,7 +144,7 @@ export function MemoryPage() {
   useEffect(() => { void load() }, [])
   useEffect(() => {
     if (tab === 'long-term') void loadLongTerm(1, !!ltQuery)
-  }, [tab, ltType, ltCategory, ltStatus]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tab, ltType, ltCategory, ltStatus, ltScope]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function submit(event: FormEvent) { event.preventDefault(); setTab('search'); await loadSearch() }
   function handleLtSearch(e: FormEvent) { e.preventDefault(); void loadLongTerm(1, true) }
@@ -195,7 +199,7 @@ export function MemoryPage() {
     <section className="workbench-page memory-page">
       <PageHeader
         title="长期记忆"
-        description="称呼、回答语言和简繁偏好经你确认后跨会话保存；其他内容按明确请求保存。"
+        description="个人偏好跨会话共享；项目与任务背景仅用于原会话。开启自动整理后，后台处理后续已完成对话。"
         actions={
           <div style={{ display: 'flex', gap: 8 }}>
             <button className="button secondary" disabled={actionBusy} onClick={handleReflect}>整理碎片</button>
@@ -204,6 +208,7 @@ export function MemoryPage() {
         }
       />
       {error && <ErrorState message={error} />}
+      <MemoryControls />
       <ActionNotice message={actionMessage || (actionBusy ? '正在处理…' : '')} />
       <p className="muted small">统计范围：当前用户可见且生效中的长期设定与行为事件。</p>
       <div className="metric-row">
@@ -242,6 +247,13 @@ export function MemoryPage() {
               <option value="archived">已归档</option>
               <option value="superseded">已替代</option>
               <option value="low_confidence">低置信</option>
+              <option value="pending">待确认</option>
+            </select>
+            <select className="input" aria-label="记忆作用域" value={ltScope} onChange={e => { setLtScope(e.target.value); setLtPage(1) }} style={{ width: 140 }}>
+              <option value="">全部作用域</option>
+              <option value="user">个人共享</option>
+              <option value="conversation">原会话</option>
+              <option value="legacy_unscoped">来源不明</option>
             </select>
             <form onSubmit={handleLtSearch} style={{ display: 'flex', gap: 8, flex: 1, minWidth: 200 }}>
               <input className="input" value={ltQuery} onChange={e => setLtQuery(e.target.value)} placeholder="搜索记忆内容..." style={{ flex: 1 }} />
@@ -271,6 +283,10 @@ export function MemoryPage() {
                       </div>
                     </div>
                     <p style={{ margin: '8px 0' }}>{item.content}</p>
+                    <p className="muted small">{item.scope === 'user' ? '个人 · 跨会话' : item.scope === 'conversation' ? `会话 · ${item.scope_id}` : '来源不明 · 仅管理'}</p>
+                    {Boolean(item.metadata?.source_quote) && <blockquote>{String(item.metadata?.source_quote)}</blockquote>}
+                    {Boolean(item.metadata?.source_message_id) && <p className="muted small">来源消息 #{String(item.metadata?.source_message_id)} · 运行 #{String(item.metadata?.run_id ?? '')}</p>}
+                    {Boolean(item.metadata?.supersedes || item.metadata?.superseded_by) && <p className="muted small">{item.metadata?.supersedes ? `替代记忆 #${String(item.metadata?.supersedes)}` : `已被记忆 #${String(item.metadata?.superseded_by)} 替代`}</p>}
                     <div className="memory-card-foot" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
                       <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                         <span className="muted small">重要性</span>
@@ -284,6 +300,7 @@ export function MemoryPage() {
                         {item.stability && <span className="muted small">稳定性 {item.stability}</span>}
                       </div>
                       <div style={{ display: 'flex', gap: 6 }}>
+                        {item.status === 'pending' && <button className="button secondary small" disabled={actionBusy} onClick={() => runAction(() => confirmMemory(item.id), '候选记忆已确认。')}>确认记忆</button>}
                         {item.status === 'archived' || item.status === 'superseded' ? (
                           <button className="button ghost small" disabled={actionBusy} onClick={() => handleRestore(item.id)}>恢复</button>
                         ) : (

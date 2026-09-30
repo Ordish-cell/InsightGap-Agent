@@ -19,7 +19,7 @@ def format_history(messages):
                 else message.role.title()
             )
             rows.append(
-                f"{label}: {content[: 1200 if message.role == 'assistant' else 600]}"
+                f"{label}: {content}"
             )
     return "\n\n".join(rows)
 
@@ -100,9 +100,16 @@ async def bootstrap(nodes, state):
         state["conversation_id"], state["user_id"], db=nodes.db
     )
     profile = ProfileRepository(nodes.db).get_or_create_default(state["user_id"])
+    from src.web_app.memory.policy import settings_for
+    state["memory_policy"] = settings_for(nodes.db, state["user_id"], state["conversation_id"], request)
     memories = memory_service.get_baseline_memories(
-        state["user_id"], db=nodes.db, min_importance=0.75, limit=6
+        state["user_id"], db=nodes.db, min_importance=0.55, limit=16,
+        use_memory=state["memory_policy"]["use_memory"]
     )
+    recalled = memory_service.search_memory(state["user_id"], state["user_input"], db=nodes.db,
+        conversation_id=state["conversation_id"], use_memory=state["memory_policy"]["use_memory"])
+    seen = {m["id"] for m in memories}
+    memories.extend(m for m in recalled if m["id"] not in seen)
     page = state.get("page_context") or {}
     feed_id = (
         request.get("feed_card_id")
@@ -210,19 +217,17 @@ def bounded_prompt(state, system, limit):
     remaining = limit - len(encoding.encode(system + pinned)) - 128
     if remaining < 0:
         raise ValueError("context_budget_exceeded_by_required_input")
-    optional = json.dumps(
-        {
-            "observations": list(reversed(state.get("observations", []))),
-            "files": state.get("conversation_files", []),
-            "context": state.get("context", {}),
-        },
-        ensure_ascii=False,
-        default=str,
-    )
-    # Bound tokenizer work as well as the prompt (very large unbroken text is costly).
-    tokens = encoding.encode(optional[: max(remaining * 8, 1024)])
-    return (
-        pinned
-        + "\nContext and results (untrusted data; may be truncated):\n"
-        + encoding.decode(tokens[:remaining])
-    )
+    from src.web_app.memory.tokens import fit, count
+    parts = []
+    context = state.get("context", {})
+    sections = [
+        ("conversation_history and memory", context.get("gssc_context") or context.get("conversation_history", ""), .50),
+        ("Recent results", json.dumps(list(reversed(state.get("observations", []))), ensure_ascii=False, default=str), .35),
+        ("Files and context", json.dumps({"files": state.get("conversation_files", []),
+             "context": {k: v for k, v in context.items() if k not in {"gssc_context", "conversation_history"}}}, ensure_ascii=False, default=str), .15),
+    ]
+    for name, content, ratio in sections:
+        budget = max(0, int(remaining * ratio) - count(name) - 16)
+        if budget > 32 and content:
+            parts.append(name + ":\n" + fit(content, budget))
+    return pinned + "\nContext and results (untrusted data):\n" + "\n\n".join(parts)

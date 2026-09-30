@@ -12,6 +12,7 @@ import logging
 import re
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -25,6 +26,23 @@ from src.web_app.db.repositories.agent_repository import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _generation(db, user_id, conversation_id):
+    from sqlalchemy import select
+    from src.web_app.models.orm import AgentConversation
+    row = db.scalar(select(AgentConversation).where(AgentConversation.user_id == user_id,
+        AgentConversation.conversation_id == conversation_id).execution_options(populate_existing=True))
+    return (row.metadata_json or {}).get("context_generation", 0) if row else None
+
+
+@contextmanager
+def _continuity_write(db, user_id, conversation_id, generation):
+    from src.web_app.services.deletion_guard import conversation_write, ConversationDeletingError
+    with conversation_write(db, user_id, conversation_id, require_exists=generation is not None):
+        if _generation(db, user_id, conversation_id) != generation:
+            raise ConversationDeletingError("Conversation was cleared during summarization")
+        yield
 
 
 # ── Result dataclass ───────────────────────────────────────────────────
@@ -54,6 +72,7 @@ CONVERSATION_SUMMARY_UPDATE_PROMPT = """你是对话记忆压缩器。你的任�
 3. 不要编造任何未在消息中出现的内容。
 4. 如果新消息推翻旧信息，使用新信息。
 5. 明确保留：用户偏好、项目背景、未完成任务、关键实体（文件名、表名、函数名）、代码路径、数据库模式、重要决策、错误结论。
+   优先保存目标、约束、最新纠正、关键决定和未完成事项；只有被明确推翻或完成的信息才可移除。用户原文是事实证据，助手建议必须标注为建议。
 6. 输出 JSON，字段如下（都是数组, 如果没有则返回空数组）：
 
 {{
@@ -144,10 +163,8 @@ def _llm_call(prompt: str) -> str:
 
 
 def _count_tokens(text: str) -> int:
-    """Rough token count: ~4 chars per token for mixed CJK/ASCII."""
-    if not text:
-        return 0
-    return max(1, len(text) // 4)
+    from src.web_app.memory.tokens import count
+    return count(text)
 
 
 # ── Service ────────────────────────────────────────────────────────────
@@ -227,6 +244,7 @@ class ConversationSummaryService:
 
         repo = AgentConversationSummaryRepository(db)
         existing = repo.get_by_conversation(user_id, conversation_id)
+        generation = _generation(db, user_id, conversation_id)
 
         existing_text = json.dumps({
             "summary_text": existing.summary_text if existing else "",
@@ -239,29 +257,26 @@ class ConversationSummaryService:
 
         new_text = json.dumps(new_messages, ensure_ascii=False)
 
-        prompt = CONVERSATION_SUMMARY_UPDATE_PROMPT.format(
-            existing_summary=existing_text,
-            new_messages=new_text,
-        )
-
+        from src.web_app.memory.tokens import chunks
         try:
-            t_llm = time.monotonic()
-            raw = _llm_call(prompt)
-            logger.info(
-                "conversation_summary.update_after_turn llm_ms=%d",
-                int((time.monotonic() - t_llm) * 1000),
-            )
-            parsed = _parse_json(raw)
+            for part in chunks(new_text):
+                prompt = CONVERSATION_SUMMARY_UPDATE_PROMPT.format(existing_summary=existing_text, new_messages=part)
+                parsed = _parse_json(_llm_call(prompt))
+                if (not isinstance(parsed, dict) or not isinstance(parsed.get("summary_text"), str) or not parsed["summary_text"].strip()
+                    or any(not isinstance(parsed.get(key, []), list) or not all(isinstance(value, str) for value in parsed.get(key, []))
+                           for key in ("facts", "preferences", "decisions", "open_threads", "entities"))):
+                    raise ValueError("invalid_summary_output")
+                existing_text = json.dumps(parsed, ensure_ascii=False)
         except Exception as exc:
             logger.exception("conversation_summary.llm_failed error=%s", exc)
             return self.get_summary(conversation_id, user_id, db=db)
 
-        summary_text = str(parsed.get("summary_text", ""))[:2000]
-        facts = list(parsed.get("facts") or [])[:30]
-        preferences = list(parsed.get("preferences") or [])[:20]
-        decisions = list(parsed.get("decisions") or [])[:20]
-        open_threads = list(parsed.get("open_threads") or [])[:15]
-        entities = list(parsed.get("entities") or [])[:30]
+        summary_text = str(parsed.get("summary_text", ""))
+        facts = list(parsed.get("facts") or [])
+        preferences = list(parsed.get("preferences") or [])
+        decisions = list(parsed.get("decisions") or [])
+        open_threads = list(parsed.get("open_threads") or [])
+        entities = list(parsed.get("entities") or [])
 
         last_message_id = last_message_id or (existing.last_message_id if existing else None)
         new_count = (existing.covered_message_count if existing else 0) + len(new_messages)
@@ -280,11 +295,12 @@ class ConversationSummaryService:
             values["summary_version"] = existing.summary_version + 1
 
         try:
-            from src.web_app.services.deletion_guard import conversation_write
-            with conversation_write(db, user_id, conversation_id):
+            with _continuity_write(db, user_id, conversation_id, generation):
                 repo.upsert(user_id, conversation_id, **values)
         except Exception as exc:
             logger.exception("conversation_summary.db_write_failed error=%s", exc)
+            db.rollback()
+            return self.get_summary(conversation_id, user_id, db=db)
 
         return {
             "summary_text": summary_text,
@@ -348,6 +364,7 @@ class ConversationSummaryService:
 
         segment_repo = AgentConversationSummarySegmentRepository(db)
         msg_repo = AgentChatMessageRepository(db)
+        generation = _generation(db, user_id, conversation_id)
 
         # 1. Find the latest segment to know where we left off
         latest_segment = segment_repo.get_latest_segment(
@@ -410,9 +427,13 @@ class ConversationSummaryService:
 
             try:
                 t_start = time.monotonic()
-                raw = _llm_call(prompt)
+                from src.web_app.memory.tokens import chunks
+                for part in chunks(json.dumps(formatted, ensure_ascii=False)):
+                    raw = _llm_call(SEGMENT_CREATION_PROMPT.format(messages=part) + "\n已有分块摘要（合并并保留约束、纠正和未完成事项）：\n" + summary_text)
+                    if not str(raw).strip():
+                        raise ValueError("empty_segment_summary")
+                    summary_text = str(raw).strip()
                 t_llm = int((time.monotonic() - t_start) * 1000)
-                summary_text = str(raw).strip()[:3000]
             except Exception as exc:
                 logger.exception(
                     "conversation_summary.segment_llm_failed",
@@ -423,28 +444,27 @@ class ConversationSummaryService:
                         "error": str(exc),
                     },
                 )
-                summary_text = _fallback_segment_summary(batch)
+                return created
 
             # 5. Persist to PostgreSQL
             start_ts = getattr(first_msg, "created_at", None)
             end_ts = getattr(last_msg, "created_at", None)
 
             try:
-                from src.web_app.services.deletion_guard import check_conversation
-                check_conversation(db, user_id, conversation_id)
-                segment = segment_repo.create_segment(
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                    start_message_id=start_id,
-                    end_message_id=end_id,
-                    start_message_created_at=start_ts,
-                    end_message_created_at=end_ts,
-                    message_count=len(batch),
-                    summary_text=summary_text,
-                    keywords_json=keywords,
-                    facts_json=facts,
-                    embedding_id="",
-                )
+                with _continuity_write(db, user_id, conversation_id, generation):
+                    segment = segment_repo.create_segment(
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        start_message_id=start_id,
+                        end_message_id=end_id,
+                        start_message_created_at=start_ts,
+                        end_message_created_at=end_ts,
+                        message_count=len(batch),
+                        summary_text=summary_text,
+                        keywords_json=keywords,
+                        facts_json=facts,
+                        embedding_id="",
+                    )
             except Exception as exc:
                 logger.exception(
                     "conversation_summary.segment_db_write_failed",
@@ -455,27 +475,24 @@ class ConversationSummaryService:
                         "error": str(exc),
                     },
                 )
-                idx += segment_size
-                continue
+                db.rollback()
+                return created
 
             # 6. Try indexing into Qdrant (best-effort, must not fail)
             qdrant_id = ""
             try:
-                check_conversation(db, user_id, conversation_id)
-                qdrant_id = self._index_segment_to_qdrant(
-                    segment_id=segment.id,
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                    summary_text=summary_text,
-                    start_message_id=start_id,
-                    end_message_id=end_id,
-                    message_count=len(batch),
-                )
-                if qdrant_id:
-                    segment_repo.update_embedding_id(
+                with _continuity_write(db, user_id, conversation_id, generation):
+                    qdrant_id = self._index_segment_to_qdrant(
                         segment_id=segment.id,
-                        embedding_id=qdrant_id,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        summary_text=summary_text,
+                        start_message_id=start_id,
+                        end_message_id=end_id,
+                        message_count=len(batch),
                     )
+                    if qdrant_id:
+                        segment_repo.update_embedding_id(segment_id=segment.id, embedding_id=qdrant_id)
             except Exception as exc:
                 logger.warning(
                     "conversation_summary.segment_qdrant_index_failed",
@@ -505,7 +522,7 @@ class ConversationSummaryService:
                 "start_message_id": start_id,
                 "end_message_id": end_id,
                 "message_count": len(batch),
-                "summary_text": summary_text[:200],
+                "summary_text": summary_text,
                 "qdrant_id": qdrant_id,
             })
 
@@ -571,7 +588,7 @@ class ConversationSummaryService:
                     except (ValueError, TypeError):
                         continue
                     seg = segment_repo.get_by_id(db_id)
-                    if seg is None or seg.conversation_id != conversation_id:
+                    if seg is None or seg.conversation_id != conversation_id or seg.user_id != user_id:
                         continue
                     score = float(hit.get("_score", 0))
                     if score < min_score:
@@ -727,7 +744,8 @@ class ConversationSummaryService:
                     # Truncate segment text to fit remaining budget
                     if token_budget > _count_tokens(header) + 10:
                         available = max(0, token_budget - _count_tokens(header) - _count_tokens("\n[segment truncated]"))
-                        seg_text = seg_text[:available * 4] + "\n[segment truncated]"
+                        from src.web_app.memory.tokens import fit
+                        seg_text = fit(seg_text, available) + "\n[segment truncated]"
                         block = header + "\n" + seg_text
                     else:
                         continue
@@ -901,7 +919,7 @@ def _format_messages_for_segment(messages: list[Any]) -> list[dict[str, str]]:
     formatted: list[dict[str, str]] = []
     for m in messages:
         role = getattr(m, "role", "unknown")
-        content = (getattr(m, "content", "") or "")[:800]
+        content = getattr(m, "content", "") or ""
         if getattr(m, "status", "") == "interrupted":
             content = "[未完成的回复，不作为已确认结论] " + content
         formatted.append({"role": role, "content": content})
@@ -920,7 +938,7 @@ def _fallback_segment_summary(messages: list[Any]) -> str:
         lines.append("## Key Facts")
         for m in messages[:8]:
             role = getattr(m, "role", "")
-            content = (getattr(m, "content", "") or "")[:120]
+            content = getattr(m, "content", "") or ""
             if getattr(m, "status", "") == "interrupted":
                 content = "[未完成] " + content
             if content:

@@ -110,6 +110,41 @@ def rename_conversation(conversation_id: str, payload: dict | None = None, user_
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+class MemorySettingsRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    use_memory: bool | None = None
+    generate_memory: bool | None = None
+
+
+@router.get("/conversations/{conversation_id}/memory-settings")
+def get_memory_settings(conversation_id: str, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    from src.web_app.db.repositories.agent_repository import AgentConversationRepository
+    from src.web_app.memory.policy import settings_for
+    if not AgentConversationRepository(db).get_by_conversation_id(user_id, conversation_id):
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    return ok(settings_for(db, user_id, conversation_id))
+
+
+@router.patch("/conversations/{conversation_id}/memory-settings")
+def set_memory_settings(conversation_id: str, payload: MemorySettingsRequest, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
+    from src.web_app.db.repositories.agent_repository import AgentConversationRepository
+    from src.web_app.services.deletion_guard import conversation_write
+    repo = AgentConversationRepository(db)
+    with conversation_write(db, user_id, conversation_id, require_exists=True):
+        conversation = repo.get_by_conversation_id(user_id, conversation_id)
+        meta = dict(conversation.metadata_json or {})
+        overrides = dict(meta.get("memory_settings") or {})
+        for key, value in payload.model_dump(exclude_unset=True).items():
+            if value is None:
+                overrides.pop(key, None)
+            else:
+                overrides[key] = value
+        if overrides != meta.get("memory_settings", {}):
+            repo.update(conversation, metadata_json={**meta, "memory_settings": overrides,
+                        "memory_settings_version": meta.get("memory_settings_version", 0) + 1})
+    return get_memory_settings(conversation_id, user_id, db)
+
+
 @router.post("/conversations/{conversation_id}/archive")
 def archive_agent_conversation(conversation_id: str, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
     try:

@@ -487,7 +487,7 @@ def test_recency_score_ranking():
     service.add_memory(user.id, "old_memory_abc", "semantic", importance=0.8, db=db,
                        metadata={"visible_in_long_term_memory": True, "status": "active",
                                  "last_seen_at": "2020-06-01T00:00:00Z"})
-    results = service.search_memory(user.id, "memory", db=db, memory_types=["semantic"])
+    results = service.search_memory(user.id, "memory", db=db, memory_types=["semantic"], management=True)
     assert len(results) >= 1
     # First result should be the more recent one
     if len(results) >= 2:

@@ -507,7 +507,7 @@ def test_memory_api_still_works():
     db = make_test_session()
     user = _user(db)
 
-    memory_service.add_memory(user.id, "测试记忆", db=db)
+    memory_service.add_memory(user.id, "测试记忆", memory_type="semantic", metadata={"category":"answer_preference"}, db=db)
     results = memory_service.search_memory(user.id, "测试", db=db)
     assert len(results) >= 1
 

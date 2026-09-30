@@ -476,9 +476,10 @@ export interface HealthResponse {
 }
 
 export type LongTermMemoryType = 'semantic' | 'episodic'
-export type LongTermMemoryStatus = 'active' | 'archived' | 'low_confidence' | 'superseded'
+export type LongTermMemoryStatus = 'active' | 'archived' | 'low_confidence' | 'superseded' | 'pending'
 
 export interface LongTermMemoryItem {
+  scope?: 'user' | 'conversation' | 'legacy_unscoped'; scope_id?: string
   id: number; memory_type: LongTermMemoryType; content: string
   category?: string; importance: number; effective_importance?: number
   confidence?: number; status: LongTermMemoryStatus; stability?: string

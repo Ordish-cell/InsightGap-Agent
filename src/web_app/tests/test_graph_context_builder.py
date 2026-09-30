@@ -42,12 +42,20 @@ def test_graph_context_service_formats_user_scoped_context(monkeypatch):
     monkeypatch.setattr(settings, "neo4j_context_enabled", True)
     service = GraphContextService(repository=FakeGraphRepository())
 
-    text = service.get_context(user_id=5, query="Qdrant graph context")
+    from src.web_app.tests.db_test_utils import make_test_session
+    from src.web_app.models.orm import User, Memory
+    db = make_test_session()
+    db.add(User(id=5, email="graph-owner@example.test", hashed_password="x"))
+    db.add(Memory(id=1, user_id=5, content="Authoritative Qdrant preference", memory_type="semantic",
+                  importance=.9, scope="user", metadata_json={"category": "answer_preference"}))
+    db.commit()
+    text = service.get_context(user_id=5, query="Qdrant graph context", db=db)
 
     assert "User Memory Graph" in text
     assert "Project Knowledge Graph" in text
     assert "DocumentService" in text
     assert service.repository.memory_calls[0]["user_id"] == 5
+    assert "Authoritative Qdrant preference" in text
 
 
 def test_graph_context_failure_falls_back(monkeypatch):

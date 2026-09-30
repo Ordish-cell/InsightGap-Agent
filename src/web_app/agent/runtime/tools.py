@@ -63,16 +63,23 @@ async def execute_tool(nodes, state, name, inputs):
     action = state["current_action"]
     identity = {"action_id": action["action_id"], "capability": action["action"]}
     name = normalize_tool_name(name)
+    if name in {"memory_mcp.search", "context.graph"} and state.get("memory_policy", {}).get("use_memory") is False:
+        return CapabilityResult(**identity, status="blocked", error="memory_reads_disabled")
+    if name in {"memory_mcp.add", "memory_mcp.extract"} and state.get("memory_policy", {}).get("writes_blocked"):
+        return CapabilityResult(**identity, status="blocked", error="memory_writes_disabled")
     if name in {"context.graph", "context.history"}:
         query = str(inputs.get("query") or state["user_input"])
         if name == "context.graph":
             from src.web_app.services.graph_context_service import graph_context_service
 
-            data = await asyncio.to_thread(
+            data = await db_call(
+                nodes,
                 graph_context_service.get_context,
                 user_id=state["user_id"],
                 query=query,
                 route="rag",
+                conversation_id=state["conversation_id"],
+                use_memory=state.get("memory_policy", {}).get("use_memory", True),
             )
         else:
             from src.web_app.services.conversation_summary_service import (

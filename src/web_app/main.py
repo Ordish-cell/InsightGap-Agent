@@ -91,6 +91,8 @@ async def startup_health_checks():
             db.commit()
         except DeletionError:
             _log_main.warning("Deletion task migration 20260909_0015 is not applied; hard deletion is unavailable.")
+    from src.web_app.services.memory_tasks import memory_tasks
+    memory_tasks.recover()
     _launch_cleanup_scheduler()
 
 
@@ -102,6 +104,8 @@ async def shutdown_agent_runs():
     await asyncio.gather(agent_run_task_manager.shutdown(), document_ingest_task_manager.shutdown())
     from src.web_app.services.summary_tasks import summary_tasks
     await summary_tasks.shutdown()
+    from src.web_app.services.memory_tasks import memory_tasks
+    await memory_tasks.shutdown()
     from src.web_app.services.conversation_deletion import deletion_manager
     await deletion_manager.shutdown()
 

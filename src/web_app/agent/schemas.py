@@ -26,6 +26,8 @@ class AgentRunRequest(BaseModel):
     depth: Literal["quick", "standard", "deep"] = "standard"
     save_artifact: bool = True
     write_memory: bool = True
+    use_memory: bool | None = None
+    generate_memory: bool | None = None
     create_skill_draft: bool = True
     top_k: int = Field(default=5, ge=1, le=20)
     attachment_ids: list[int] = Field(default_factory=list)

@@ -332,7 +332,11 @@ def prepare_agent_run(db: Session, user_id: int, payload: dict[str, Any]) -> dic
     thread_id = conversation.thread_id or f"user:{user_id}:conversation:{conversation_id}"
     if not conversation.thread_id:
         conversation_repo.update(conversation, thread_id=thread_id)
+    from src.web_app.memory.policy import settings_for
+    memory_policy = settings_for(db, user_id, conversation_id, payload)
+    memory_policy["request_overrides"] = {k: payload[k] for k in ("use_memory", "generate_memory") if isinstance(payload.get(k), bool)}
     run = run_repo.create(
+        memory_policy=memory_policy,
         user_id=user_id,
         conversation_id=conversation_id,
         thread_id=thread_id,
@@ -875,6 +879,8 @@ async def execute_prepared_run(
             publish_event(db, stream_queue, run.id, "run_completed", {"status": "completed", "answer": answer, "response": response}, user_id=user_id, thread_id=thread_id)
             from src.web_app.services.summary_tasks import summary_tasks
             summary_tasks.schedule(user_id, conversation_id)
+            from src.web_app.services.memory_tasks import memory_tasks
+            memory_tasks.enqueue(db, user_id, conversation_id, run.id)
         return response
     finally:
         reset_model_context(model_context_token)
@@ -1325,6 +1331,8 @@ async def _finalize_resume(
     if final_status == "completed":
         from src.web_app.services.summary_tasks import summary_tasks
         summary_tasks.schedule(user_id, conversation_id)
+    from src.web_app.services.memory_tasks import memory_tasks
+    memory_tasks.enqueue(db, user_id, conversation_id, run_id)
 
     return _run_response(run_id, state, elapsed_ms=elapsed_ms)
 
@@ -1449,7 +1457,13 @@ def update_conversation(db: Session, user_id: int, conversation_id: str, payload
     if "selected_feed_card_title" in payload:
         values["selected_feed_card_title"] = str(payload.get("selected_feed_card_title") or "")[:512]
     if "metadata" in payload or "metadata_json" in payload:
-        values["metadata_json"] = payload.get("metadata_json") or payload.get("metadata") or {}
+        incoming = dict(payload.get("metadata_json") or payload.get("metadata") or {})
+        current = conversation.metadata_json or {}
+        for key in ("memory_settings", "memory_settings_version", "context_generation"):
+            incoming.pop(key, None)
+            if key in current:
+                incoming[key] = current[key]
+        values["metadata_json"] = incoming
     if values:
         conversation = repo.update(conversation, **values)
     return _conversation_response(conversation, messages=AgentChatMessageRepository(db).list_by_conversation(user_id, conversation_id))
@@ -1467,9 +1481,24 @@ def delete_conversation(db: Session, user_id: int, conversation_id: str) -> dict
     return _conversation_response(conversation)
 
 
+@guarded_transition
 def clear_conversation(db: Session, user_id: int, conversation_id: str) -> dict[str, Any]:
     conversation_repo = AgentConversationRepository(db)
     conversation = _require_conversation(db, user_id, conversation_id)
+    from sqlalchemy import update, select
+    from src.web_app.models.orm import MemoryMaintenanceTask, Memory, AgentConversationSummary, AgentConversationSummarySegment
+    meta = dict(conversation.metadata_json or {})
+    conversation_repo.update(conversation, metadata_json={**meta,
+        "memory_settings_version": meta.get("memory_settings_version", 0) + 1,
+        "context_generation": meta.get("context_generation", 0) + 1})
+    db.execute(update(MemoryMaintenanceTask).where(MemoryMaintenanceTask.user_id == user_id,
+        MemoryMaintenanceTask.conversation_id == conversation_id, MemoryMaintenanceTask.status != "completed").values(status="cancelled"))
+    for memory in db.scalars(select(Memory).where(Memory.user_id == user_id, Memory.scope == "conversation", Memory.scope_id == conversation_id)):
+        memory.metadata_json = {**(memory.metadata_json or {}), "status": "archived"}
+    from sqlalchemy import delete
+    for model in (AgentConversationSummary, AgentConversationSummarySegment):
+        db.execute(delete(model).where(model.user_id == user_id, model.conversation_id == conversation_id))
+    db.commit()
     removed = AgentChatMessageRepository(db).clear_conversation(user_id, conversation_id)
     conversation = conversation_repo.update(conversation, message_count=0, last_message_preview="")
     return {"conversation": _conversation_response(conversation), "cleared_messages": removed}
@@ -1632,9 +1661,6 @@ def _format_chat_messages_for_context(messages: list[Any]) -> str:
         if not content:
             continue
         label = "User" if role == "user" else "Assistant" if role == "assistant" else role.capitalize() or "Message"
-        max_len = 1200 if role == "assistant" else 600
-        if len(content) > max_len:
-            content = content[:max_len] + "..."
         lines.append(f"{label}: {content}")
     return "\n\n".join(lines)
 

@@ -1,6 +1,7 @@
 from typing import Any
 
 from src.web_app.context.packets import ContextConfig, ContextPacket
+from src.web_app.memory.tokens import count, fit
 
 
 SECTIONS = [
@@ -145,7 +146,7 @@ class ContextBuilder:
             packets.append(
                 ContextPacket(
                     content=text,
-                    token_count=max(1, len(text) // 4),
+                    token_count=max(1, count(text)),
                     relevance_score=relevance,
                     metadata={"source": source},
                 )
@@ -163,9 +164,13 @@ class ContextBuilder:
             if packet.relevance_score < self.config.min_relevance:
                 self._dropped_sources.append(packet.metadata.get("source", "?"))
                 continue
-            if used + packet.token_count > budget:
+            caps = {"conversation_history": .40, "conversation_summary": .20, "memory": .20, "task": .15}
+            cap = min(budget - used - 32, int(budget * caps.get(packet.metadata.get("source"), .15)))
+            if cap <= 32:
                 self._dropped_sources.append(packet.metadata.get("source", "?"))
                 continue
+            if packet.token_count > cap:
+                packet = packet.model_copy(update={"content": fit(packet.content, cap), "token_count": cap})
             selected.append(packet)
             used += packet.token_count
             self._selected_sources.append(packet.metadata.get("source", "?"))
@@ -199,11 +204,11 @@ class ContextBuilder:
         return result
 
     def compress(self, context: str) -> str:
-        max_chars = self.config.max_tokens * 4
-        if not self.config.enable_compression or len(context) <= max_chars:
+        max_chars = self.config.max_tokens
+        if not self.config.enable_compression or count(context) <= max_chars:
             return context
         # Smart compress: drop the lowest-priority sections first
-        return context[: max_chars - 32] + "\n[compressed]"
+        return fit(context, max_chars)
 
     def build(self, payload: dict[str, Any]) -> str:
         return self.compress(self.structure(self.select(self.gather(payload))))

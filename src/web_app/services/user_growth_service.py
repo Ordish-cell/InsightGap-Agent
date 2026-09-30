@@ -12,8 +12,6 @@ Design principles:
 - Decay-aware (effective importance degrades for stale memories)
 """
 
-import re
-from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
@@ -37,27 +35,8 @@ _STATUS_FACTORS = {
     "superseded": 0.0,
     "archived": 0.25,
     "low_confidence": 0.50,
+    "pending": 0.0,
 }
-
-# Category groups that can be reflected into a single summary
-_REFLECTABLE_CATEGORIES = {
-    "project_goal": "project_goal_summary",
-    "tech_stack": "tech_stack_summary",
-    "preference": "ui_preference_summary",
-    "boundary": "boundary_summary",
-    "feed_interest": "feed_interest_summary",
-    "workflow_pattern": "workflow_pattern_summary",
-}
-
-# Conflict detection keywords — if a new memory contains a "now_use" or
-# reversal pattern that conflicts with an existing "do_not_use" memory,
-# we supersede the old one.
-_CONFLICT_PAIRS = [
-    (r"(不要|不做|暂时不做?|不引入|不接|不使?用).*?({term})", "do_not_use"),
-    (r"(现在|可以|开始|准备|要).*?(做|引入|接入?|使?用).*?({term})", "now_use"),
-    (r"(偏好|喜欢|倾向|选择).*?({term})", "prefer"),
-    (r"(不再|不要|放弃|切换).*?(偏好|喜欢|使用|选择).*?({term})", "no_longer_prefer"),
-]
 
 _ENTITY_TERMS = [
     "exa", "neo4j", "neo4j", "qdrant", "redis", "mysql", "langgraph", "langchain",
@@ -84,7 +63,6 @@ class UserGrowthService:
         db: Session | None = None,
     ) -> dict[str, Any]:
         """Process a conversation turn through the growth engine."""
-        existing_semantic = self._get_active_semantic(user_id, db)
         result = memory_service.extract_and_save(
             user_id=user_id,
             user_input=user_input,
@@ -95,10 +73,7 @@ class UserGrowthService:
             created_skill_draft=created_skill_draft,
             db=db,
         )
-        # Check for conflicts with existing memories
-        newly_saved = result.get("saved", {})
-        for mem in newly_saved.get("semantic", []):
-            self._detect_and_supersede(user_id, mem, existing_semantic, db)
+        # MemoryService owns scoped comparison and atomic version replacement.
         return result
 
     def process_feed_feedback(
@@ -266,148 +241,17 @@ class UserGrowthService:
 
     # ── Supersede ─────────────────────────────────────────────────────
 
-    def supersede_conflicting_memories(
-        self, user_id: int, new_memory: dict[str, Any], db: Session | None = None
-    ) -> list[dict[str, Any]]:
-        """Find and supersede memories that conflict with a new one."""
-        if not db:
-            return []
-        existing = self._get_active_semantic(user_id, db)
-        superseded = []
-        new_content = str(new_memory.get("content", ""))
-        new_category = str(new_memory.get("metadata", {}).get("category", "") or new_memory.get("category", ""))
-
-        for old in existing:
-            old_content = str(old.get("content", "") if isinstance(old, dict) else old.content)
-            old_meta = old.get("metadata", {}) if isinstance(old, dict) else (old.metadata_json or {})
-            old_category = str(old_meta.get("category", ""))
-
-            if old_category != new_category:
-                continue
-            if self._is_conflict(old_content, new_content):
-                if isinstance(old, dict):
-                    old_id = old.get("id")
-                else:
-                    old_id = old.id
-                repo = MemoryRepository(db)
-                item = repo.get_by_id(old_id)
-                if item:
-                    old_meta = dict(item.metadata_json or {})
-                    old_meta["status"] = "superseded"
-                    old_meta["superseded_by"] = new_memory.get("id")
-                    old_meta["superseded_at"] = datetime.now(UTC).isoformat()
-                    repo.update(item, metadata_json=old_meta)
-                    superseded.append(self._to_dict(item))
-
-                # Update new memory with supersedes link
-                new_meta = dict(new_memory.get("metadata", {}))
-                new_meta["supersedes"] = old_id
-                if new_memory.get("id"):
-                    new_item = repo.get_by_id(new_memory["id"])
-                    if new_item:
-                        repo.update(new_item, metadata_json=new_meta)
-
-        return superseded
-
-    def _detect_and_supersede(
-        self, user_id: int, new_memory: dict[str, Any],
-        existing: list[dict[str, Any]], db: Session | None = None
-    ) -> None:
-        """Auto-detect and resolve conflicts after saving a new memory."""
+    def supersede_conflicting_memories(self, user_id, new_memory, db=None):
+        """Compatibility report; MemoryService performs the atomic replacement."""
         if not db or not new_memory.get("id"):
-            return
-        self.supersede_conflicting_memories(user_id, new_memory, db)
-
-    def _is_conflict(self, old_content: str, new_content: str) -> bool:
-        """Check if two memory contents describe conflicting settings."""
-        for pattern, conflict_type in _CONFLICT_PAIRS:
-            for term in _ENTITY_TERMS:
-                formatted = pattern.format(term=term)
-                old_match = re.search(formatted, old_content, re.IGNORECASE)
-                new_match = re.search(formatted, new_content, re.IGNORECASE)
-                if old_match and new_match:
-                    old_type = conflict_type
-                    # Check if the new one represents a reversal
-                    new_formatted_alt = _CONFLICT_PAIRS[1][0].format(term=term) if len(_CONFLICT_PAIRS) > 1 else ""
-                    if conflict_type == "do_not_use" and re.search(new_formatted_alt, new_content, re.IGNORECASE):
-                        return True
-                    if conflict_type == "prefer" and re.search(
-                        _CONFLICT_PAIRS[3][0].format(term=term), new_content, re.IGNORECASE
-                    ):
-                        return True
-        return False
+            return []
+        return [self._to_dict(item) for item in MemoryRepository(db).list_by_user(user_id)
+                if (item.metadata_json or {}).get("superseded_by") == new_memory["id"]]
 
     # ── Reflection ────────────────────────────────────────────────────
 
-    def reflect_user_profile(
-        self, user_id: int, db: Session | None = None
-    ) -> dict[str, Any]:
-        """Merge fragmented semantic memories of the same category into
-        summary profile memories. Deterministic — no LLM required."""
-        if not db:
-            return {"summaries": [], "archived": []}
-
-        active = self._get_active_semantic(user_id, db)
-        if len(active) < 8:
-            return {"summaries": [], "archived": [], "reason": "not_enough_memories"}
-
-        by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for mem in active:
-            meta = mem.get("metadata", {}) if isinstance(mem, dict) else (mem.metadata_json or {})
-            cat = meta.get("category", "uncategorized")
-            by_category[cat].append(mem)
-
-        summaries = []
-        archived_ids = []
-
-        for cat, group in by_category.items():
-            if len(group) < 4:
-                continue
-            summary_cat = _REFLECTABLE_CATEGORIES.get(cat)
-            if not summary_cat:
-                continue
-
-            contents = [m.get("content", "") if isinstance(m, dict) else m.content for m in group]
-            summary_content = self._build_category_summary(cat, contents)
-
-            best_importance = max(
-                m.get("importance", 0.7) if isinstance(m, dict) else m.importance
-                for m in group
-            )
-            source_ids = [m.get("id") if isinstance(m, dict) else m.id for m in group]
-
-            summary = memory_service.add_with_dedup(
-                user_id, summary_content,
-                memory_type="semantic",
-                importance=min(0.96, best_importance + 0.05),
-                metadata={
-                    "category": summary_cat, "source": "reflection",
-                    "stability": "long_term", "status": "active",
-                    "confidence": 0.85,
-                    "source_memory_ids": source_ids,
-                    "reflected_at": datetime.now(UTC).isoformat(),
-                }, db=db,
-            )
-            if summary:
-                summaries.append(summary)
-
-            # Archive original fragments
-            for source_id in source_ids:
-                repo = MemoryRepository(db)
-                item = repo.get_by_id(source_id)
-                if item:
-                    meta = dict(item.metadata_json or {})
-                    meta["status"] = "archived"
-                    meta["archived_into"] = summary.get("id") if summary else None
-                    repo.update(item, metadata_json=meta)
-                    archived_ids.append(source_id)
-
-        return {
-            "summaries": summaries,
-            "archived": archived_ids,
-            "summary_count": len(summaries),
-            "archived_count": len(archived_ids),
-        }
+    def reflect_user_profile(self, user_id, db=None, *, conversation_id=None):
+        return memory_service.consolidate_memory(user_id, db, conversation_id=conversation_id)
 
     def _build_category_summary(self, category: str, contents: list[str]) -> str:
         """Deterministic summary from same-category memory contents."""

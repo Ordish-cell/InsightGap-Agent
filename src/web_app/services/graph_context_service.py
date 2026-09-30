@@ -19,8 +19,8 @@ class GraphContextService:
         self.repository = repository or GraphRepository()
         self.last_debug: dict[str, Any] = {}
 
-    def get_context(self, *, user_id: int, query: str, route: str = "chat", limit: int | None = None) -> str:
-        if not self._enabled():
+    def get_context(self, *, user_id: int, query: str, route: str = "chat", limit: int | None = None, db=None, conversation_id=None, use_memory=True) -> str:
+        if not use_memory or not self._enabled():
             self.last_debug = {"enabled": False, "reason": "disabled"}
             return ""
         started = perf_counter()
@@ -29,6 +29,17 @@ class GraphContextService:
         limit = limit or settings.neo4j_graph_context_limit
         try:
             memory_rows = [] if is_project_diagnostic else self.repository.get_user_memory_context(user_id=user_id, terms=terms, limit=limit)
+            if db is not None:
+                from src.web_app.services.memory_service import memory_service
+                from src.web_app.db.repositories.memory_repository import MemoryRepository
+                ids = [int(r["memory_id"]) for r in memory_rows if str(r.get("memory_id", "")).isdigit()]
+                allowed = {m.id: m for m in MemoryRepository(db).get_by_ids(user_id, ids)
+                           if memory_service.is_recallable(m, db, conversation_id)}
+                memory_rows = [{**r, "preview": allowed[int(r["memory_id"])].content,
+                    "category": (allowed[int(r["memory_id"])].metadata_json or {}).get("category", ""), "target_key": ""} for r in memory_rows
+                               if str(r.get("memory_id", "")).isdigit() and int(r["memory_id"]) in allowed]
+            else:
+                memory_rows = []  # graph projections never authorize memory reads without PG
             project_rows = self.repository.get_project_context(
                 project_key=settings.neo4j_project_key,
                 terms=terms,

@@ -8,6 +8,8 @@ from sqlalchemy.orm import Session
 
 from src.web_app.db.repositories.memory_repository import MemoryRepository
 from src.web_app.memory.extractor import memory_extractor
+from src.web_app.memory.policy import eligible, infer_scope, runtime_policy, validate_source
+from src.web_app.memory.facts import compare, evidence, fact_key, normalized, source_order
 from src.web_app.services.deletion_guard import guarded_transition
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,8 @@ class MemoryService:
             source_type = ""
 
         metadata = dict(metadata or {})
+        if db and runtime_policy(db).get("writes_blocked"):
+            raise ValueError("memory_writes_disabled")
         metadata.setdefault("status", "active")
         metadata.setdefault("visible_in_long_term_memory", memory_type in self._QDRANT_MEMORY_TYPES)
         if memory_type == "working":
@@ -94,15 +98,20 @@ class MemoryService:
             from src.web_app.services.deletion_guard import check_conversation
             from src.web_app.agent.runtime.chat_control import execution
             from src.web_app.models.orm import AgentRun
-            metadata = dict(metadata or {})
+            metadata = validate_source(db, user_id, metadata)
             token = execution.get()
-            source_run = metadata.get("run_id") or (token.run_id if token else None)
+            source_run = metadata.get("run_id") or metadata.get("agent_run_id") or (token.run_id if token else None)
             if source_run and str(source_run).isdigit():
                 owner_run = db.get(AgentRun, int(source_run))
                 if owner_run and owner_run.user_id == user_id:
                     metadata.update(run_id=owner_run.id, conversation_id=owner_run.conversation_id)
             check_conversation(db, user_id, metadata.get("conversation_id"), require_exists=bool(metadata.get("conversation_id")))
+            scope, scope_id = infer_scope(metadata, metadata.get("conversation_id", ""))
+            metadata["fact_key"] = fact_key(content, metadata)
+            metadata["evidence"] = evidence(metadata)
+            metadata["evidence_count"] = len({e["message_id"] for e in metadata["evidence"]})
             item = MemoryRepository(db).create(
+                scope=scope, scope_id=scope_id,
                 user_id=user_id,
                 content=content,
                 memory_type=memory_type,
@@ -118,6 +127,8 @@ class MemoryService:
             "memory_type": memory_type,
             "importance": importance,
             "metadata": metadata or {},
+            "scope": infer_scope(metadata, metadata.get("conversation_id", ""))[0],
+            "scope_id": infer_scope(metadata, metadata.get("conversation_id", ""))[1],
             "ok": True,
             "qdrant_point_id": None,
             "qdrant_indexed": False,
@@ -138,9 +149,10 @@ class MemoryService:
         qdrant_indexed = False
         qdrant_error = None
         # PostgreSQL is authoritative; vector indexing is best-effort.
-        store = self._get_qdrant_store() if memory_type in self._QDRANT_MEMORY_TYPES else None
+        store = self._get_qdrant_store() if memory_type in self._QDRANT_MEMORY_TYPES and eligible(result, item.scope_id) else None
         if store is not None:
             try:
+                from uuid import NAMESPACE_URL, uuid5
                 qdrant_point_id = store.upsert_memory(
                     memory_id=item.id,
                     user_id=user_id,
@@ -148,7 +160,8 @@ class MemoryService:
                     memory_type=memory_type,
                     importance=importance,
                     source_type=source_type,
-                    metadata=metadata,
+                    metadata={**metadata, "scope": item.scope, "scope_id": item.scope_id},
+                    point_id=item.qdrant_point_id or str(uuid5(NAMESPACE_URL, f"memory:{user_id}:{item.id}")),
                 )
                 qdrant_indexed = True
                 # Mark as indexed in PG metadata (best-effort)
@@ -177,10 +190,22 @@ class MemoryService:
             "category": (metadata or {}).get("category", ""),
             "status": (metadata or {}).get("status", "active"),
         })
-        graph_result = self._sync_memory_graph(user_id, item)
+        graph_result = self._sync_memory_graph(user_id, item) if eligible(result, item.scope_id) else {"synced": False}
         if graph_result.get("warning"):
             result["graph_warning"] = graph_result["warning"]
         result["graph_indexed"] = bool(graph_result.get("synced"))
+        # Durable retry markers live beside the authoritative fact. Index failures
+        # never roll back the fact or its version transition.
+        from src.web_app.core.config import settings
+        pending = bool(eligible(result, item.scope_id) and (
+            (settings.qdrant_url and not qdrant_indexed) or
+            (settings.enable_neo4j and settings.neo4j_memory_graph_enabled and not graph_result.get("synced"))))
+        try:
+            MemoryRepository(db).update(item, metadata_json={**(item.metadata_json or {}),
+                "index_pending": pending, "graph_indexed": result["graph_indexed"]})
+        except Exception:
+            db.rollback()
+            logger.warning("memory.index_retry_marker_failed memory_id=%s", item.id, exc_info=True)
         return result
 
     @guarded_transition
@@ -190,25 +215,36 @@ class MemoryService:
         from src.web_app.models.orm import Memory, User
         from src.web_app.memory.basic_facts import LABELS, content_for
         from src.web_app.services.deletion_guard import check_conversation
+        if runtime_policy(db).get("writes_blocked"):
+            raise ValueError("memory_writes_disabled")
         if fact.get("key") not in LABELS or not fact.get("value"):
             raise ValueError("invalid_basic_fact")
         check_conversation(db, user_id, provenance.get("conversation_id"), require_exists=bool(provenance.get("conversation_id")))
+        provenance = dict(provenance)
+        if provenance.get("source_run_id"):
+            from src.web_app.models.orm import AgentChatMessage
+            source = db.scalar(select(AgentChatMessage).where(AgentChatMessage.user_id == user_id,
+                AgentChatMessage.run_id == provenance["source_run_id"], AgentChatMessage.role == "user").order_by(AgentChatMessage.id).limit(1))
+            if source:
+                provenance.update(source_message_id=source.id, source_quote=source.content, source_verified=True)
+
         db.execute(select(User).where(User.id == user_id).with_for_update()).scalar_one()
         rows = MemoryRepository(db).list_by_user(user_id)
-        active = [m for m in rows if (m.metadata_json or {}).get("fact_key") == fact["key"]
+        active = [m for m in rows if m.scope == "user" and (m.metadata_json or {}).get("fact_key") == fact["key"]
                   and (m.metadata_json or {}).get("status", "active") == "active"]
         same = next((m for m in active if m.metadata_json.get("fact_value") == fact["value"]), None)
         if same:
-            return {**self._to_dict(same), "ok": True, "deduped": True,
-                    "qdrant_indexed": bool(same.metadata_json.get("qdrant_indexed"))}
+            return self._update_existing(same, same.importance, provenance, db)
         meta = {**provenance, "fact_key": fact["key"], "fact_value": fact["value"],
                 "category": fact["key"], "confirmed": True, "confidence": 1.0,
                 "status": "active", "visible_in_long_term_memory": True, "stability": "long_term"}
         item = Memory(user_id=user_id, content=content_for(fact), memory_type="semantic",
-                      importance=0.95, source_type="confirmed_basic_fact", metadata_json=meta)
+                      importance=0.95, source_type="confirmed_basic_fact", scope="user", scope_id="", metadata_json={**meta,
+                          "evidence": evidence(meta), "evidence_count": len({e["message_id"] for e in evidence(meta)})})
         try:
             db.add(item)
             db.flush()
+            item.metadata_json = {**item.metadata_json, "supersedes": [old.id for old in active]}
             for old in active:
                 old.metadata_json = {**old.metadata_json, "status": "superseded", "superseded_by": item.id}
             db.commit()
@@ -224,21 +260,85 @@ class MemoryService:
         from sqlalchemy import select
         from src.web_app.models.orm import User
         meta = dict(item.metadata_json or {})
+        if item.user_id != user_id:
+            raise ValueError("memory_not_owned")
+        from src.web_app.services.deletion_guard import check_conversation
+        check_conversation(db, user_id, item.scope_id if item.scope == "conversation" else None, require_exists=item.scope == "conversation")
         key = meta.get("fact_key")
+        conflict = db.get(type(item), meta["conflicts_with"]) if meta.get("conflicts_with") else None
+        if conflict and conflict.user_id == user_id and conflict.scope == item.scope and conflict.scope_id == item.scope_id:
+            key = (conflict.metadata_json or {}).get("fact_key", key)
+            meta["fact_key"] = key
+            meta["supersedes"] = conflict.id
         if key:
             db.execute(select(User).where(User.id == user_id).with_for_update()).scalar_one()
             for other in MemoryRepository(db).list_by_user(user_id):
                 previous = other.metadata_json or {}
-                if other.id != item.id and previous.get("fact_key") == key and previous.get("status", "active") == "active":
+                if other.id != item.id and other.scope == item.scope and other.scope_id == item.scope_id and previous.get("fact_key") == key and previous.get("status", "active") == "active":
                     other.metadata_json = {**previous, "status": "superseded", "superseded_by": item.id}
         meta.pop("superseded_by", None)
-        item.metadata_json = {**meta, "status": "active"}
+        item.metadata_json = {**meta, "status": "active", "confirmed": True}
         try:
             db.commit()
         except Exception:
             db.rollback()
             raise
+        return self._index_saved(item, db)
 
+    @guarded_transition
+    def edit_memory(self, user_id, item, payload, db):
+        if item.user_id != user_id:
+            raise ValueError("memory_not_owned")
+        from src.web_app.services.deletion_guard import check_conversation
+        check_conversation(db, user_id, item.scope_id if item.scope == "conversation" else None, require_exists=item.scope == "conversation")
+        meta = dict(item.metadata_json or {})
+        safe = {"category", "sensitive", "visible_in_long_term_memory", "stability"}
+        meta.update({k: v for k, v in (payload.get("metadata") or {}).items() if k in safe})
+        if "status" in payload:
+            if payload["status"] not in {"active", "archived", "pending", "low_confidence", "superseded"}:
+                raise ValueError("invalid_memory_status")
+            if payload["status"] == "active" and meta.get("status") != "active":
+                return self.restore_memory(user_id, item, db)
+            meta["status"] = payload["status"]
+        values = {"metadata_json": meta}
+        if "importance" in payload:
+            importance = float(payload["importance"])
+            if not 0 <= importance <= 1:
+                raise ValueError("invalid_importance")
+            values["importance"] = importance
+        if "content" in payload:
+            content = str(payload["content"]).strip()
+            if not content:
+                raise ValueError("empty_memory_content")
+            if content != item.content:
+                # An authenticated edit targets this exact fact. No model comparison
+                # or scope reclassification is needed for an explicit correction.
+                from sqlalchemy import select
+                from src.web_app.models.orm import Memory, User
+                db.execute(select(User).where(User.id == user_id).with_for_update()).scalar_one()
+                reviewed = {**meta, "confirmed": True, "supersedes": item.id,
+                    "manual_evidence": {"quote": content, "reviewed_at": datetime.now(UTC).isoformat()}}
+                reviewed.pop("superseded_by", None)
+                reviewed.pop("is_summary", None)
+                reviewed.pop("source_memory_ids", None)
+                reviewed.pop("fact_value", None)
+                replacement = Memory(user_id=user_id, content=content, scope=item.scope, scope_id=item.scope_id,
+                    memory_type=item.memory_type, importance=values.get("importance", item.importance),
+                    source_type="manual_edit", metadata_json=reviewed)
+                try:
+                    db.add(replacement)
+                    db.flush()
+                    item.metadata_json = {**(item.metadata_json or {}), "status": "superseded", "superseded_by": replacement.id}
+                    db.commit()
+                    db.refresh(replacement)
+                except Exception:
+                    db.rollback()
+                    raise
+                return self._index_saved(replacement, db)
+        MemoryRepository(db).update(item, **values)
+        return self._index_saved(item, db)
+
+    @guarded_transition
     def add_with_dedup(
         self,
         user_id: int,
@@ -249,20 +349,87 @@ class MemoryService:
         metadata: dict[str, Any] | None = None,
         db: Session | None = None,
     ) -> dict[str, Any] | None:
-        if db:
-            existing = self._find_similar(user_id, content, memory_type, db)
-            if existing:
-                return self._update_existing(existing, importance, metadata, db)
-        return self.add_memory(user_id, content, memory_type, importance, source_type, metadata, db)
+        metadata = dict(metadata or {})
+        if db and runtime_policy(db).get("writes_blocked"):
+            raise ValueError("memory_writes_disabled")
+        if not db:
+            return self.add_memory(user_id, content, memory_type, importance, source_type, metadata, db)
+        from sqlalchemy import select
+        from src.web_app.models.orm import Memory, User, AgentRun
+        from src.web_app.agent.runtime.chat_control import execution
+        from src.web_app.services.deletion_guard import check_conversation
+        metadata = validate_source(db, user_id, metadata)
+        token = execution.get()
+        run_id = metadata.get("run_id") or metadata.get("agent_run_id") or (token.run_id if token else None)
+        run = db.get(AgentRun, int(run_id)) if run_id and str(run_id).isdigit() else None
+        if run and run.user_id == user_id:
+            metadata.update(run_id=run.id, conversation_id=run.conversation_id)
+        scope, scope_id = infer_scope(metadata, metadata.get("conversation_id", ""))
+        check_conversation(db, user_id, metadata.get("conversation_id"), require_exists=bool(metadata.get("conversation_id")))
+        db.execute(select(User).where(User.id == user_id).with_for_update()).scalar_one()
+        metadata["fact_key"] = fact_key(content, metadata)
+        rows = MemoryRepository(db).search_by_type(user_id, memory_type, 0)
+        candidates = [m for m in rows if (m.scope, m.scope_id) == (scope, scope_id)
+                      and (m.metadata_json or {}).get("status", "active") == "active"
+                      and not (m.metadata_json or {}).get("is_summary")]
+        plausible = [m for m in candidates if normalized(m.content) == normalized(content)
+            or (m.metadata_json or {}).get("fact_key") == metadata["fact_key"]
+            or ((m.metadata_json or {}).get("category", "") == metadata.get("category", "")
+                and (self._similarity(content, m.content) >= .55 or
+                    (bool(metadata.get("category")) and (not metadata.get("entity") or (m.metadata_json or {}).get("entity") == metadata.get("entity")))))]
+        plausible.sort(key=lambda m: (normalized(m.content) == normalized(content),
+            (m.metadata_json or {}).get("fact_key") == metadata["fact_key"], self._similarity(content, m.content)), reverse=True)
+        old, relation, uncertain = None, "unrelated", None
+        for candidate in plausible[:4]:
+            compared = compare(candidate.content, content,
+                same_key=(candidate.metadata_json or {}).get("fact_key") == metadata["fact_key"])
+            if compared == "ambiguous" and uncertain is None:
+                uncertain = candidate
+            if compared in {"duplicate", "supplement", "correction"}:
+                old, relation = candidate, compared
+                break
+        if old is None and uncertain is not None:
+            old, relation = uncertain, "ambiguous"
+        if old and (metadata.get("status", "active") != "active" or (relation != "duplicate" and
+            source_order(old.metadata_json or {}) > source_order(metadata) and source_order(metadata) != (0, 0))):
+            relation = "ambiguous"
+        if relation == "duplicate":
+            return self._update_existing(old, importance, metadata, db)
+        if relation == "ambiguous":
+            metadata.update(status="pending", conflicts_with=old.id)
+            pending = next((m for m in rows if m.content == content and m.scope == scope and m.scope_id == scope_id
+                            and (m.metadata_json or {}).get("status") == "pending"), None)
+            if pending:
+                return {**self._to_dict(pending), "ok": True, "deduped": True, "qdrant_indexed": False}
+        item = Memory(user_id=user_id, content=content, memory_type=memory_type, importance=importance,
+                      source_type=source_type, scope=scope, scope_id=scope_id,
+                      metadata_json={**metadata, "evidence": evidence(metadata), "visible_in_long_term_memory": memory_type in self._QDRANT_MEMORY_TYPES})
+        item.metadata_json = {**item.metadata_json, "evidence_count": len({e["message_id"] for e in evidence(metadata)})}
+        if relation == "supplement":
+            item.content = old.content + "\n" + content
+            combined = evidence({"evidence": evidence(old.metadata_json or {}) + evidence(metadata)})
+            item.metadata_json = {**item.metadata_json, "fact_key": (old.metadata_json or {}).get("fact_key", metadata["fact_key"]),
+                                  "evidence": combined, "evidence_count": len({e["message_id"] for e in combined})}
+        if relation in {"correction", "supplement"}:
+            item.metadata_json = {**item.metadata_json, "supersedes": old.id}
+        try:
+            db.add(item)
+            db.flush()
+            if relation in {"correction", "supplement"}:
+                old.metadata_json = {**(old.metadata_json or {}), "status": "superseded", "superseded_by": item.id}
+            db.commit()
+            db.refresh(item)
+        except Exception:
+            db.rollback()
+            raise
+        result = self._index_saved(item, db)
+        result["updated_existing"] = relation in {"correction", "supplement"}
+        return result
 
-    def _find_similar(self, user_id: int, content: str, memory_type: str, db: Session) -> Any:
-        existing = MemoryRepository(db).search_by_type(user_id, memory_type=memory_type, min_importance=0.3)
-        for mem in existing:
-            if (mem.metadata_json or {}).get("fact_key"):
-                continue  # Fixed-key facts must never be merged by text similarity.
-            if self._similarity(content, mem.content) >= 0.55:
-                return mem
-        return None
+    def _find_similar(self, user_id, content, memory_type, db):
+        return next((m for m in MemoryRepository(db).search_by_type(user_id, memory_type, .3)
+                     if (m.metadata_json or {}).get("status", "active") == "active"
+                     and normalized(m.content) == normalized(content)), None)
 
     def _similarity(self, text1: str, text2: str) -> float:
         if not text1 or not text2:
@@ -295,189 +462,103 @@ class MemoryService:
     def _update_existing(self, existing: Any, importance: float, metadata: dict[str, Any] | None, db: Session) -> dict[str, Any]:
         repo = MemoryRepository(db)
         current_meta = dict(existing.metadata_json or {})
-        evidence_count = current_meta.get("evidence_count", 1) + 1
+        metadata = dict(metadata or {})
+        merged_evidence = evidence({"evidence": evidence(current_meta) + evidence(metadata)})
+        if source_order(metadata) < source_order(current_meta):
+            for key in ("run_id", "source_run_id", "source_message_id", "source_quote", "conversation_id", "source_verified"):
+                if key in current_meta:
+                    metadata[key] = current_meta[key]
+        evidence_count = len({e["message_id"] for e in merged_evidence}) or current_meta.get("evidence_count", 1)
         updated_importance = max(existing.importance, importance)
         updated_meta = {
             **current_meta,
             **(metadata or {}),
             "last_seen_at": datetime.now(UTC).isoformat(),
             "evidence_count": evidence_count,
+            "evidence": merged_evidence,
             "updated_from": existing.importance,
         }
         # Boost importance slightly with repeated evidence
-        if evidence_count >= 3:
+        if evidence_count >= 3 and evidence_count > current_meta.get("evidence_count", 1):
             updated_importance = min(0.98, updated_importance + 0.05)
         repo.update(
             existing,
             importance=updated_importance,
             metadata_json=updated_meta,
         )
-        qdrant_indexed = False
-        qdrant_error = None
-        store = self._get_qdrant_store() if existing.memory_type in self._QDRANT_MEMORY_TYPES else None
-        if store is not None and existing.qdrant_point_id:
-            try:
-                store.upsert_memory(memory_id=existing.id, user_id=existing.user_id, content=existing.content, memory_type=existing.memory_type, importance=updated_importance, source_type=existing.source_type or "", metadata=updated_meta, point_id=existing.qdrant_point_id)
-                qdrant_indexed = True
-            except Exception as exc:
-                qdrant_error = str(exc)[:200]
-        result = self._to_dict(existing)
+        result = self._index_saved(existing, db)
         result.update({
-            "ok": True,
-            "qdrant_point_id": existing.qdrant_point_id,
-            "qdrant_indexed": qdrant_indexed,
             "deduped": True,
             "updated_existing": True,
-            "error": qdrant_error,
-            "category": updated_meta.get("category", ""),
-            "status": updated_meta.get("status", "active"),
         })
-        graph_result = self._sync_memory_graph(existing.user_id, existing)
-        if graph_result.get("warning"):
-            result["graph_warning"] = graph_result["warning"]
-        result["graph_indexed"] = bool(graph_result.get("synced"))
         return result
 
-    def search_memory(
-        self,
-        user_id: int,
-        query: str = "",
-        memory_type: str | None = None,
-        min_importance: float = 0.0,
-        db: Session | None = None,
-        *,
-        memory_types: list[str] | None = None,
-        limit: int = 8,
-    ) -> list[dict[str, Any]]:
-        """Search long-term memory with Qdrant → ILIKE → recent-important fallback."""
-        from datetime import UTC, datetime as _dt
-        from src.web_app.services.user_growth_service import user_growth_service as _ugs
-
-        if not db:
-            query_lower = query.lower()
-            return [item for item in self._items if item["user_id"] == user_id and query_lower in item["content"].lower()]
-
-        # ── Helper closures ─────────────────────────────────────────────
-        def _status_allowed(m) -> bool:
-            if hasattr(m, "metadata_json"):
-                s = (m.metadata_json or {}).get("status", "active")
-            else:
-                s = (m.get("metadata", {}) or {}).get("status", "active")
-            return s == "active"
-
-        def _effective_importance(mem_dict: dict) -> float:
-            imp = float(mem_dict.get("importance", 0) or 0)
-            meta = mem_dict.get("metadata", {}) or {}
-            status = meta.get("status", "active")
-            if status == "superseded":
-                imp *= 0.50
-            elif status == "archived":
-                imp *= 0.25
-            if meta.get("stability") == "temporary":
-                imp *= 0.80
-            return imp
-
-        def _recency_score(meta: dict) -> float:
-            now = _dt.now(UTC)
-            ts_str = meta.get("last_seen_at") or meta.get("updated_at") or meta.get("created_at") or ""
-            if not ts_str:
-                return 0.0
-            try:
-                if ts_str.endswith("Z"):
-                    ts_str = ts_str[:-1] + "+00:00"
-                ts = _dt.fromisoformat(ts_str)
-                age_days = (now - ts).total_seconds() / 86400.0
-                # Half-life of 30 days
-                return max(0.0, 1.0 / (1.0 + age_days / 30.0))
-            except Exception:
-                return 0.0
-
-        # Determine which memory types to search
-        types_for_search: list[str] | None = None
-        if memory_types:
-            types_for_search = memory_types
-        elif memory_type:
-            types_for_search = [memory_type]
-
-        results: list[dict[str, Any]] = []
-        repo = MemoryRepository(db)
-
-        # ── Tier 1: Qdrant semantic search ────────────────────────────
-        if query:
-            store = self._get_qdrant_store()
-            if store is not None:
-                try:
-                    qdrant_hits = store.search_memory(
-                        user_id=user_id,
-                        query=query,
-                        memory_types=types_for_search,
-                        limit=limit,
-                        score_threshold=0.25,
-                    )
-                    self._last_search_backend = "qdrant"
-                    self._last_qdrant_hits = len(qdrant_hits)
-
-                    if qdrant_hits:
-                        memory_ids = [int(h["memory_id"]) for h in qdrant_hits]
-                        memories = repo.get_by_ids(user_id=user_id, ids=memory_ids)
-                        # Filter by min_importance, memory_type, and status
-                        if min_importance > 0:
-                            memories = [m for m in memories if m.importance >= min_importance]
-                        if types_for_search:
-                            memories = [m for m in memories if m.memory_type in types_for_search]
-                        memories = [m for m in memories if _status_allowed(m)]
-                        # Sort: 65% Qdrant + 25% effective importance + 10% recency
-                        score_map = {int(h["memory_id"]): h["score"] for h in qdrant_hits}
-                        memories.sort(
-                            key=lambda m: (
-                                0.65 * score_map.get(m.id, 0)
-                                + 0.25 * _effective_importance(self._to_dict(m))
-                                + 0.10 * _recency_score(m.metadata_json or {})
-                            ),
-                            reverse=True,
-                        )
-                        results = []
-                        for m in memories[:limit]:
+    def search_memory(self, user_id, query="", memory_type=None, min_importance=0.0, db=None,
+                      *, memory_types=None, limit=8, conversation_id=None, use_memory=True, management=False):
+        """Hybrid retrieval; PostgreSQL decides visibility, ownership and scope."""
+        if not use_memory or (db and not management and runtime_policy(db).get("use_memory") is False):
+            return []
+        types = memory_types or ([memory_type] if memory_type else ["semantic", "episodic", "working"] if management else ["semantic", "episodic"])
+        scores = {}
+        candidates = {}
+        def accept(d):
+            if management:
+                return d["memory_type"] in types and d.get("importance", 0) >= min_importance and d.get("metadata", {}).get("status") != "deleting"
+            if db and d.get("metadata", {}).get("is_summary"):
+                ids = d["metadata"].get("source_memory_ids", [])
+                sources = MemoryRepository(db).get_by_ids(user_id, ids)
+                if not ids or len(sources) != len(ids) or not all(not (m.metadata_json or {}).get("is_summary") and eligible(self._to_dict(m), conversation_id, allow_legacy=management) for m in sources):
+                    return False
+            return d["memory_type"] in types and d.get("importance", 0) >= min_importance and eligible(d, conversation_id, allow_legacy=management)
+        if db:
+            repo = MemoryRepository(db)
+            if query:
+                store = self._get_qdrant_store()
+                if store:
+                    try:
+                        hits = store.search_memory(user_id=user_id, query=query, memory_types=types,
+                                                   limit=max(32, limit * 4), score_threshold=.25)
+                        scores = {int(h["memory_id"]): h["score"] for h in hits}
+                        for m in repo.get_by_ids(user_id=user_id, ids=list(scores)):
                             d = self._to_dict(m)
-                            d["_qdrant_score"] = score_map.get(m.id, 0)
-                            meta = m.metadata_json or {}
-                            if meta.get("confidence", 0.95) < 0.55:
-                                d["_low_confidence"] = True
-                            results.append(d)
-                        return results
-                except Exception:
-                    logger.warning("memory.qdrant_search_failed", exc_info=True)
-                    self._last_search_backend = "qdrant_search_failed"
-                    self._last_qdrant_hits = 0
+                            if accept(d):
+                                candidates[m.id] = d
+                    except Exception:
+                        logger.warning("memory.qdrant_search_failed", exc_info=True)
+            rows = repo.search_keywords(user_id, query, types, min_importance, conversation_id=conversation_id, management=management) if query else repo.search(user_id, min_importance=min_importance)
+            for m in rows:
+                d = self._to_dict(m)
+                if accept(d):
+                    candidates[m.id] = d
+        else:
+            for d in self._items:
+                if d["user_id"] == user_id and (not query or query.casefold() in d["content"].casefold()) and accept(d):
+                    candidates[d["id"]] = d
+        self._last_qdrant_hits = len(scores)
+        self._last_search_backend = "hybrid" if scores else "postgres_keywords" if candidates else "no_results"
+        def recency(d):
+            value = (d.get("metadata") or {}).get("last_seen_at") or d.get("updated_at")
+            try:
+                stamp = datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=UTC)
+                return 1 / (1 + max(0, (datetime.now(UTC) - stamp).total_seconds() / 86400) / 30)
+            except (TypeError, AttributeError, ValueError):
+                return 0
+        ranked = sorted(candidates.values(), key=lambda d: (.65 * scores.get(d["id"], 0) + .25 * d.get("importance", 0) + .10 * recency(d), d["id"]), reverse=True)
+        for d in ranked:
+            if d["id"] in scores:
+                d["_qdrant_score"] = scores[d["id"]]
+        return ranked[:limit]
 
-        # ── Tier 2: PostgreSQL ILIKE fallback ──────────────────────────
-        pg_memories = repo.search(
-            user_id, query=query if query else "",
-            memory_type=memory_type,
-            min_importance=min_importance,
-        )
-        if pg_memories:
-            self._last_search_backend = "postgres_like"
-            self._last_qdrant_hits = 0
-            pg_memories = [m for m in pg_memories if _status_allowed(m)]
-            return [self._to_dict(m) for m in pg_memories[:limit]]
-
-        # ── Tier 3: recent important semantic memories ─────────────────
-        fallback_memories = repo.list_recent_important(
-            user_id=user_id,
-            memory_type="semantic",
-            min_importance=0.7,
-            limit=limit,
-        )
-        if fallback_memories:
-            self._last_search_backend = "recent_important_fallback"
-            self._last_qdrant_hits = 0
-            fallback_memories = [m for m in fallback_memories if _status_allowed(m)]
-            return [self._to_dict(m) for m in fallback_memories]
-
-        self._last_search_backend = "no_results"
-        self._last_qdrant_hits = 0
-        return []
+    def is_recallable(self, item, db, conversation_id=None):
+        d = self._to_dict(item)
+        if not eligible(d, conversation_id):
+            return False
+        if d["metadata"].get("is_summary"):
+            ids = d["metadata"].get("source_memory_ids", [])
+            sources = MemoryRepository(db).get_by_ids(item.user_id, ids)
+            return bool(ids) and len(sources) == len(ids) and all(
+                not (m.metadata_json or {}).get("is_summary") and eligible(self._to_dict(m), conversation_id) for m in sources)
+        return True
 
     def get_baseline_memories(
         self,
@@ -487,22 +568,25 @@ class MemoryService:
         categories: set[str] | list[str] | tuple[str, ...] | None = None,
         min_importance: float = 0.75,
         limit: int = 6,
+        use_memory: bool = True,
     ) -> list[dict[str, Any]]:
-        """Read stable profile/project memories without using the current query.
+        """Read stable personal preferences without using the current query.
 
         Read-only by contract: no writes, no consolidation, no importance updates.
         """
         from src.web_app.memory.basic_facts import LABELS
+        if not use_memory or (db and runtime_policy(db).get("use_memory") is False):
+            return []
         allowed = set(categories or {
-            "name_preference", "language_preference", "tone_preference", "answer_preference",
-            "project_goal", "tech_stack", "boundary", "workflow_pattern", *LABELS,
+            "name_preference", "language_preference", "tone_preference", "answer_preference", "output_preference", "preference", "negative_preference",
+            *LABELS,
         })
         items = ([self._to_dict(m) for m in MemoryRepository(db).search_by_type(user_id, "semantic", min_importance)]
                  if db else [m for m in self._items if m.get("user_id") == user_id and m.get("memory_type") == "semantic"])
-        eligible = []
+        accepted = []
         for item in items:
             meta = item.get("metadata") or {}
-            if (float(item.get("importance") or 0) < min_importance
+            if (not eligible(item) or float(item.get("importance") or 0) < min_importance
                 or meta.get("status", "active") != "active"
                 or not meta.get("visible_in_long_term_memory", True)
                 or float(meta.get("confidence", 1) or 0) < 0.55
@@ -510,12 +594,14 @@ class MemoryService:
                 continue
             if meta.get("category") in LABELS and not meta.get("confirmed"):
                 continue
-            eligible.append(item)
-        return sorted(eligible, key=lambda m: (not bool(m["metadata"].get("confirmed") and m["metadata"].get("fact_key") in LABELS),
+            accepted.append(item)
+        return sorted(accepted, key=lambda m: (not bool(m["metadata"].get("confirmed") and m["metadata"].get("fact_key") in LABELS),
                       -float(m["importance"]), -int(m["id"])))[:limit]
 
     def get_semantic_memories(self, user_id: int, db: Session, min_importance: float = 0.3) -> list[dict[str, Any]]:
-        return [self._to_dict(item) for item in MemoryRepository(db).search(user_id, memory_type="semantic", min_importance=min_importance)]
+        from src.web_app.memory.policy import settings_for
+        return self.search_memory(user_id, memory_type="semantic", min_importance=min_importance,
+            db=db, limit=1000, use_memory=settings_for(db, user_id)["use_memory"])
 
     def summarize_memory(self, user_id: int, db: Session | None = None) -> dict[str, Any]:
         if db:
@@ -530,27 +616,35 @@ class MemoryService:
 
     _SEMANTIC_CATEGORIES = {"preference", "negative_preference", "project_goal", "tech_stack", "boundary", "answer_preference", "name_preference", "language_preference", "tone_preference", "workflow_pattern"}
 
-    def consolidate_memory(self, user_id: int, db: Session | None = None) -> dict[str, Any]:
-        if not db: return {"user_id": user_id, "promoted": 0, "mode": "mock"}
+    @guarded_transition
+    def consolidate_memory(self, user_id, db=None, *, conversation_id=None):
+        """Build scoped summaries without deleting evidence or promoting stale records."""
+        if not db:
+            return {"user_id": user_id, "promoted": 0, "mode": "mock"}
         repo = MemoryRepository(db)
-        promoted_w_to_e = 0; promoted_e_to_s = 0
-        now_ts = datetime.now(UTC).isoformat()
-        # working→episodic: importance>=0.7
-        for item in repo.search(user_id, memory_type="working", min_importance=0.7):
-            updated_meta = dict(item.metadata_json or {})
-            updated_meta.update({"visible_in_long_term_memory": True, "status": "active", "stability": "medium_term", "consolidated_at": now_ts, "consolidated_from": "working"})
-            repo.update(item, memory_type="episodic", metadata_json=updated_meta)
-            promoted_w_to_e += 1
-        # episodic→semantic: importance>=0.8 AND stability!="temporary" AND evidence_count>=2 AND category in _SEMANTIC_CATEGORIES
-        for item in repo.search(user_id, memory_type="episodic", min_importance=0.8):
-            meta = item.metadata_json or {}
-            if meta.get("stability") == "temporary" or meta.get("evidence_count", 1) < 2: continue
-            if meta.get("category", "") not in self._SEMANTIC_CATEGORIES: continue
-            updated_meta = dict(meta)
-            updated_meta.update({"stability": "long_term", "consolidated_at": now_ts, "consolidated_from": "episodic"})
-            repo.update(item, memory_type="semantic", metadata_json=updated_meta)
-            promoted_e_to_s += 1
-        return {"user_id": user_id, "promoted_working_to_episodic": promoted_w_to_e, "promoted_episodic_to_semantic": promoted_e_to_s, "total_promoted": promoted_w_to_e + promoted_e_to_s}
+        groups = {}
+        for m in repo.list_by_user(user_id):
+            d = self._to_dict(m)
+            if eligible(d, conversation_id) and not d["metadata"].get("is_summary"):
+                groups.setdefault((m.scope, m.scope_id), []).append(m)
+        summaries = []
+        for (scope, scope_id), rows in groups.items():
+            content = "\n".join(m.content for m in sorted(rows, key=lambda m: m.id))
+            ids = sorted(m.id for m in rows)
+            meta = {"category": "scope_summary", "is_summary": True, "source_memory_ids": ids,
+                    "status": "active", "visible_in_long_term_memory": True, "confidence": 1.0}
+            old = next((m for m in repo.list_by_user(user_id) if m.scope == scope and m.scope_id == scope_id and (m.metadata_json or {}).get("is_summary")), None)
+            if old:
+                repo.update(old, content=content, metadata_json=meta)
+                result = self._index_saved(old, db)
+            else:
+                from src.web_app.models.orm import Memory
+                item = repo.create(user_id=user_id, content=content, memory_type="semantic", importance=.75,
+                                   scope=scope, scope_id=scope_id, metadata_json=meta, source_type="memory_summary")
+                result = self._index_saved(item, db)
+            summaries.append(result)
+        return {"user_id": user_id, "summaries": summaries, "summary_count": len(summaries), "archived": 0, "total_promoted": 0,
+                "promoted_working_to_episodic": 0, "promoted_episodic_to_semantic": 0}
 
     def forget_memory(self, user_id: int, memory_id: int | None = None, db: Session | None = None) -> dict[str, Any]:
         if db:
@@ -724,6 +818,26 @@ class MemoryService:
         save_results: list[dict[str, Any]] = []
         filtered_out = {"episodic": 0, "semantic": 0}
         now_ts = datetime.now(UTC).isoformat()
+        provenance = {}
+        source_text = ""
+        if db and run_id and str(run_id).isdigit():
+            from sqlalchemy import select
+            from src.web_app.models.orm import AgentRun, AgentChatMessage
+            run = db.get(AgentRun, int(run_id))
+            if not run or run.user_id != user_id:
+                raise ValueError("invalid_memory_source")
+            source = db.scalar(select(AgentChatMessage).where(AgentChatMessage.run_id == run.id,
+                AgentChatMessage.user_id == user_id, AgentChatMessage.role == "user").order_by(AgentChatMessage.id).limit(1))
+            source_text = source.content if source else run.user_input
+            provenance = {"run_id": run.id, "conversation_id": run.conversation_id,
+                          "source_message_id": source.id if source else None}
+        def source_metadata(mem):
+            quote = mem.get("source_quote", "")
+            verified = bool(quote and provenance.get("source_message_id") and quote in source_text)
+            return {**provenance, "source_quote": quote, "source_verified": verified,
+                    "entity": mem.get("entity", ""), "personal_long_term": bool(mem.get("personal_long_term")),
+                    **({"confirmed": True, "confirmation": "verified_source"} if verified and mem.get("category") in {"preferred_name", "response_language", "script_preference"} else {}),
+                    **({"status": "pending"} if not verified else {})}
 
         # working: low-barrier, visible_in_long_term_memory=False
         for mem in extraction.get("working_memories", []):
@@ -745,7 +859,7 @@ class MemoryService:
                 importance=importance,
                 metadata={"category": mem.get("category", ""), "source": mem.get("source", ""),
                           "visible_in_long_term_memory": True, "stability": mem.get("stability", "medium_term"),
-                          "status": "active", "evidence_count": 1, "last_seen_at": now_ts, "confidence": confidence}, db=db)
+                          "status": mem.get("status", "active"), "evidence_count": 1, "last_seen_at": now_ts, "confidence": confidence, **source_metadata(mem)}, db=db)
             if result:
                 saved["episodic"].append(result)
                 save_results.append(result)
@@ -760,36 +874,10 @@ class MemoryService:
                 importance=importance,
                 metadata={"category": mem.get("category", ""), "source": mem.get("source", "home_chat"),
                           "visible_in_long_term_memory": True, "stability": mem.get("stability", "long_term"),
-                          "status": "active", "evidence_count": 1, "last_seen_at": now_ts, "confidence": confidence}, db=db)
+                          "status": mem.get("status", "active"), "evidence_count": 1, "last_seen_at": now_ts, "confidence": confidence, **source_metadata(mem)}, db=db)
             if result:
                 saved["semantic"].append(result)
                 save_results.append(result)
-
-        # Auto consolidate + reflect triggers
-        if db:
-            should_consolidate = extraction.get("should_consolidate", False)
-            saved_sem_count = len(saved["semantic"])
-            has_high_episodic = any(m.get("importance", 0) >= 0.75 for m in extraction.get("episodic_memories", []) if m.get("importance", 0) >= 0.65)
-            if saved_sem_count > 0 or has_high_episodic: should_consolidate = True
-            if should_consolidate:
-                try:
-                    self.consolidate_memory(user_id, db)
-                except Exception:
-                    logger.warning("memory.auto_consolidate_failed", exc_info=True)
-            try:
-                from collections import Counter
-                repo = MemoryRepository(db)
-                all_sem, _ = repo.list_long_term(user_id, memory_type="semantic", page=1, page_size=500)
-                cat_counts = Counter()
-                for m in all_sem:
-                    if (m.metadata_json or {}).get("status", "active") == "active":
-                        cat = (m.metadata_json or {}).get("category", "")
-                        if cat: cat_counts[cat] += 1
-                if any(c >= 4 for c in cat_counts.values()):
-                    from src.web_app.services.user_growth_service import user_growth_service as _ugs
-                    _ugs.reflect_user_profile(user_id, db)
-            except Exception:
-                logger.warning("memory.auto_reflect_failed", exc_info=True)
 
         total_saved = len(saved["working"]) + len(saved["episodic"]) + len(saved["semantic"])
         qdrant_indexed_count = sum(1 for r in save_results if r.get("qdrant_indexed"))
@@ -806,6 +894,10 @@ class MemoryService:
             "memory_type": item.memory_type,
             "importance": item.importance,
             "metadata": item.metadata_json or {},
+            "scope": item.scope, "scope_id": item.scope_id,
+            "expires_at": item.expires_at.isoformat() if item.expires_at else None,
+            "created_at": item.created_at.isoformat() if item.created_at else None,
+            "updated_at": item.updated_at.isoformat() if item.updated_at else None,
         }
 
     def _to_summary(self, item) -> dict[str, Any]:

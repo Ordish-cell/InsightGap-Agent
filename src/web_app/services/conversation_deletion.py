@@ -3,7 +3,7 @@ import asyncio
 from sqlalchemy import select, delete, update, inspect
 from src.web_app.models.orm import (ConversationDeletionTask as Job, AgentConversation, AgentChatMessage,
     AgentConversationSummary, AgentConversationSummarySegment, AgentRun, AgentRunControl, AgentStep,
-    AgentEvent, LLMCall, ToolCall, Approval, Artifact, EvalRecord, ResearchRun, Memory, Document, DocumentChunk, Skill)
+    AgentEvent, LLMCall, ToolCall, Approval, Artifact, EvalRecord, ResearchRun, Memory, Document, DocumentChunk, Skill, MemoryMaintenanceTask)
 from src.web_app.db.session import SessionLocal
 from src.web_app.services.deletion_guard import asset_lock
 
@@ -105,9 +105,9 @@ def build_manifest(db, job):
         doc.status = "deleting"
     for memory in db.scalars(select(Memory).where(Memory.user_id == uid)):
         meta = memory.metadata_json or {}
-        if memory.memory_type in {"semantic", "episodic"} or meta.get("visible_in_long_term_memory") is True:
+        if memory.scope != "conversation" and (memory.memory_type in {"semantic", "episodic"} or meta.get("visible_in_long_term_memory") is True):
             continue
-        owned = meta.get("conversation_id") == cid or str(meta.get("run_id", "")) in set(map(str, run_ids)) or str(memory.id) in memory_refs
+        owned = memory.scope_id == cid or meta.get("conversation_id") == cid or str(meta.get("run_id", "")) in set(map(str, run_ids)) or str(memory.id) in memory_refs
         owned |= memory.source_type in {"conversation", "agent_conversation"} and memory.source_id == cid
         owned |= memory.source_type in {"run", "agent_run"} and memory.source_id in set(map(str, run_ids))
         if owned:
@@ -153,6 +153,7 @@ def delete_sql(db, job):
         db.execute(delete(model).where(model.user_id == uid, model.conversation_id == cid))
     for model in (Approval, EvalRecord, AgentStep, AgentEvent, LLMCall, ToolCall):
         db.execute(delete(model).where(model.run_id.in_(ids)))
+    db.execute(delete(MemoryMaintenanceTask).where(MemoryMaintenanceTask.user_id == uid, MemoryMaintenanceTask.conversation_id == cid))
     db.execute(delete(AgentRunControl).where(AgentRunControl.run_id.in_(ids)))
     db.execute(update(AgentRunControl).where(AgentRunControl.successor_run_id.in_(ids)).values(successor_run_id=None))
     db.execute(update(AgentRun).where(AgentRun.supersedes_run_id.in_(ids)).values(supersedes_run_id=None))
@@ -269,6 +270,14 @@ class DeletionManager:
                         job.status, job.error_message = "failed", "停止超时，请等待任务退出后重试。"
                         db.commit()
                         return
+        with SessionLocal() as db:
+            db.execute(update(MemoryMaintenanceTask).where(MemoryMaintenanceTask.user_id == uid,
+                MemoryMaintenanceTask.conversation_id == cid).values(status="cancelled"))
+            db.commit()
+        from src.web_app.services.memory_tasks import memory_tasks
+        memory_task = memory_tasks.tasks.get((uid, cid))
+        if memory_task:
+            await asyncio.shield(memory_task)
         summary_tasks.pending.pop((uid, cid), None)
         summary = summary_tasks.tasks.get((uid, cid))
         if summary:

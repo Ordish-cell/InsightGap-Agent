@@ -28,7 +28,7 @@ def test_memory_add_search_summary_masks_sensitive():
     service.add_memory(user.id, "normal note", "working", 0.5, {}, db)
     service.add_memory(user.id, "sensitive note", "working", 0.9, {"sensitive": True}, db)
 
-    assert service.search_memory(user.id, "note", db=db)
+    assert service.search_memory(user.id, "note", db=db) == []  # working memory is never a long-term recall
     summary = service.summarize_memory(user.id, db)
     assert "sensitive note" not in str(summary)
     assert "masked sensitive memory" in str(summary)
@@ -75,7 +75,7 @@ def test_long_term_memories_write_qdrant(monkeypatch):
         "user prefers concise answers",
         memory_type="semantic",
         importance=0.9,
-        metadata={"visible_in_long_term_memory": True},
+        metadata={"visible_in_long_term_memory": True, "category": "answer_preference"},
         db=db,
     )
     episodic = service.add_memory(
@@ -83,7 +83,7 @@ def test_long_term_memories_write_qdrant(monkeypatch):
         "user completed a research workflow",
         memory_type="episodic",
         importance=0.86,
-        metadata={"visible_in_long_term_memory": True},
+        metadata={"visible_in_long_term_memory": True, "category": "answer_preference"},
         db=db,
     )
 

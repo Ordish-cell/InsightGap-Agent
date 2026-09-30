@@ -27,6 +27,9 @@ class LongTermMemoryItem(BaseModel):
     source: str = "home_chat"
     status: Literal["active", "low_confidence"] = "active"
     reason: str = ""
+    source_quote: str = ""
+    entity: str = ""
+    personal_long_term: bool = False
 
 
 class MemoryExtractionResult(BaseModel):
@@ -55,6 +58,7 @@ class LlmMemoryExtractor:
         feed_card_context=None,
         matched_skill=None,
         created_skill_draft=None,
+        strict=False,
     ) -> dict[str, Any]:
         """Extract memories — casual chat uses regex, otherwise tries LLM with fallback."""
         if memory_extractor._is_casual_chat(user_input):
@@ -82,6 +86,8 @@ class LlmMemoryExtractor:
             )
             return self._convert_llm_result(llm_result, page_context, feed_card_context)
         except Exception:
+            if strict:
+                raise
             logger.exception("LLM memory extraction failed, falling back to regex")
             return memory_extractor.extract(
                 user_input=user_input,
@@ -190,6 +196,8 @@ class LlmMemoryExtractor:
                 "stability": mem.stability,
                 "status": mem.status,
                 "reason": mem.reason,
+                "source_quote": mem.source_quote, "entity": mem.entity,
+                "personal_long_term": mem.personal_long_term,
             }
             if mem.memory_type == "semantic":
                 if mem.importance < 0.70:
@@ -236,6 +244,8 @@ def _build_memory_extraction_prompt(
     return (
         "你是 Agent OS 的记忆提取器。你的任务是从对话中提取长期记忆和短期工作记忆，并输出严格 JSON。\n\n"
         "提取规则：\n"
+        "只把 user_input 中用户自己的陈述当成个人事实；agent_output 的建议不是用户偏好。\n"
+        "每条长期记忆必须给出 source_quote（用户原文中的连续原句）、entity（事实主体或属性），以及 personal_long_term（是否明确为长期个人偏好）。不要把项目背景设为个人长期偏好。\n"
         "1. 长期偏好/习惯表达 → memory_type=\"semantic\"（如：用户正在开发的项目、技术栈偏好、长期目标、边界约束、风格偏好）\n"
         "2. 项目目标/技术栈 → memory_type=\"semantic\"（如：使用 LangGraph、React、MySQL 等具体技术）\n"
         "3. 重要事件/动作 → memory_type=\"episodic\"（如：用户启动了深度研究、创建/匹配了 Skill、反馈了性能/UI 问题）\n"

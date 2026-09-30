@@ -1134,8 +1134,8 @@ class TestGracefulDegradation:
         result = conversation_summary_service.create_segment_if_needed(
             conversation_id=conv.conversation_id, user_id=user.id, db=db,
         )
-        assert len(result) == 1, f"Expected 1 segment, got {len(result)}"
-        assert result[0].get("message_count", 0) > 0
+        assert result == []  # preserve the cursor so failed extraction can be retried
+        assert not result  # no frozen segment may advance the source cursor on failure
 
     def test_segment_recall_failure_returns_empty(self, monkeypatch):
         """If both Qdrant and PG ILIKE fail, search returns empty list."""

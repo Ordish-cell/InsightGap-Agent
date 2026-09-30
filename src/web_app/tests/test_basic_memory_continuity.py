@@ -178,7 +178,7 @@ def test_visibility_counts_priority_and_stale_vectors(env, monkeypatch):
         assert MemoryRepository(db).list_long_term(env.user)[1] == 23
         assert growth_profile(env.user, db)["data"]["semantic_count"] == 23
         assert memory_service.get_baseline_memories(env.user, db=db)[0]["id"] == saved["id"]
-        assert len(memory_service.get_baseline_memories(env.user, db=db)) == 6
+        assert len(memory_service.get_baseline_memories(env.user, db=db)) == 1
         assert not memory_service.get_baseline_memories(other.id, db=db)
         class StaleStore:
             def search_memory(self, **kwargs):
@@ -193,7 +193,7 @@ def test_visibility_counts_priority_and_stale_vectors(env, monkeypatch):
         assert memory_service.search_memory(other.id, "常", db=db) == []
         row.metadata_json = {**row.metadata_json, "status": "archived"}
         db.commit()
-        assert MemoryRepository(db).list_long_term(env.user, status="all")[1] == 23
+        assert MemoryRepository(db).list_long_term(env.user, status="all")[1] == 24
         assert MemoryRepository(db).list_long_term(env.user)[1] == 22
 
 

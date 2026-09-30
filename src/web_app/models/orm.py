@@ -49,6 +49,9 @@ class UserProfile(Base, TimestampMixin):
     last_feed_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_feed_refresh_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     default_llm_model_id: Mapped[int | None] = mapped_column(ForeignKey("llm_models.id"), nullable=True)
+    use_memory: Mapped[bool] = mapped_column(Boolean, default=True, server_default="true", nullable=False)
+    generate_memory: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false", nullable=False)
+    memory_settings_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
     user: Mapped[User] = relationship(back_populates="profile")
 
@@ -168,6 +171,23 @@ class Memory(Base, TimestampMixin):
     qdrant_point_id: Mapped[str] = mapped_column(String(128), default="", nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    scope: Mapped[str] = mapped_column(String(32), default="legacy_unscoped", server_default="legacy_unscoped", index=True, nullable=False)
+    scope_id: Mapped[str] = mapped_column(String(64), default="", server_default="", index=True, nullable=False)
+
+
+class MemoryMaintenanceTask(Base, TimestampMixin):
+    __tablename__ = "memory_maintenance_tasks"
+    __table_args__ = (UniqueConstraint("run_id", name="uq_memory_maintenance_run"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True, nullable=False)
+    conversation_id: Mapped[str] = mapped_column(String(64), index=True, nullable=False)
+    run_id: Mapped[int] = mapped_column(ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False)
+    source_message_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class Skill(Base, TimestampMixin):
@@ -209,6 +229,7 @@ class AgentRun(Base, TimestampMixin):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     supersedes_run_id: Mapped[int | None] = mapped_column(ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True)
     chat_control_phase: Mapped[str] = mapped_column(String(32), default="disabled", server_default="disabled", nullable=False)
+    memory_policy: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
 
 
 class AgentRunControl(Base, TimestampMixin):

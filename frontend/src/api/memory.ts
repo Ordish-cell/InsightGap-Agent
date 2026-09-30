@@ -14,3 +14,4 @@ export const updateMemory = (id: number, body: Record<string, unknown>) => apiRe
 export const deleteMemory = (id: number) => apiRequest<{ deleted: boolean; memory_id: number }>(`/memory/${id}`, { method: 'DELETE' })
 export const archiveMemory = (id: number) => apiRequest<{ memory_id: number; status: string }>(`/memory/${id}/archive`, { method: 'POST' })
 export const restoreMemory = (id: number) => apiRequest<{ memory_id: number; status: string }>(`/memory/${id}/restore`, { method: 'POST' })
+export const confirmMemory = (id: number) => apiRequest<LongTermMemoryItem>(`/memory/${id}/confirm`, { method: 'POST' })

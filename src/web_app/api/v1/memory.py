@@ -14,12 +14,12 @@ router = APIRouter()
 
 @router.post("/add")
 def add_memory(payload: dict, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    return ok(memory_service.add_memory(user_id, payload.get("content", ""), payload.get("memory_type", "working"), payload.get("importance", 0.0), payload.get("metadata", {}), db))
+    return ok(memory_service.add_with_dedup(user_id, payload.get("content", ""), payload.get("memory_type", "working"), payload.get("importance", 0.0), metadata=payload.get("metadata", {}), db=db))
 
 
 @router.post("/search")
 def search_memory(payload: dict, user_id: int = Depends(get_current_user_id), db: Session = Depends(get_db)):
-    return ok(memory_service.search_memory(user_id, payload.get("query", ""), payload.get("memory_type"), payload.get("min_importance", 0.0), db))
+    return ok(memory_service.search_memory(user_id, payload.get("query", ""), payload.get("memory_type"), payload.get("min_importance", 0.0), db, conversation_id=payload.get("conversation_id"), management=True))
 
 
 @router.post("/consolidate")
@@ -132,9 +132,9 @@ def _enrich_long_term_memory(m) -> dict:
     return d
 
 @router.get("/long-term")
-def list_long_term_memories(user_id=Depends(get_current_user_id), db=Depends(get_db), memory_type=Query(None, alias="type"), category=Query(None), status=Query(None), query=Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
+def list_long_term_memories(user_id=Depends(get_current_user_id), db=Depends(get_db), memory_type=Query(None, alias="type"), category=Query(None), status=Query(None), query=Query(None), scope=Query(None), scope_id=Query(None), page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100)):
     repo = MemoryRepository(db)
-    items, total = repo.list_long_term(user_id, memory_type=memory_type, category=category, status=status, query=query, page=int(page), page_size=int(page_size))
+    items, total = repo.list_long_term(user_id, memory_type=memory_type, category=category, status=status, query=query, page=int(page), page_size=int(page_size), scope=scope, scope_id=scope_id)
     return ok({"items": [_enrich_long_term_memory(m) for m in items], "total": total, "page": page, "page_size": page_size})
 
 @router.post("/long-term/search")
@@ -142,31 +142,26 @@ def search_long_term(payload: dict, user_id=Depends(get_current_user_id), db=Dep
     repo = MemoryRepository(db)
     query = str(payload.get("query", "") or payload.get("q", ""))
     memory_type = payload.get("type") or payload.get("memory_type")
-    items, total = repo.list_long_term(user_id, memory_type=memory_type, category=payload.get("category"), status=payload.get("status"), query=query, page=int(payload.get("page", 1)), page_size=int(payload.get("page_size", 20)))
+    items, total = repo.list_long_term(user_id, memory_type=memory_type, category=payload.get("category"), status=payload.get("status"), query=query, page=int(payload.get("page", 1)), page_size=int(payload.get("page_size", 20)), scope=payload.get("scope"), scope_id=payload.get("scope_id"))
     return ok({"items": [_enrich_long_term_memory(m) for m in items], "total": total, "page": int(payload.get("page", 1)), "page_size": int(payload.get("page_size", 20)), "query": query})
 
 @router.patch("/{memory_id}")
 def update_memory(memory_id: int, payload: dict, user_id=Depends(get_current_user_id), db=Depends(get_db)):
-    import logging as _log
     repo = MemoryRepository(db)
     item = repo.get_by_id(memory_id)
-    if not item or item.user_id != user_id: return fail("not_found", f"Memory {memory_id} not found")
-    changed = False
-    if "importance" in payload:
-        importance = float(payload["importance"])
-        if 0.0 <= importance <= 1.0: repo.update(item, importance=importance); changed = True
-    if "status" in payload:
-        meta = dict(item.metadata_json or {}); meta["status"] = payload["status"]
-        repo.update(item, metadata_json=meta); changed = True
-    if "metadata" in payload and isinstance(payload["metadata"], dict):
-        meta = dict(item.metadata_json or {}); meta.update(payload["metadata"])
-        repo.update(item, metadata_json=meta); changed = True
-    if changed and item.qdrant_point_id:
-        try:
-            store = QdrantMemoryStore(); db.refresh(item)
-            store.upsert_memory(memory_id=item.id, user_id=item.user_id, content=item.content, memory_type=item.memory_type, importance=item.importance, source_type=item.source_type or "", metadata=item.metadata_json or {}, point_id=item.qdrant_point_id)
-        except Exception: _log.warning("qdrant_sync_failed", exc_info=True)
-    db.refresh(item)
+    if not item or item.user_id != user_id:
+        return fail("not_found", f"Memory {memory_id} not found")
+    return ok(memory_service.edit_memory(user_id, item, payload, db))
+
+
+@router.post("/{memory_id}/confirm")
+def confirm_memory(memory_id: int, user_id=Depends(get_current_user_id), db=Depends(get_db)):
+    item = MemoryRepository(db).get_by_id(memory_id)
+    if not item or item.user_id != user_id:
+        return fail("not_found", f"Memory {memory_id} not found")
+    if (item.metadata_json or {}).get("status") != "pending":
+        return fail("invalid_status", "Only pending memories can be confirmed")
+    memory_service.restore_memory(user_id, item, db)
     return ok(_enrich_long_term_memory(item))
 
 @router.delete("/{memory_id}")

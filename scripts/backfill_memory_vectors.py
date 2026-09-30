@@ -11,7 +11,6 @@ Usage:
 
 import argparse
 import sys
-from datetime import UTC, datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -191,33 +190,24 @@ def run_backfill(store: QdrantMemoryStore, repo: MemoryRepository, args) -> None
 
         # ── Upsert ────────────────────────────────────────────────
         try:
-            point_id = store.upsert_memory(
-                memory_id=mem.id,
-                user_id=mem.user_id,
-                content=content,
-                memory_type=mem.memory_type,
-                importance=float(mem.importance or 0),
-                source_type=mem.source_type or "",
-                metadata=mem.metadata_json or {},
-            )
-            # Update PG metadata (best-effort)
-            try:
-                db2 = SessionLocal()
-                try:
-                    from src.web_app.models.orm import Memory
-                    MemoryRepository(db2).update(
-                        db2.get(Memory, mem.id),
-                        qdrant_point_id=point_id,
-                        metadata_json={
-                            **(mem.metadata_json or {}),
-                            "qdrant_indexed": True,
-                            "qdrant_indexed_at": datetime.now(UTC).isoformat(),
-                        },
-                    )
-                finally:
-                    db2.close()
-            except Exception:
-                pass
+            from sqlalchemy import select
+            from src.web_app.models.orm import Memory
+            from src.web_app.services.memory_service import MemoryService
+            from src.web_app.services.deletion_guard import conversation_write
+            with SessionLocal() as db2:
+                # Revalidate the row immediately before indexing, under the same
+                # scope/deletion rules as chat saves and the repair worker.
+                fresh = db2.scalar(select(Memory).where(Memory.id == mem.id).with_for_update())
+                indexer = MemoryService()
+                indexer._qdrant_store = store
+                if not fresh or not indexer.is_recallable(fresh, db2, fresh.scope_id):
+                    stats["skipped_existing"] += 1
+                    continue
+                with conversation_write(db2, fresh.user_id, fresh.scope_id if fresh.scope == "conversation" else None,
+                                        require_exists=fresh.scope == "conversation"):
+                    result = indexer._index_saved(fresh, db2)
+                    if not result["qdrant_indexed"]:
+                        raise RuntimeError(result.get("error") or "vector_index_unavailable")
             stats["upserted"] += 1
             if i % 20 == 0:
                 print(f"[PROGRESS] {i}/{len(candidates)} — {stats['upserted']} ok, "
